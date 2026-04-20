@@ -36,12 +36,14 @@ def client(tmp_path: Path, monkeypatch):
     import config as _config
     importlib.reload(_config)
     import database.models as _models
+    # Swap the settings reference without reloading the module — reload
+    # would re-register SQLAlchemy mappers and pollute other test files.
+    _models.settings = _config.settings
     _models._engine = None
     _models._SessionLocal = None
     _models._async_engine = None
     _models._AsyncSessionLocal = None
     _models._resolved_db_url = None
-    importlib.reload(_models)
     import services.storage as _storage
     importlib.reload(_storage)
     import services.project_service as _ps

@@ -28,12 +28,14 @@ def pipe_env(tmp_path: Path, monkeypatch):
     import config as _config
     importlib.reload(_config)
     import database.models as _models
+    # Swap the settings reference without reloading the module — reload
+    # would re-register SQLAlchemy mappers and pollute other test files.
+    _models.settings = _config.settings
     _models._engine = None
     _models._SessionLocal = None
     _models._async_engine = None
     _models._AsyncSessionLocal = None
     _models._resolved_db_url = None
-    importlib.reload(_models)
     import services.storage as _storage
     importlib.reload(_storage)
     import services.project_service as _ps
@@ -94,15 +96,28 @@ def _patch_all_phase_agents(phase_complete: bool = True):
 
 
 class _Stacked:
+    """Start a stack of `patch(...)` handles and stop them in LIFO order.
+
+    LIFO stop order matters when two patches target the same attribute
+    (e.g. both patching `agents.document_agent.DocumentAgent`); popping
+    in start order leaves the outer patch orphaned and the original
+    class unrestored, which then leaks into subsequent test modules.
+    """
     def __init__(self, patches):
         self._patches = patches
+        self._started: list = []
     def __enter__(self):
         for p in self._patches:
             p.start()
+            self._started.append(p)
         return self
     def __exit__(self, *a):
-        for p in self._patches:
-            p.stop()
+        while self._started:
+            p = self._started.pop()
+            try:
+                p.stop()
+            except RuntimeError:
+                pass  # already stopped — ok
 
 
 # ---------------------------------------------------------------------------

@@ -36,7 +36,9 @@ class TestBaseAgentInit:
         assert agent.phase_name == "Test Phase"
         # Default model comes from settings.primary_model (env-dependent: glm-4.7 or claude-opus-4-6)
         assert agent.model in ("glm-4.7", "claude-opus-4-6", settings.primary_model)
-        assert agent.max_tokens == 8192
+        # Constructor default — bumped from 8192 to 16384 to fit structured
+        # tool-use responses (the netlist + SDD tools produce large payloads).
+        assert agent.max_tokens == 16384
         assert agent.tools == []
 
     def test_init_with_custom_values(self, mock_env_vars):
@@ -58,15 +60,17 @@ class TestBaseAgentInit:
         assert agent.max_tokens == 4096
 
     def test_anthropic_client_initialization(self, mock_env_vars):
-        """Test Anthropic client is initialized with API key."""
-        mock_client = MagicMock(spec=anthropic.Anthropic)
-        with patch("agents.base_agent.settings") as mock_settings, \
-             patch("agents.base_agent.anthropic.Anthropic", return_value=mock_client):
-            mock_settings.anthropic_api_key = "sk-ant-test-key"
-            mock_settings.primary_model = "claude-opus-4-6"
-            mock_settings.fallback_chain = ["claude-opus-4-6", "claude-haiku-4-5-20251001"]
+        """Agent constructor creates an Anthropic client when the key is set.
+
+        Patch only `settings.anthropic_api_key` (not the whole settings
+        object) so pydantic-settings fields the constructor reads later —
+        deepseek_base_url, glm_base_url, etc. — stay as real strings that
+        httpx can parse.
+        """
+        with patch("agents.base_agent.settings.anthropic_api_key", "sk-ant-test-key"):
             agent = DummyAgent(phase_number="1", phase_name="Test")
             assert agent._anthropic_client is not None
+            assert isinstance(agent._anthropic_client, anthropic.Anthropic)
 
 
 class TestSystemPrompt:
@@ -136,7 +140,7 @@ class TestCallLLM:
         agent = DummyAgent(phase_number="1", phase_name="Test")
         captured = {}
 
-        async def fake_call_model(model, messages, system, tools, max_tokens):
+        async def fake_call_model(model, messages, system, tools, max_tokens, tool_choice=None):
             captured["system"] = system
             return self._mock_call_model_response()
 
@@ -155,7 +159,7 @@ class TestCallLLM:
         agent = DummyAgent(phase_number="1", phase_name="Test")
         captured = {}
 
-        async def fake_call_model(model, messages, system, tools, max_tokens):
+        async def fake_call_model(model, messages, system, tools, max_tokens, tool_choice=None):
             captured["tools"] = tools
             return self._mock_call_model_response()
 
@@ -175,7 +179,7 @@ class TestCallLLM:
         agent = DummyAgent(phase_number="1", phase_name="Test")
         captured = {}
 
-        async def fake_call_model(model, messages, system, tools, max_tokens):
+        async def fake_call_model(model, messages, system, tools, max_tokens, tool_choice=None):
             captured["max_tokens"] = max_tokens
             return self._mock_call_model_response()
 
@@ -194,8 +198,14 @@ class TestLLMFallback:
 
     @pytest.mark.asyncio
     async def test_fallback_on_rate_limit(self, mock_env_vars):
-        """Test fallback when primary model hits rate limit — _call_model raises then succeeds."""
+        """Fallback chain: primary hits rate limit → next model succeeds.
+
+        The production chain has 4 entries (primary, fast, fallback, last
+        resort). We force a short chain on the agent so the test doesn't
+        depend on which default chain `settings` is producing.
+        """
         agent = DummyAgent(phase_number="1", phase_name="Test")
+        agent.fallback_chain = [agent.model, "claude-haiku-4-5-20251001"]
 
         success_result = {
             "content": "Fallback response",

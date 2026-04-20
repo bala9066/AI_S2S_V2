@@ -78,9 +78,20 @@ class TestOrchestratorAgent:
         assert orchestrator._agent_cache == {}
 
     def test_phase_order_constant(self):
-        """Test phase execution order."""
-        expected = ["P1", "P2", "P3", "P4", "P6", "P8a", "P8b", "P8c"]
+        """PHASE_ORDER covers every auto AI phase in execution order.
+
+        The list now includes P7 (FPGA) and P7a (Register Map) between P6
+        (GLR) and P8a (SRS). Manual-only phases (P5 PCB layout) are
+        intentionally absent — the orchestrator doesn't auto-run them.
+        """
+        expected = ["P1", "P2", "P3", "P4", "P6", "P7", "P7a", "P8a", "P8b", "P8c"]
         assert PHASE_ORDER == expected
+        # Locking in two structural invariants rather than just a literal
+        # so a reorder with a typo gets flagged even if the length matches:
+        assert PHASE_ORDER.index("P1") == 0
+        assert PHASE_ORDER[-1] == "P8c"
+        assert "P5" not in PHASE_ORDER  # manual PCB layout
+        assert len(set(PHASE_ORDER)) == len(PHASE_ORDER)  # no duplicates
 
     def test_phase_agents_mapping(self):
         """Test phase to agent mapping."""
