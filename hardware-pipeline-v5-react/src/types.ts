@@ -1,0 +1,77 @@
+export type PhaseStatusValue = 'pending' | 'in_progress' | 'completed' | 'failed' | 'draft_pending';
+
+export interface PhaseStatusEntry {
+  status: PhaseStatusValue;
+  updated_at?: string; // ISO string from backend
+}
+
+export type StatusesRaw = Record<string, PhaseStatusEntry>;
+
+export interface Project {
+  id: number;
+  name: string;
+  description?: string;
+  design_type?: string;
+  /** Wizard-selected scope — authoritative on the backend (ProjectDB.design_scope). */
+  design_scope?: DesignScope;
+  status?: string;
+  output_dir?: string;
+  created_at?: string;
+  conversation_history?: unknown[];
+}
+
+export type Statuses = Record<string, PhaseStatusValue>;
+
+export interface SubStep {
+  label: string;
+  time: string;
+  detail: string;
+}
+
+export interface PhaseMeta {
+  id: string;           // "P1", "P2", "P8a" etc
+  code: string;         // "P01", "P02" etc
+  num: number;
+  name: string;
+  tagline: string;
+  color: string;
+  auto: boolean;
+  manual: boolean;
+  time: string;
+  subSteps: SubStep[];
+  metrics: { timeSaved: string; errorReduction: string; confidence: string; costImpact: string };
+  inputs: string[];
+  outputs: string[];
+  tools: string[];
+  externalTool?: string;
+  /**
+   * v20 — which Stage-0 design scopes this phase applies to.
+   * Omitted or empty means "applies to all scopes" (default).
+   * When a scope is active, phases not listed here are shown greyed-out
+   * with a "Not applicable for scope X" label.
+   */
+  applicableScopes?: DesignScope[];
+}
+
+export type CenterTab = 'chat' | 'documents';
+export type AppMode = 'landing' | 'pipeline';
+
+/**
+ * v20 — Stage 0 design scope. Picked once per project, before the P1 chat
+ * begins. Drives which clarification questions are asked, which fallback
+ * card bank renders on backend failure, and which pipeline phases are
+ * applicable (others are greyed out in the sidebar).
+ *
+ * - 'full'          : whole receiver chain (default if unset)
+ * - 'front-end'     : RF front-end only (LNA + preselector + optional mixer)
+ * - 'downconversion': downconversion / IF stage only (mixer + LO + IF filter)
+ * - 'dsp'           : baseband / digital only (ADC + FPGA / DSP / interface)
+ */
+export type DesignScope = 'full' | 'front-end' | 'downconversion' | 'dsp';
+
+export const SCOPE_LABELS: Record<DesignScope, string> = {
+  'full': 'Full Receiver System',
+  'front-end': 'RF Front-End Only',
+  'downconversion': 'Downconversion / IF Stage',
+  'dsp': 'Baseband / DSP Only',
+};
