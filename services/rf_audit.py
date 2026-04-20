@@ -31,6 +31,10 @@ from domains._schema import AuditIssue
 from rules.banned_parts import filter_components
 from tools.block_diagram_validator import validate as _validate_topology
 from tools.datasheet_verify import is_trusted_vendor_url, verify_url
+from tools.distributor_search import (
+    any_api_configured as _distributor_configured,
+    lookup as _distributor_lookup,
+)
 
 log = logging.getLogger(__name__)
 
@@ -158,6 +162,116 @@ def _missing_url_issue(idx: int, c: dict[str, Any]) -> AuditIssue:
 # Banned parts
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Live part-number validation (DigiKey → Mouser → local seed)
+# ---------------------------------------------------------------------------
+
+def run_part_validation_audit(
+    component_recommendations: list[dict[str, Any]],
+    *, timeout_s: float = 6.0,
+) -> tuple[list[dict[str, Any]], list[AuditIssue]]:
+    """Look every MPN up via the distributor cascade. When a part is
+    found we enrich the original component dict with the distributor's
+    canonical manufacturer name, datasheet URL, and lifecycle status so
+    downstream docs use the authoritative values, not the LLM's guesses.
+
+    Issues produced:
+      - `hallucinated_part` (critical) — MPN not found anywhere
+      - `nrnd_part` (high) — found but flagged NRND by the distributor
+      - `obsolete_part` (critical) — found but obsolete / discontinued
+
+    Returns (enriched_components, issues).
+    """
+    issues: list[AuditIssue] = []
+    enriched: list[dict[str, Any]] = []
+    if not component_recommendations:
+        return enriched, issues
+
+    # When nobody is configured to look up live AND the seed file is
+    # also unreachable, we can't distinguish hallucination from "no
+    # oracle" — return without adding issues so the pipeline doesn't
+    # hard-fail on every BOM in air-gap / CI.
+    live_configured = _distributor_configured()
+
+    for c in component_recommendations:
+        pn = (
+            c.get("part_number")
+            or c.get("primary_part")
+            or c.get("mpn")
+            or ""
+        ).strip()
+        if not pn:
+            enriched.append(c)
+            continue
+
+        info = None
+        try:
+            info = _distributor_lookup(pn, timeout_s=timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("distributor_lookup_failed pn=%s: %s", pn, exc)
+
+        if info is None:
+            # MPN unknown to every oracle we tried.
+            if live_configured:
+                issues.append(AuditIssue(
+                    severity="critical",
+                    category="hallucinated_part",
+                    location=f"component_recommendations/{pn}",
+                    detail=(
+                        f"Part `{pn}` was not found on DigiKey, Mouser, or in "
+                        "the local component seed — the LLM may have invented it."
+                    ),
+                    suggested_fix=(
+                        "Replace with a verifiable active-production part from "
+                        "data/sample_components.json or a real distributor MPN."
+                    ),
+                ))
+            enriched.append(c)
+            continue
+
+        # Found — flag lifecycle issues before accepting.
+        if info.lifecycle_status == "obsolete":
+            issues.append(AuditIssue(
+                severity="critical",
+                category="obsolete_part",
+                location=f"component_recommendations/{pn}",
+                detail=(
+                    f"Part `{pn}` is marked OBSOLETE by {info.source}. "
+                    "Shipping an obsolete MPN risks immediate BOM redesign."
+                ),
+                suggested_fix="Replace with an active-production successor.",
+            ))
+        elif info.lifecycle_status == "nrnd":
+            issues.append(AuditIssue(
+                severity="high",
+                category="nrnd_part",
+                location=f"component_recommendations/{pn}",
+                detail=(
+                    f"Part `{pn}` is NRND (Not Recommended for New Designs) "
+                    f"per {info.source}."
+                ),
+                suggested_fix="Prefer an active-production alternative for new builds.",
+            ))
+
+        # Enrich the component dict with authoritative values. The LLM's
+        # fields survive only when the distributor didn't provide one.
+        merged = {**c}
+        if info.manufacturer:
+            merged["manufacturer"] = info.manufacturer
+        if info.datasheet_url:
+            merged["datasheet_url"] = info.datasheet_url
+        if info.lifecycle_status != "unknown":
+            merged["lifecycle_status"] = info.lifecycle_status
+        merged.setdefault("distributor_source", info.source)
+        if info.product_url:
+            merged.setdefault("product_url", info.product_url)
+        if info.unit_price_usd is not None:
+            merged.setdefault("unit_price_usd", info.unit_price_usd)
+        enriched.append(merged)
+
+    return enriched, issues
+
+
 def run_banned_parts_audit(
     component_recommendations: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[AuditIssue]]:
@@ -194,18 +308,30 @@ def run_all(
         architecture,
     ))
 
-    # 2. Banned parts — clean the BOM before the datasheet probe so we
-    # don't waste HEAD requests on parts we're about to drop anyway.
+    # 2. Banned parts — clean the BOM before the distributor lookup so we
+    # don't waste API calls on parts we're about to drop anyway.
     bom_key = "component_recommendations"
     if bom_key not in tool_input and "bom" in tool_input:
         bom_key = "bom"
     original = tool_input.get(bom_key) or []
     cleaned, banned_issues = run_banned_parts_audit(original)
     issues.extend(banned_issues)
-    if banned_issues:
-        tool_input = {**tool_input, bom_key: cleaned}
 
-    # 3. Datasheet URLs (on the cleaned BOM)
-    issues.extend(run_datasheet_audit(cleaned, timeout_s=timeout_s))
+    # 3. Live part validation — DigiKey → Mouser → seed. Closes the
+    # last-mile hallucination gap: parts the LLM invents and that aren't
+    # in any distributor catalogue get flagged here. Also enriches
+    # component dicts with the distributor's canonical manufacturer +
+    # datasheet URL, so downstream docs use authoritative values.
+    enriched, part_issues = run_part_validation_audit(cleaned, timeout_s=timeout_s)
+    issues.extend(part_issues)
+
+    # Persist the cleaned + enriched BOM back onto tool_input
+    if banned_issues or part_issues or enriched != cleaned:
+        tool_input = {**tool_input, bom_key: enriched}
+
+    # 4. Datasheet URLs (on the enriched BOM — post-distributor, the URLs
+    # should mostly be authoritative already, but any that still slipped
+    # through get validated here as a belt-and-braces check).
+    issues.extend(run_datasheet_audit(enriched, timeout_s=timeout_s))
 
     return tool_input, issues
