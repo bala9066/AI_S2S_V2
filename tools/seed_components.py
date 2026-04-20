@@ -1,95 +1,80 @@
 """
-Component Seeding Tool - Populate ChromaDB with sample components.
+Component seeding — load data/sample_components.json into the vector store
+on first boot when the collection is empty.
 
-Reads sample components from JSON and seeds them into ChromaDB
-if the database is empty.
+Delegates the actual add to `ComponentSearchTool.add_component` so the
+on-disk storage shape and metadata layout stay consistent with search.
 """
+from __future__ import annotations
 
 import json
 import logging
 from pathlib import Path
 
-from tools.component_search import ComponentSearchTool
 from schemas.component import Component
+from tools.component_search import ComponentSearchTool
 
 logger = logging.getLogger(__name__)
 
 
-def seed_if_empty() -> None:
-    """
-    Seed ChromaDB with sample components if it's empty.
+def _coerce_specs(raw: dict) -> dict[str, str]:
+    """Chroma metadata must be primitive — stringify nested specs."""
+    if not isinstance(raw, dict):
+        return {}
+    return {k: str(v) for k, v in raw.items()}
 
-    This function checks if the ChromaDB collection already has components.
-    If empty, it loads components from data/sample_components.json and adds them.
-    """
+
+def seed_if_empty() -> None:
+    """Populate the vector store from data/sample_components.json, but only
+    when it's empty. Safe to call on every startup (idempotent no-op when
+    already populated)."""
     tool = ComponentSearchTool()
 
-    # Check if collection is available
-    if not tool._collection:
-        logger.warning("ChromaDB collection not available, skipping seed")
+    if not tool._vs:
+        logger.warning("Vector store not available — skipping seed")
         return
 
-    # Get current stats
-    stats = tool.get_stats()
-    total_components = stats.get("total_components", 0)
-
-    if total_components > 0:
-        logger.info(f"ChromaDB already populated with {total_components} components, skipping seed")
+    if tool.get_stats().get("total_components", 0) > 0:
+        logger.info("Vector store already populated — skipping seed")
         return
 
-    # Load sample components from JSON
     sample_file = Path(__file__).parent.parent / "data" / "sample_components.json"
-
     if not sample_file.exists():
-        logger.warning(f"Sample components file not found: {sample_file}")
+        logger.warning("Sample components file not found: %s", sample_file)
         return
 
     try:
-        with open(sample_file, "r") as f:
-            data = json.load(f)
+        data = json.loads(sample_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.error("Failed to load %s: %s", sample_file, exc)
+        return
 
-        components = data.get("components", [])
-        logger.info(f"Loading {len(components)} sample components into ChromaDB...")
+    components = data.get("components", [])
+    logger.info("Seeding %d sample components...", len(components))
 
-        added_count = 0
-        for comp_data in components:
-            # Create Component object — coerce all key_specs values to str
-            raw_specs = comp_data.get("key_specs", {})
-            str_specs = {k: str(v) for k, v in raw_specs.items()}
+    added = 0
+    for comp_data in components:
+        component = Component(
+            part_number=comp_data.get("part_number", ""),
+            manufacturer=comp_data.get("manufacturer", ""),
+            description=comp_data.get("description", ""),
+            category=comp_data.get("category", "Unknown"),
+            key_specs=_coerce_specs(comp_data.get("key_specs", {})),
+            datasheet_url=comp_data.get("datasheet_url", ""),
+            lifecycle_status=comp_data.get("lifecycle_status", "unknown"),
+            estimated_cost_usd=comp_data.get("estimated_cost_usd"),
+        )
+        # Prefer explicit search_text if present (richer than description)
+        description_text = comp_data.get("search_text") or component.description
+        if tool.add_component(component, description_text):
+            added += 1
 
-            component = Component(
-                part_number=comp_data.get("part_number", ""),
-                manufacturer=comp_data.get("manufacturer", ""),
-                description=comp_data.get("description", ""),
-                category=comp_data.get("category", "Unknown"),
-                key_specs=str_specs,
-                datasheet_url=comp_data.get("datasheet_url", ""),
-                lifecycle_status=comp_data.get("lifecycle_status", "unknown"),
-                estimated_cost_usd=comp_data.get("estimated_cost_usd"),
-            )
-
-            # Use search_text for semantic indexing (or fall back to description)
-            description_text = comp_data.get("search_text", comp_data.get("description", ""))
-
-            # Add to ChromaDB
-            success = tool.add_component(component, description_text)
-            if success:
-                added_count += 1
-                logger.debug(f"Added component: {component.part_number}")
-            else:
-                logger.warning(f"Failed to add component: {component.part_number}")
-
-        logger.info(f"Successfully seeded {added_count}/{len(components)} sample components")
-
-    except Exception as e:
-        logger.error(f"Error seeding components: {e}")
+    logger.info("Seeded %d/%d components", added, len(components))
 
 
 if __name__ == "__main__":
-    # Configure logging for standalone execution
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-
     seed_if_empty()

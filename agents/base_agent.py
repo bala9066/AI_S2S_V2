@@ -22,12 +22,15 @@ import httpx
 from openai import AsyncOpenAI
 
 from config import settings
+from observability import tracer as _tracer
 from services.llm_logger import (
     canonical_prompt as _canonical_prompt,
     current_run_id as _current_run_id,
     log_llm_call as _log_llm_call,
     now_ms as _now_ms,
 )
+
+_otel_tracer = _tracer("hardware-pipeline.agent")
 
 logger = logging.getLogger(__name__)
 
@@ -215,66 +218,89 @@ class BaseAgent(ABC):
         # Try each model in the fallback chain
         chain = [model] + [m for m in self.fallback_chain if m != model]
 
-        last_error = None
-        for fallback_model in chain:
-            _start_ms = _now_ms()
-            try:
-                result = await self._call_model(
-                    fallback_model, messages, system, tools, max_tokens, tool_choice
-                )
-                if result:
-                    result["model_used"] = fallback_model
-                    usage = result.get("usage", {})
-                    logger.info(
-                        "llm.call_ok phase=%s model=%s in=%s out=%s",
-                        self.phase_number, fallback_model,
-                        usage.get("input_tokens", 0), usage.get("output_tokens", 0),
-                        extra={"phase": self.phase_number, "model": fallback_model},
+        # One parent span per call_llm — captures the whole fallback traversal.
+        # Child _call_model calls show up as attributes on this parent so we
+        # can see which model actually answered.
+        with _otel_tracer.start_as_current_span(f"llm.{self.phase_number}") as span:
+            span.set_attribute("llm.phase", self.phase_number or "")
+            span.set_attribute("llm.model_requested", model)
+            span.set_attribute("llm.message_count", len(messages))
+            span.set_attribute("llm.tool_count", len(tools) if tools else 0)
+            span.set_attribute("llm.max_tokens", max_tokens)
+            last_error = None
+            for fallback_model in chain:
+                _start_ms = _now_ms()
+                try:
+                    result = await self._call_model(
+                        fallback_model, messages, system, tools, max_tokens, tool_choice
                     )
-                    # B1.3 — persist one llm_calls row per successful call.
-                    try:
-                        _log_llm_call(
-                            pipeline_run_id=_current_run_id(),
-                            model=fallback_model,
-                            prompt=_canonical_prompt(messages, system),
-                            response=result.get("content", ""),
-                            tokens_in=usage.get("input_tokens"),
-                            tokens_out=usage.get("output_tokens"),
-                            latency_ms=_now_ms() - _start_ms,
-                            tool_calls=result.get("tool_calls") or None,
-                            temperature=0.0,  # ADR-001: agents run at temp=0
+                    if result:
+                        result["model_used"] = fallback_model
+                        usage = result.get("usage", {})
+                        logger.info(
+                            "llm.call_ok phase=%s model=%s in=%s out=%s",
+                            self.phase_number, fallback_model,
+                            usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                            extra={"phase": self.phase_number, "model": fallback_model},
                         )
-                    except Exception as _log_exc:
-                        logger.debug("llm_logger.failed: %s", _log_exc)
-                    return result
-            except anthropic.RateLimitError as e:
-                logger.warning(
-                    "llm.rate_limit phase=%s model=%s — trying next",
-                    self.phase_number, fallback_model,
-                    extra={"phase": self.phase_number},
-                )
-                last_error = e
-            except anthropic.APIStatusError as e:
-                if "token" in str(e).lower() or "limit" in str(e).lower():
+                        span.set_attribute("llm.model_used", fallback_model)
+                        span.set_attribute("llm.tokens_in",  usage.get("input_tokens", 0) or 0)
+                        span.set_attribute("llm.tokens_out", usage.get("output_tokens", 0) or 0)
+                        span.set_attribute("llm.stop_reason", result.get("stop_reason", "") or "")
+                        span.set_attribute("llm.latency_ms", _now_ms() - _start_ms)
+                        span.set_attribute("llm.tool_calls", len(result.get("tool_calls") or []))
+                        # B1.3 — persist one llm_calls row per successful call.
+                        try:
+                            _log_llm_call(
+                                pipeline_run_id=_current_run_id(),
+                                model=fallback_model,
+                                prompt=_canonical_prompt(messages, system),
+                                response=result.get("content", ""),
+                                tokens_in=usage.get("input_tokens"),
+                                tokens_out=usage.get("output_tokens"),
+                                latency_ms=_now_ms() - _start_ms,
+                                tool_calls=result.get("tool_calls") or None,
+                                temperature=0.0,  # ADR-001: agents run at temp=0
+                            )
+                        except Exception as _log_exc:
+                            logger.debug("llm_logger.failed: %s", _log_exc)
+                        return result
+                except anthropic.RateLimitError as e:
                     logger.warning(
-                        "llm.token_limit phase=%s model=%s — trying next",
+                        "llm.rate_limit phase=%s model=%s — trying next",
                         self.phase_number, fallback_model,
                         extra={"phase": self.phase_number},
                     )
                     last_error = e
-                else:
-                    raise
-            except Exception as e:
-                logger.warning(
-                    "llm.error phase=%s model=%s: %s — trying next",
-                    self.phase_number, fallback_model, e,
-                    extra={"phase": self.phase_number},
-                )
-                last_error = e
+                except anthropic.APIStatusError as e:
+                    if "token" in str(e).lower() or "limit" in str(e).lower():
+                        logger.warning(
+                            "llm.token_limit phase=%s model=%s — trying next",
+                            self.phase_number, fallback_model,
+                            extra={"phase": self.phase_number},
+                        )
+                        last_error = e
+                    else:
+                        span.record_exception(e)
+                        raise
+                except Exception as e:
+                    logger.warning(
+                        "llm.error phase=%s model=%s: %s — trying next",
+                        self.phase_number, fallback_model, e,
+                        extra={"phase": self.phase_number},
+                    )
+                    last_error = e
 
-        raise RuntimeError(
-            f"All models in fallback chain failed. Last error: {last_error}"
-        )
+            err = RuntimeError(
+                f"All models in fallback chain failed. Last error: {last_error}"
+            )
+            span.record_exception(err)
+            try:
+                from opentelemetry.trace import Status, StatusCode
+                span.set_status(Status(StatusCode.ERROR))
+            except Exception:
+                pass
+            raise err
 
     async def _call_model(
         self,

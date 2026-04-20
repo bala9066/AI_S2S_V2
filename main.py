@@ -45,7 +45,16 @@ async def lifespan(app: FastAPI):
 
     # 2. Initialise DB (creates tables if they don't exist)
     from database.models import get_engine
-    get_engine()
+    _db_engine = get_engine()
+
+    # 2b. Wire up OpenTelemetry — no-op when OTEL_EXPORTER_OTLP_ENDPOINT
+    # is unset, so local dev keeps working unchanged. When set, every
+    # FastAPI route, SQL query, and LLM call becomes a span.
+    try:
+        from observability import configure_otel
+        configure_otel(app=app, engine=_db_engine)
+    except Exception as exc:
+        log.warning("startup.otel_skipped: %s", exc)
 
     # 2a. Apply idempotent SQLite migrations (requirements lock columns,
     #     pipeline_runs / llm_calls tables). Safe to call on every start.
