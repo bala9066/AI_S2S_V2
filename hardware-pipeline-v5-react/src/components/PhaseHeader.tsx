@@ -26,8 +26,8 @@ export default function PhaseHeader({ phase, status, tab, onTabChange, onExecute
   const applicable = isPhaseApplicable(phase, scope ?? undefined);
 
   const tabs: { id: CenterTab; label: string; show: boolean }[] = [
-    { id: 'chat',      label: '⚡ Chat',      show: phase.id === 'P1' },
-    { id: 'documents', label: '📄 Documents', show: true },
+    { id: 'chat' as const,      label: '⚡ Chat',      show: phase.id === 'P1' },
+    { id: 'documents' as const, label: '📄 Documents', show: true },
   ].filter(t => t.show);
 
   // Status pill config

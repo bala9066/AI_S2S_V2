@@ -345,7 +345,11 @@ function ICBlock({ comp }: { comp: ComponentData }) {
         const step = (side === 'left' || side === 'right') ? hPx / (list.length + 1) : wPx / (list.length + 1);
         return list.map((p, i) => {
           const pos = step * (i + 1);
-          let x1 = 0, y1 = 0, x2 = 0, y2 = 0, tx = 0, ty = 0, anchor = 'start';
+          let x1 = 0, y1 = 0, x2 = 0, y2 = 0, tx = 0, ty = 0;
+          // SVG textAnchor accepts "start" | "middle" | "end" — type the
+          // variable so the <text textAnchor=...> prop isn't handed a plain
+          // string (verbatimModuleSyntax tightens this check).
+          let anchor: 'start' | 'middle' | 'end' = 'start';
           if (side === 'left')   { x1 = 0;    y1 = pos; x2 = -10; y2 = pos; tx = 4;       ty = pos + 3; anchor = 'start'; }
           if (side === 'right')  { x1 = wPx;  y1 = pos; x2 = wPx + 10; y2 = pos; tx = wPx - 4; ty = pos + 3; anchor = 'end'; }
           if (side === 'top')    { x1 = pos;  y1 = 0;   x2 = pos; y2 = -10; tx = pos;     ty = 10; anchor = 'middle'; }
