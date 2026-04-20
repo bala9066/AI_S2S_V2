@@ -118,6 +118,13 @@ filterwarnings = [
     "error",
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
+    # pytest-asyncio leaves its event loop around for the duration of the
+    # test session; Python's GC emits ResourceWarnings ("unclosed event loop")
+    # at interpreter shutdown that pytest's unraisable-exception collector
+    # then promotes to PytestUnraisableExceptionWarning. Tests all pass —
+    # this is end-of-session noise only, so we silence it.
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+    "ignore::ResourceWarning",
 ]
 
 [tool.coverage.run]

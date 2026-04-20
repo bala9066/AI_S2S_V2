@@ -59,9 +59,14 @@ def chat_env(tmp_path: Path, monkeypatch):
     import asyncio
     try:
         if _models._async_engine is not None:
-            asyncio.get_event_loop().run_until_complete(
-                _models._async_engine.dispose()
-            )
+            # Dispose on a dedicated, immediately-closed loop so we don't
+            # leave an orphaned event loop behind (pytest emits an
+            # unraisable-exception warning otherwise).
+            _loop = asyncio.new_event_loop()
+            try:
+                _loop.run_until_complete(_models._async_engine.dispose())
+            finally:
+                _loop.close()
     except Exception:
         pass
     try:

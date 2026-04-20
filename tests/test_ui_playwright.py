@@ -14,7 +14,18 @@ Run with:
 import re
 import time
 import pytest
-from playwright.sync_api import Page, expect, sync_playwright
+
+# Skip the whole module when Playwright isn't installed — previously a bare
+# `import playwright` at module load broke pytest collection on fresh
+# environments, forcing contributors to `--ignore=tests/test_ui_playwright.py`
+# to run any other suite. importorskip turns it into a clean "skipped".
+playwright_sync_api = pytest.importorskip(
+    "playwright.sync_api",
+    reason="playwright not installed — run `pip install playwright pytest-playwright` to enable",
+)
+Page = playwright_sync_api.Page
+expect = playwright_sync_api.expect
+sync_playwright = playwright_sync_api.sync_playwright
 
 BASE_URL = "http://localhost:8501"
 TIMEOUT = 30_000  # 30s timeout for slow LLM responses
