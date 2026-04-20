@@ -376,6 +376,28 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             try:
                 from tools.netlist_drc import run_drc
                 drc = run_drc(netlist_data)
+                # Pin-number validation (P3 — closes the "pin numbers are
+                # LLM-generated" gap): validate every schematic component
+                # against `data/pin_maps.json` or the package pin-count
+                # fallback. Hallucinated pins surface here as critical /
+                # high severity entries that the UI already renders.
+                try:
+                    from tools.pin_map import validate_netlist_pins
+                    pin_issues = validate_netlist_pins(netlist_data)
+                    if pin_issues:
+                        drc.setdefault("violations", []).extend(pin_issues)
+                        for pi in pin_issues:
+                            sev = pi.get("severity", "info")
+                            drc.setdefault("counts", {})[sev] = \
+                                drc["counts"].get(sev, 0) + 1
+                        drc["checks_run"] = list(drc.get("checks_run") or []) + [
+                            "pin_validation",
+                        ]
+                        if any(p["severity"] in ("critical", "high")
+                               for p in pin_issues):
+                            drc["overall_pass"] = False
+                except Exception as _pin_exc:
+                    self.log(f"pin_validation_failed: {_pin_exc}", "warning")
                 outputs["netlist_drc.json"] = json.dumps(drc, indent=2)
             except Exception as _drc_exc:
                 self.log(f"drc_failed: {_drc_exc}", "warning")
@@ -428,7 +450,25 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             outputs["netlist_validation.json"] = json.dumps(validation, indent=2)
             try:
                 from tools.netlist_drc import run_drc
-                outputs["netlist_drc.json"] = json.dumps(run_drc(netlist_data), indent=2)
+                drc = run_drc(netlist_data)
+                try:
+                    from tools.pin_map import validate_netlist_pins
+                    pin_issues = validate_netlist_pins(netlist_data)
+                    if pin_issues:
+                        drc.setdefault("violations", []).extend(pin_issues)
+                        for pi in pin_issues:
+                            sev = pi.get("severity", "info")
+                            drc.setdefault("counts", {})[sev] = \
+                                drc["counts"].get(sev, 0) + 1
+                        drc["checks_run"] = list(drc.get("checks_run") or []) + [
+                            "pin_validation",
+                        ]
+                        if any(p["severity"] in ("critical", "high")
+                               for p in pin_issues):
+                            drc["overall_pass"] = False
+                except Exception:
+                    pass
+                outputs["netlist_drc.json"] = json.dumps(drc, indent=2)
             except Exception:
                 pass
             outputs["schematic.json"] = json.dumps(
