@@ -516,6 +516,14 @@ class ProjectService:
                 entry: dict = {"status": status, "updated_at": datetime.utcnow().isoformat()}
                 if extra:
                     entry.update(extra)
+                # Mirror the sync variant: stamp the current requirements_hash
+                # onto every completion so the stale-phase detector can tell
+                # whether this output was generated against the currently-locked
+                # requirements or an older version.
+                if status == "completed":
+                    current_hash = getattr(p, "requirements_hash", None)
+                    if current_hash:
+                        entry["requirements_hash_at_completion"] = current_hash
                 statuses[phase_id] = entry
 
                 # When P1 requirements are updated (re-completed), reset all downstream

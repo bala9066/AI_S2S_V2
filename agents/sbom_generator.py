@@ -121,11 +121,16 @@ def _parse_components(text: str) -> List[Dict]:
     components = []
     seen = set()
 
-    # 1. Parse markdown table rows
+    # 1. Parse markdown table rows — run the pattern per-line so the trailing
+    # `(?:[^|]*\|)*` segment can't eat subsequent rows' content (the old
+    # full-text match collapsed multi-row tables into the first row only).
     table_row = re.compile(
         r"\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|(?:[^|]*\|)*"
     )
-    for m in table_row.finditer(text):
+    for line in text.splitlines():
+        m = table_row.search(line)
+        if not m:
+            continue
         name = m.group(1).strip().lstrip("#").strip()
         vendor = m.group(2).strip()
         desc = m.group(3).strip()
