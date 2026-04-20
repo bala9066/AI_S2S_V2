@@ -4,15 +4,19 @@ from pathlib import Path
 dist = Path('hardware-pipeline-v5-react/dist')
 src_html = (dist / 'index.html').read_text(encoding='utf-8')
 
-# Inline CSS
+# Inline CSS (fallback — vite-plugin-singlefile already handles this)
 for css_file in dist.glob('assets/*.css'):
     tag = f'<link rel="stylesheet" crossorigin href="/assets/{css_file.name}">'
     src_html = src_html.replace(tag, f'<style>{css_file.read_text("utf-8")}</style>')
 
-# Inline JS
+# Inline JS (fallback — vite-plugin-singlefile already handles this)
 for js_file in dist.glob('assets/*.js'):
     tag = f'<script type="module" crossorigin src="/assets/{js_file.name}"></script>'
     src_html = src_html.replace(tag, f'<script type="module">{js_file.read_text("utf-8")}</script>')
+
+# vite-plugin-singlefile preserves rel/crossorigin attrs on inlined <style> tags.
+# Browsers tolerate these but they are invalid HTML — strip them for cleanliness.
+src_html = re.sub(r'<style\s+rel="stylesheet"\s+crossorigin>', '<style>', src_html)
 
 # Escape non-ASCII in entire HTML.
 # Characters above U+FFFF (emoji etc.) need JS surrogate pairs — \uXXXX
