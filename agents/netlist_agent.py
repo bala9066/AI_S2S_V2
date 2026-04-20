@@ -353,6 +353,15 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             # handles the actual file writes via StorageAdapter (single write path).
             outputs["netlist.json"] = json.dumps(generator_netlist, indent=2)
 
+            # P1.4 — emit a real KiCad-importable .net alongside the JSON.
+            # Mirrors the JSON but in S-expression format so a PCB designer
+            # can Forward-Netlist → Pcbnew without hand-translation.
+            try:
+                from generators.kicad_netlist import netlist_to_kicad
+                outputs["netlist.net"] = netlist_to_kicad(generator_netlist)
+            except Exception as _knl_exc:
+                self.log(f"kicad_netlist_export_failed: {_knl_exc}", "warning")
+
             # Generate visual markdown with full component/connection tables
             mermaid_diagram = self.netlist_generator.to_mermaid(generator_netlist)
             visual_content = self._build_visual_md(netlist_data, project_name, mermaid_diagram)
@@ -361,6 +370,15 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             # Run NetworkX validation — always store as JSON string (not dict)
             validation = self._validate_netlist(netlist_data)
             outputs["netlist_validation.json"] = json.dumps(validation, indent=2)
+
+            # P2.7 — structured DRC (shorts, floating outputs, power-net
+            # connectivity). Complements the LLM's prose validation_notes.
+            try:
+                from tools.netlist_drc import run_drc
+                drc = run_drc(netlist_data)
+                outputs["netlist_drc.json"] = json.dumps(drc, indent=2)
+            except Exception as _drc_exc:
+                self.log(f"drc_failed: {_drc_exc}", "warning")
 
             # Schematic data — if the LLM produced one, persist it. Otherwise synthesize a
             # minimal single-sheet schematic from the node/edge list so the UI always has
@@ -395,6 +413,12 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                 metadata={"auto_synthesized": True},
             )
             outputs["netlist.json"] = json.dumps(generator_netlist, indent=2)
+            # Same KiCad .net + DRC emission as the happy path above.
+            try:
+                from generators.kicad_netlist import netlist_to_kicad
+                outputs["netlist.net"] = netlist_to_kicad(generator_netlist)
+            except Exception:
+                pass
             mermaid_diagram = self.netlist_generator.to_mermaid(generator_netlist)
             visual_content = self._build_visual_md(netlist_data, project_name, mermaid_diagram)
             import re as _re
@@ -402,6 +426,11 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             outputs["netlist_visual.md"] = visual_content
             validation = self._validate_netlist(netlist_data)
             outputs["netlist_validation.json"] = json.dumps(validation, indent=2)
+            try:
+                from tools.netlist_drc import run_drc
+                outputs["netlist_drc.json"] = json.dumps(run_drc(netlist_data), indent=2)
+            except Exception:
+                pass
             outputs["schematic.json"] = json.dumps(
                 self._synthesize_schematic(netlist_data), indent=2
             )

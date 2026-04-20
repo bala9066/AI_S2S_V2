@@ -27,7 +27,28 @@ from typing import Any, Optional
 
 from domains._schema import AuditIssue, AuditReport
 from domains.standards import validate_citations
+from tools.block_diagram_validator import validate as _validate_topology
 from tools.cascade_validator import validate_cascade_from_dicts
+
+
+def _check_topology(mermaid: str, architecture: Optional[str]) -> list[AuditIssue]:
+    """Translate block-diagram topology violations into AuditIssue rows.
+
+    Keeps the audit module topology-aware without re-implementing the
+    rules engine here — the source of truth stays in
+    `tools/block_diagram_validator.py`.
+    """
+    violations = _validate_topology(mermaid, architecture=architecture)
+    return [
+        AuditIssue(
+            severity=v.severity,
+            category="topology",
+            location="block_diagram_mermaid",
+            detail=v.detail,
+            suggested_fix=v.suggested_fix,
+        )
+        for v in violations
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +404,8 @@ def audit(
     temperature_c: float = 25.0,
     cascade_tolerance_db: float = 1.0,
     cosite_context: Optional[dict[str, Any]] = None,
+    block_diagram_mermaid: Optional[str] = None,
+    architecture: Optional[str] = None,
 ) -> AuditReport:
     """
     Run all red-team checks and return a combined AuditReport.
@@ -421,6 +444,11 @@ def audit(
 
     issues.extend(check_citations(citations))
     issues.extend(check_part_numbers(claimed_parts, known_parts or set()))
+
+    # P2.9 — RF block-diagram topology gate. Only runs when the caller
+    # passed a mermaid + architecture (chat_service / p1_finalize do).
+    if block_diagram_mermaid:
+        issues.extend(_check_topology(block_diagram_mermaid, architecture))
     # v16 — lifecycle gate: blocks EOL/NRND/discontinued parts even when the
     # LLM claims lifecycle_status="active" (hardcoded blacklist wins).
     issues.extend(check_lifecycle(claimed_parts))

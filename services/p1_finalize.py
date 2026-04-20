@@ -28,8 +28,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agents.red_team_audit import audit as _run_audit
-from domains._schema import AuditReport
+from domains._schema import AuditIssue, AuditReport
 from services.requirements_lock import RequirementsLock, freeze, save_to_row
+from services.rf_audit import run_all as _run_rf_audit
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,37 @@ def _collect_parts(tool_input: dict[str, Any]) -> list[dict[str, Any]]:
             "datasheet_url": c.get("datasheet_url") or c.get("datasheet"),
         })
     return parts
+
+
+# ---------------------------------------------------------------------------
+# RF-audit merge
+# ---------------------------------------------------------------------------
+
+def _merge_rf_issues(rep: AuditReport, rf_issues: list[AuditIssue]) -> AuditReport:
+    """Fold RF-audit issues into an existing AuditReport. Recomputes the
+    derived counters and the overall_pass / confidence fields so the UI
+    reflects the new findings."""
+    combined = list(rep.issues) + list(rf_issues)
+    # Counters
+    hallucinations = sum(1 for i in combined if i.category in
+                         ("hallucination", "part_number", "banned_part"))
+    unresolved_cites = sum(1 for i in combined if i.category in
+                           ("missing_citation", "citation"))
+    cascade_errs = sum(1 for i in combined if i.category in
+                       ("cascade_error", "cascade_vs_claims"))
+    blockers = [i for i in combined if i.severity in ("critical", "high")]
+    overall_pass = len(blockers) == 0
+    # Confidence: start at existing score, penalise per blocker, floor at 0
+    confidence = max(0.0, rep.confidence_score - 0.05 * len(blockers))
+    return AuditReport(
+        phase_id=rep.phase_id,
+        issues=combined,
+        hallucination_count=hallucinations,
+        unresolved_citations=unresolved_cites,
+        cascade_errors=cascade_errs,
+        overall_pass=overall_pass,
+        confidence_score=confidence,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +260,11 @@ def finalize_p1(
             "summary_md": f"_(lock not frozen: {exc})_",
         }
 
+    # ── Post-LLM structural checks (topology / datasheets / banned parts) ──
+    # Mutates `tool_input` to strip banned parts before they reach downstream
+    # docs, and produces AuditIssue rows we merge into the red-team report.
+    tool_input, rf_issues = _run_rf_audit(tool_input, architecture=architecture)
+
     # Build audit inputs
     bom_stages = _tool_bom_to_stages(
         tool_input.get("component_recommendations") or tool_input.get("bom") or []
@@ -238,6 +275,9 @@ def finalize_p1(
     known_parts = _load_known_parts(domain)
 
     try:
+        # Topology + datasheet + banned-parts checks run via `rf_audit.run_all`
+        # above — intentionally NOT passed into _run_audit again here to avoid
+        # double-counting the same findings in the final report.
         rep = _run_audit(
             phase_id="P1",
             bom_stages=bom_stages,
@@ -258,6 +298,11 @@ def finalize_p1(
             overall_pass=True,
             confidence_score=0.5,
         )
+
+    # Merge the RF-audit issues (topology / datasheets / banned parts) into
+    # the red-team report so they show up in the same audit artefact.
+    if rf_issues:
+        rep = _merge_rf_issues(rep, rf_issues)
 
     # Serialize artifacts
     lock_json = json.dumps(lock.to_dict(), indent=2, sort_keys=True)
