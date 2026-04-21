@@ -7,12 +7,13 @@ interface Props {
   stalePhaseIds?: string[];
   onRunPipeline?: () => void;
   onRerunStale?: (staleIds: string[]) => void;
+  onShowDag?: () => void;
   pipelineRunning?: boolean;
   theme?: 'dark' | 'light';
   onToggleTheme?: () => void;
 }
 
-export default function MiniTopbar({ project, phases, statuses, stalePhaseIds = [], onRunPipeline, onRerunStale, pipelineRunning, theme = 'dark', onToggleTheme }: Props) {
+export default function MiniTopbar({ project, phases, statuses, stalePhaseIds = [], onRunPipeline, onRerunStale, onShowDag, pipelineRunning, theme = 'dark', onToggleTheme }: Props) {
   const completedCount = phases.filter(p => statuses[p.id] === 'completed').length;
   const runningPhase = phases.find(p => statuses[p.id] === 'in_progress');
   // All AI phases complete (excludes manual phases P5/P7)
@@ -146,6 +147,35 @@ export default function MiniTopbar({ project, phases, statuses, stalePhaseIds = 
           {aiCompletedCount}/{aiPhases.length}
         </span>
       </div>
+
+      {/* Pipeline DAG viewer trigger */}
+      {onShowDag && (
+        <button
+          onClick={onShowDag}
+          title="Open pipeline dependency map"
+          style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            width: 30, height: 30, borderRadius: 6,
+            background: 'var(--panel2)',
+            border: '1px solid var(--border)',
+            color: 'var(--text2)',
+            cursor: 'pointer', fontSize: 13,
+            transition: 'all 0.2s', flexShrink: 0,
+          }}
+          onMouseEnter={e => {
+            e.currentTarget.style.background = 'var(--panel3)';
+            e.currentTarget.style.color = 'var(--teal)';
+            e.currentTarget.style.borderColor = 'var(--teal-border)';
+          }}
+          onMouseLeave={e => {
+            e.currentTarget.style.background = 'var(--panel2)';
+            e.currentTarget.style.color = 'var(--text2)';
+            e.currentTarget.style.borderColor = 'var(--border)';
+          }}
+        >
+          ⌘
+        </button>
+      )}
 
       {/* Theme toggle */}
       {onToggleTheme && (

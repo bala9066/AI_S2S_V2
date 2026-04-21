@@ -9,6 +9,7 @@ import LeftPanel from './components/LeftPanel';
 import MiniTopbar from './components/MiniTopbar';
 import PhaseHeader from './components/PhaseHeader';
 import CreateProjectModal from './components/CreateProjectModal';
+import PipelineDagView from './components/PipelineDagView';
 import LoadProjectModal from './components/LoadProjectModal';
 import LLMSettingsModal from './components/LLMSettingsModal';
 import JudgeMode from './components/JudgeMode';
@@ -32,6 +33,7 @@ export default function App() {
   const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark');
 
   const [mode, setMode] = useState<AppMode>('landing');
+  const [showDag, setShowDag] = useState(false);
   const [modal, setModal] = useState<'create' | 'load' | null>(null);
   const [llmSettingsOpen, setLLMSettingsOpen] = useState(false);
   const [project, setProject] = useState<Project | null>(null);
@@ -588,6 +590,7 @@ export default function App() {
           stalePhaseIds={stalePhaseIds}
           onRunPipeline={handleRunPipeline}
           onRerunStale={handleRerunStale}
+          onShowDag={() => setShowDag(true)}
           pipelineRunning={hasRunning}
           theme={theme}
           onToggleTheme={toggleTheme}
@@ -672,6 +675,18 @@ export default function App() {
       />
       <JudgeMode projectId={project?.id ?? null} />
       <RerunPlanDrawer projectId={project?.id ?? null} />
+      {showDag && (
+        <PipelineDagView
+          statuses={statuses}
+          selectedId={selectedPhase?.id}
+          onSelect={(id) => {
+            const idx = PHASES.findIndex(p => p.id === id);
+            if (idx >= 0) setSelectedPhaseIdx(idx);
+            setShowDag(false);
+          }}
+          onClose={() => setShowDag(false)}
+        />
+      )}
       {toast && <Toast message={toast} />}
     </>
   );
