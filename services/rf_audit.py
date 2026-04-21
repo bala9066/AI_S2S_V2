@@ -658,6 +658,38 @@ def run_pa_thermal_audit(
     return [AuditIssue(**i) for i in raw]
 
 
+def run_acpr_mask_audit(
+    design_parameters: Optional[dict[str, Any]],
+) -> list[AuditIssue]:
+    """Regulatory-mask check. Fires on any project that carries both a
+    spur_mask selection and a claimed ACPR / harmonic rejection. Not
+    strictly TX-only — an RX with a planned retransmit also benefits
+    from the check — but in practice only TX projects fill the fields.
+    """
+    if not design_parameters:
+        return []
+    mask = (design_parameters.get("spur_mask")
+            or design_parameters.get("regulatory_mask"))
+    if not mask:
+        return []
+    aclr = (design_parameters.get("aclr_dbc")
+            or design_parameters.get("acpr_dbc")
+            or design_parameters.get("aclr"))
+    harmonic = (design_parameters.get("harmonic_rej")
+                or design_parameters.get("harmonic_rejection_dbc")
+                or design_parameters.get("harmonic_dbc"))
+    try:
+        from tools.acpr_mask_validator import validate_acpr_mask
+    except Exception:
+        return []
+    raw = validate_acpr_mask(
+        claimed_aclr_dbc=aclr,
+        claimed_harmonic_dbc=harmonic,
+        mask_name=mask,
+    )
+    return [AuditIssue(**i) for i in raw]
+
+
 def run_bom_linkage_audit(
     component_recommendations: list[dict[str, Any]],
     netlist_nodes: Optional[list[dict[str, Any]]],
@@ -812,7 +844,15 @@ def run_all(
     # derating margin.
     issues.extend(run_pa_thermal_audit(enriched, dp))
 
-    # 10. BOM ↔ schematic linkage (P2.9) — runs only in P4 context
+    # 10. Regulatory ACPR / harmonic mask. Fires when design_parameters
+    # carries both a spur_mask choice and a claimed ACPR (or harmonic
+    # rejection). Compares the claim against the published limit for
+    # the mask family (MIL-STD-461, FCC Part 15 A/B, ETSI EN 300,
+    # FCC Part 97). Catches the "PA is 20 dB too hot for type-approval"
+    # case pre-hardware.
+    issues.extend(run_acpr_mask_audit(dp))
+
+    # 11. BOM ↔ schematic linkage (P2.9) — runs only in P4 context
     # where `netlist_nodes` exists. Flags missing + invented parts
     # between the BOM and the generated schematic.
     issues.extend(run_bom_linkage_audit(enriched, netlist_nodes))

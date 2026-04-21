@@ -403,6 +403,58 @@ class TestPaThermalWiring:
         )
 
 
+class TestAcprMaskWiring:
+
+    def test_run_all_flags_acpr_mask_violation(self, monkeypatch):
+        monkeypatch.setenv("SKIP_DISTRIBUTOR_LOOKUP", "1")
+        monkeypatch.setenv("SKIP_DATASHEET_VERIFY", "1")
+        from services.rf_audit import run_all
+        tool_input = {
+            "block_diagram_mermaid": (
+                "flowchart LR\n"
+                "  BB[Baseband] --> DRV[Driver] --> PA[PA]\n"
+                "  PA --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+            ),
+            "component_recommendations": [
+                {"part_number": "PA1", "category": "RF-PA",
+                 "key_specs": {"gain_db": 20, "pout_dbm": 40}},
+            ],
+            "design_parameters": {
+                "direction": "tx",
+                "aclr_dbc": -30,   # way worse than MIL-STD -60
+                "spur_mask": "MIL-STD-461",
+            },
+        }
+        _, issues = run_all(tool_input, architecture="tx_driver_pa_classab")
+        assert any(i.category == "acpr_mask_violation" for i in issues)
+
+    def test_run_all_skips_mask_check_when_none_selected(self, monkeypatch):
+        monkeypatch.setenv("SKIP_DISTRIBUTOR_LOOKUP", "1")
+        monkeypatch.setenv("SKIP_DATASHEET_VERIFY", "1")
+        from services.rf_audit import run_all
+        tool_input = {
+            "block_diagram_mermaid": (
+                "flowchart LR\n"
+                "  BB[Baseband] --> DRV[Driver] --> PA[PA]\n"
+                "  PA --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+            ),
+            "component_recommendations": [
+                {"part_number": "PA1", "category": "RF-PA",
+                 "key_specs": {"gain_db": 20, "pout_dbm": 40}},
+            ],
+            "design_parameters": {
+                "direction": "tx",
+                "aclr_dbc": -30,
+                # no spur_mask
+            },
+        }
+        _, issues = run_all(tool_input, architecture="tx_driver_pa_classab")
+        assert not any(
+            i.category in ("acpr_mask_violation", "harmonic_mask_violation")
+            for i in issues
+        )
+
+
 class TestBomLinkageWiring:
 
     def test_run_all_flags_missing_bom_part_when_nodes_supplied(self, monkeypatch):
