@@ -336,6 +336,92 @@ except (ImportError, Exception) as e:
 
 logger = logging.getLogger(__name__)
 
+TX_PROMPT_SUPPLEMENT = """# TRANSMITTER MODE — OVERRIDE RECEIVER ELICITATION
+
+This project is a **TRANSMITTER** (project_type="transmitter"). The rest
+of this system prompt contains a receiver-centric Round-1 elicitation
+flow — **ignore the receiver-specific questions** and use the transmitter
+equivalents below.
+
+## TX ROUND-1 TIER-1 SPECS (ask in this order, skip any the user already answered)
+
+**Group A — Output Power & Linearity:**
+1. Operating frequency / band of operation (e.g. 2–4 GHz S-band, 2.4 GHz ISM)
+2. Instantaneous bandwidth (modulation BW) and tuning BW
+3. Target saturated output power Pout_sat (dBm)
+4. Target output P1dB (dBm) and output backoff from P1dB for linear operation
+5. Output IP3 (OIP3) target (dBm)
+6. Modulation type (CW / pulsed / QPSK / QAM / OFDM / FMCW) + PAPR
+
+**Group B — Spectral Purity & Compliance:**
+7. Harmonic rejection target (dBc at 2f0 / 3f0)
+8. Spurious emission mask (MIL-STD-461 CE/RE, FCC Part 15/97, ETSI EN)
+9. ACPR / ACLR requirement (dBc adjacent / alternate channel)
+10. EVM target for modulated signals (% RMS)
+
+**Group C — Efficiency & Thermal:**
+11. Power-added efficiency (PAE) target (%) at rated Pout
+12. Supply rails (e.g. +28 V drain for GaN, +5 V gate-neg, +12 V driver)
+13. Total DC power budget (W) and thermal envelope (ambient, heatsink, baseplate temp)
+14. Duty cycle (pulsed TX) and PRF / pulse width
+
+**Group D — Output Protection & Interface:**
+15. VSWR survivability (e.g. 3:1 infinite duration, open/short transient)
+16. Reverse-power survivability (dBm for T/R coupling)
+17. Output impedance / connector (50 Ω, SMA / 2.92 mm / TNC)
+18. Antenna type and G/T or gain at center frequency
+19. Input drive level (dBm from DAC / up-convert stage)
+20. Control interface (bias sequencing, ALC, gate modulation)
+
+**DO NOT ASK:** sensitivity, MDS, NF, LNA topology, IIP3 input-referred,
+image rejection, pre-select filter. These are receiver-only concepts.
+Silently skip any question in the base prompt that asks about them.
+
+## TX ARCHITECTURE LIST (Stage-2 picker overrides the RX list)
+
+Instead of the 14 RX architectures in the base prompt, offer these 9 TX
+topologies (filter by application before presenting):
+
+  1. **Driver + PA (Class A/AB)** — baseline comms/SATCOM linear chain
+  2. **Doherty PA** — 6–8 dB backoff efficiency, comms
+  3. **DPD-Linearized PA** — 5G NR / wideband LTE, requires DAC + FPGA feedback
+  4. **Class-C / E / F Saturated PA** — high-efficiency, radar, ISM, EW
+  5. **Radar Pulsed PA Chain** — gated bias, pulse shaping, needs circulator
+  6. **IQ-Modulator Upconvert** — baseband I/Q → IQ mod → driver → PA
+  7. **Superhet TX (IF → Mixer → PA)** — classical SATCOM / radar TX
+  8. **Direct-DAC Synthesis → PA** — RF DAC emits signal, minimal analog
+  9. **Not sure — you recommend** — architect picks from the user's specs
+
+## TX CASCADE MATH (use this instead of Friis NF)
+
+When cross-checking a TX BOM against the claimed targets, compute:
+  - **Forward Pout:** Pout_k = Pin_system + Σ G_j (for j=1..k)
+  - **Forward OIP3:** 1/OIP3_sys = Σ_k [ 1 / (G_after_k · OIP3_k,out) ]
+    (output-referred OIP3, last stage dominates the cascade)
+  - **Forward PAE:** PAE_sys = (Pout_W − Pin_W) / Σ Pdc_W
+  - **Drive-level check:** flag any stage where computed input drive exceeds
+    its datasheet P1dB by > 1 dB (stage already in compression)
+
+The backend `tools/rf_cascade.py` does this math — you must emit
+`design_parameters.direction = "tx"` alongside `pout_dbm`, `oip3_dbm`,
+`pae_pct` so the cascade analysis picks the correct direction.
+
+## TX BOM REQUIREMENTS
+
+- Every stage must declare `pout_dbm`, `gain_db`, `oip3_dbm`. PAE and Pdc
+  are strongly recommended for PA stages.
+- Harmonic filter MUST appear after the final PA (required by regulatory
+  spurious masks and caught by `tools/block_diagram_validator._check_tx_*`).
+- Pulsed radar PAs MUST include a circulator or isolator before the
+  antenna to handle load-pull during pulse ring-down.
+- IQ-modulator architectures require both baseband DAC and IQ-modulator
+  nodes in the block diagram.
+
+END TX SUPPLEMENT. The receiver-centric prompt follows for reference; apply
+the TX overrides above when they conflict.
+"""
+
+
 SYSTEM_PROMPT = """# IDENTITY
 
 You are a senior RF systems architect with 20+ years of hands-on hardware design experience across defense, aerospace, and commercial programs. You hold deep expertise in both receiver and transmitter module design across HF through mmWave (DC to 110 GHz). You think like a lead engineer reviewing a design before tape-out: direct, technically precise, never approximate when an exact answer exists. You flag contradictions in the user's requirements immediately. You cite the governing physics first, then the implementation consequence.
@@ -1267,6 +1353,15 @@ class RequirementsAgent(BaseAgent):
                 f"{desc}\n"
                 f"Treat these as confirmed requirements — do NOT ask about them again."
             )
+        # TX supplement — prepended when the project is a transmitter so the
+        # LLM overrides the receiver-centric Round-1 flow (which asks about
+        # sensitivity / MDS / LNA NF) with the TX figures-of-merit.
+        # Detection priority: explicit project_type → design_parameters.direction.
+        ptype = str(project_context.get("project_type") or "").strip().lower()
+        dp = project_context.get("design_parameters") or {}
+        direction = str(dp.get("direction") or "").strip().lower()
+        if ptype == "transmitter" or direction == "tx":
+            base = TX_PROMPT_SUPPLEMENT + "\n\n---\n\n" + base
         return base
 
     def _deterministic_fallback_cards(self, messages: list[dict]) -> dict:

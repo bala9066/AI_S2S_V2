@@ -43,7 +43,8 @@ ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "lna":         ("lna", "low-noise", "low noise amp", "low noise amplifier"),
     "balanced_lna":("balanced lna", "balanced amp"),
     "mixer":       ("mixer", "downconvert", "downconversion", "demod mixer",
-                    "i/q mixer", "iq mixer", "quadrature mixer"),
+                    "i/q mixer", "iq mixer", "quadrature mixer",
+                    "upconvert", "upconversion", "up-convert", "modulator mixer"),
     "lo":          ("local oscillator", " lo ", "lo input", "lo port",
                     "synthesizer", "pll", "synth"),
     "if_filter":   ("if filter", "if bpf", "if select", "channel filter",
@@ -52,6 +53,8 @@ ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "baseband_lpf":("baseband", "bb filter", "low-pass", "lpf"),
     "adc":         ("adc", "analog-to-digital", "analog to digital", "digitiser",
                     "digitizer", "sampler"),
+    "dac":         ("dac", "digital-to-analog", "digital to analog",
+                    "rf dac", "waveform gen"),
     "clock":       ("clock", "sample clock", "tcxo", "ocxo", "reference osc"),
     "fpga":        ("fpga", "dsp", "fpga/dsp", "processor"),
     "detector":    ("crystal video", "log video", "log detector", "power detector",
@@ -59,8 +62,24 @@ ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "filter_bank": ("filter bank", "polyphase", "channelized", "channelised",
                     "fft bank"),
     "t_r_switch":  ("t/r switch", "tr switch", "t r switch", "transmit/receive"),
-    "tx_path":     ("power amp", " pa ", " pa/", "transmit", "tx chain"),
-    "output":      ("output", "baseband out", "iq out", "to host", "data out"),
+    # TX-side roles
+    "iq_modulator":("iq modulator", "i/q modulator", "quadrature modulator",
+                    "iq mod"),
+    "predriver":   ("predriver", "pre-driver", "pre driver", "gain block"),
+    "driver":      ("driver amp", "drv amp", "driver", " drv ", "driver stage",
+                    "va driver", "pa driver"),
+    "power_amp":   ("power amplifier", "power amp", " pa ", " pa/", "class-a",
+                    "class-ab", "class a/ab", "class ab", "class-c", "class-e",
+                    "class-f", "doherty", "hpa", "spa", "sspa"),
+    "harmonic_filter": ("harmonic filter", "harmonic reject", "harm filt",
+                        "output filter", "anti-harmonic", "lowpass filter",
+                        "lpf output"),
+    "isolator":    ("isolator", "circulator", "ferrite isolator"),
+    "coupler":     ("coupler", "directional coupler", "bidirectional coupler",
+                    "tap", "output tap"),
+    "bias_tee":    ("bias tee", "bias-tee", "biastee"),
+    "output":      ("output", "baseband out", "iq out", "to host", "data out",
+                    "rf out", "antenna feed"),
 }
 
 # Architectures that fall under the "downconversion" umbrella.
@@ -83,6 +102,19 @@ _FRONT_END_ARCHS = {
 
 # Detector-only special topologies.
 _DETECTOR_ARCHS = {"crystal_video", "log_video"}
+
+# Transmitter architecture groups (mirror rfArchitect.ts.category).
+_TX_LINEAR_ARCHS = {
+    "tx_driver_pa_classab", "tx_doherty", "tx_dpd_linearized",
+}
+_TX_SATURATED_ARCHS = {
+    "tx_class_c_pulsed", "tx_pulse_radar",
+}
+_TX_UPCONVERT_ARCHS = {
+    "tx_iq_mod_upconvert", "tx_superhet_upconvert", "tx_direct_dac",
+}
+_ALL_TX_ARCHS = _TX_LINEAR_ARCHS | _TX_SATURATED_ARCHS | _TX_UPCONVERT_ARCHS
+_ALL_TX_ARCHS |= {"tx_recommend"}
 
 
 # ---------------------------------------------------------------------------
@@ -220,40 +252,57 @@ def validate(mermaid: str, architecture: Optional[str],
         )]
 
     violations: list[Violation] = []
+    arch = (architecture or "").strip().lower()
+    is_tx = arch in _ALL_TX_ARCHS
 
     # -------------------------------------------------------------- common
-    # An LNA must exist in any receiver — it sets the noise floor.
-    has_lna = any({"lna", "balanced_lna"} & n.roles for n in diagram.nodes)
-    has_detector = any("detector" in n.roles for n in diagram.nodes)
-    if not has_lna and not has_detector:
-        violations.append(Violation(
-            severity="critical", category="topology",
-            detail=(
-                "No LNA (or detector) found in the block diagram. Every "
-                "receiver chain sets its noise floor in the first active "
-                "stage — without an LNA, Friis sensitivity is meaningless."
-            ),
-            suggested_fix="Insert an LNA as the first active stage after the antenna / preselector.",
-            architecture=architecture,
-        ))
-
-    # Preselector ought to come before the LNA so it attenuates out-of-band
-    # interferers without the LNA desensitising on them.
-    if has_lna and _has_preselector(diagram):
-        if not _preselector_before_lna(diagram):
+    if is_tx:
+        # TX: require at least one PA (or driver) — that sets the Pout floor.
+        has_pa = any("power_amp" in n.roles for n in diagram.nodes)
+        has_driver = any({"driver", "predriver"} & n.roles for n in diagram.nodes)
+        if not has_pa and not has_driver:
             violations.append(Violation(
-                severity="high", category="topology",
+                severity="critical", category="topology",
                 detail=(
-                    "A preselector / RF band-pass filter exists but does not "
-                    "precede the LNA. Out-of-band interferers will reach the "
-                    "LNA and reduce effective SFDR."
+                    "No PA or driver found in the block diagram. Every "
+                    "transmitter needs at least a driver/PA to reach the "
+                    "target output power."
                 ),
-                suggested_fix="Route the preselector BPF between the antenna and the LNA.",
+                suggested_fix="Insert a driver → PA stage before the antenna feed.",
+                architecture=architecture,
+            ))
+    else:
+        # RX: an LNA must exist — it sets the noise floor.
+        has_lna = any({"lna", "balanced_lna"} & n.roles for n in diagram.nodes)
+        has_detector = any("detector" in n.roles for n in diagram.nodes)
+        if not has_lna and not has_detector:
+            violations.append(Violation(
+                severity="critical", category="topology",
+                detail=(
+                    "No LNA (or detector) found in the block diagram. Every "
+                    "receiver chain sets its noise floor in the first active "
+                    "stage — without an LNA, Friis sensitivity is meaningless."
+                ),
+                suggested_fix="Insert an LNA as the first active stage after the antenna / preselector.",
                 architecture=architecture,
             ))
 
+        # Preselector ought to come before the LNA so it attenuates out-of-band
+        # interferers without the LNA desensitising on them.
+        if has_lna and _has_preselector(diagram):
+            if not _preselector_before_lna(diagram):
+                violations.append(Violation(
+                    severity="high", category="topology",
+                    detail=(
+                        "A preselector / RF band-pass filter exists but does not "
+                        "precede the LNA. Out-of-band interferers will reach the "
+                        "LNA and reduce effective SFDR."
+                    ),
+                    suggested_fix="Route the preselector BPF between the antenna and the LNA.",
+                    architecture=architecture,
+                ))
+
     # -------------------------------------------------------- per-architecture
-    arch = (architecture or "").strip().lower()
 
     if arch in _DOWNCONVERSION_ARCHS:
         violations += _check_downconversion(diagram, arch)
@@ -263,7 +312,13 @@ def validate(mermaid: str, architecture: Optional[str],
         violations += _check_front_end(diagram, arch)
     elif arch in _DETECTOR_ARCHS:
         violations += _check_detector(diagram, arch)
-    elif arch and arch != "recommend":
+    elif arch in _TX_LINEAR_ARCHS:
+        violations += _check_tx_linear(diagram, arch)
+    elif arch in _TX_SATURATED_ARCHS:
+        violations += _check_tx_saturated(diagram, arch)
+    elif arch in _TX_UPCONVERT_ARCHS:
+        violations += _check_tx_upconversion(diagram, arch)
+    elif arch and arch not in ("recommend", "tx_recommend"):
         # Unknown architecture — warn but don't block.
         violations.append(Violation(
             severity="medium", category="topology",
@@ -411,6 +466,159 @@ def _check_front_end(diag: ParsedDiagram, arch: str) -> list[Violation]:
             severity="high", category="topology",
             detail="'lna_filter_limiter' requires a PIN-diode limiter node — none found.",
             suggested_fix="Add a limiter between the antenna and the LNA for survivability.",
+            architecture=arch,
+        ))
+    return out
+
+
+def _check_tx_linear(diag: ParsedDiagram, arch: str) -> list[Violation]:
+    """Linear PA chains — Class A/AB, Doherty, DPD.
+    Require: driver → PA → harmonic filter → (coupler) → antenna.
+    No LNA/mixer/ADC (if present, flag — this is a transmitter).
+    """
+    out: list[Violation] = []
+    roles = diag.roles()
+
+    if "power_amp" not in roles and "driver" not in roles:
+        out.append(Violation(
+            severity="critical", category="topology",
+            detail=f"TX architecture '{arch}' requires a driver or PA node — none found.",
+            suggested_fix="Add a driver and a final-stage PA before the output filter.",
+            architecture=arch,
+        ))
+
+    if "harmonic_filter" not in roles and "preselector" not in roles:
+        out.append(Violation(
+            severity="high", category="topology",
+            detail=(
+                f"TX architecture '{arch}' lacks a harmonic / output filter. "
+                "Every transmitter needs a post-PA low-pass or band-pass filter "
+                "to meet the regulatory harmonic-emission mask."
+            ),
+            suggested_fix="Insert a harmonic / band-pass filter between the PA and the antenna.",
+            architecture=arch,
+        ))
+
+    # DPD implies a baseband DAC + feedback path — flag when neither is present.
+    if arch == "tx_dpd_linearized":
+        if "dac" not in roles and "fpga" not in roles:
+            out.append(Violation(
+                severity="medium", category="topology",
+                detail=(
+                    "DPD-linearized PA requires a digital predistortion path "
+                    "(DAC + FPGA/DSP). Neither is present in the diagram."
+                ),
+                suggested_fix="Add DAC + FPGA/DSP blocks feeding the modulator.",
+                architecture=arch,
+            ))
+
+    # RX-side artefacts shouldn't appear in a pure TX chain.
+    if "lna" in roles or "balanced_lna" in roles:
+        out.append(Violation(
+            severity="medium", category="topology",
+            detail=(
+                f"TX architecture '{arch}' shouldn't contain an LNA — that's "
+                "a receiver component. If this is a transceiver, switch to a "
+                "TRX topology (not yet wired)."
+            ),
+            suggested_fix="Remove the LNA or change the project to transceiver scope.",
+            architecture=arch,
+        ))
+    return out
+
+
+def _check_tx_saturated(diag: ParsedDiagram, arch: str) -> list[Violation]:
+    """Saturated PA — Class C/E/F, radar pulsed.
+    Tighter output filter requirement (harmonics are much worse in saturated
+    operation) and isolator/circulator highly recommended.
+    """
+    out: list[Violation] = []
+    roles = diag.roles()
+
+    # Same PA-presence rule as linear.
+    if "power_amp" not in roles and "driver" not in roles:
+        out.append(Violation(
+            severity="critical", category="topology",
+            detail=f"TX architecture '{arch}' requires a driver or PA node — none found.",
+            suggested_fix="Add a driver and a saturated PA.",
+            architecture=arch,
+        ))
+
+    if "harmonic_filter" not in roles:
+        out.append(Violation(
+            severity="high", category="topology",
+            detail=(
+                f"Saturated TX architecture '{arch}' MUST include a harmonic "
+                "filter. Class-C/E/F PAs produce strong H2/H3 that will fail "
+                "regulatory spurious masks without post-PA filtering."
+            ),
+            suggested_fix="Insert a steep low-pass harmonic filter after the PA.",
+            architecture=arch,
+        ))
+
+    if arch == "tx_pulse_radar" and "isolator" not in roles:
+        out.append(Violation(
+            severity="medium", category="topology",
+            detail=(
+                "Pulsed radar PA chain without an isolator/circulator. Mismatch "
+                "at the antenna during pulse ring-down can load-pull the PA."
+            ),
+            suggested_fix="Insert a circulator (or isolator) between the PA and the antenna.",
+            architecture=arch,
+        ))
+    return out
+
+
+def _check_tx_upconversion(diag: ParsedDiagram, arch: str) -> list[Violation]:
+    """TX upconversion front-ends — IQ modulator, superhet TX, direct-DAC."""
+    out: list[Violation] = []
+    roles = diag.roles()
+
+    if arch == "tx_iq_mod_upconvert":
+        if "iq_modulator" not in roles and "mixer" not in roles:
+            out.append(Violation(
+                severity="critical", category="topology",
+                detail="IQ-modulator TX architecture requires an IQ-modulator / quadrature modulator node.",
+                suggested_fix="Add an IQ modulator between the baseband DAC and the driver.",
+                architecture=arch,
+            ))
+    if arch == "tx_superhet_upconvert":
+        if "mixer" not in roles:
+            out.append(Violation(
+                severity="critical", category="topology",
+                detail="Superhet TX requires a mixer + LO — no mixer found.",
+                suggested_fix="Insert an up-convert mixer between the IF source and the driver.",
+                architecture=arch,
+            ))
+        if "lo" not in roles:
+            out.append(Violation(
+                severity="high", category="topology",
+                detail="Superhet TX requires a local oscillator / synthesizer — none found.",
+                suggested_fix="Add a PLL/synth driving the mixer's LO port.",
+                architecture=arch,
+            ))
+    if arch == "tx_direct_dac":
+        if "dac" not in roles:
+            out.append(Violation(
+                severity="critical", category="topology",
+                detail="Direct-DAC TX architecture requires an RF DAC node — none found.",
+                suggested_fix="Add an RF DAC feeding the driver stage directly.",
+                architecture=arch,
+            ))
+
+    # All upconversion topologies still need a PA + harmonic filter.
+    if "power_amp" not in roles and "driver" not in roles:
+        out.append(Violation(
+            severity="high", category="topology",
+            detail=f"TX architecture '{arch}' lacks a driver / PA — output will be below spec.",
+            suggested_fix="Insert a driver → PA after the upconverter.",
+            architecture=arch,
+        ))
+    if "harmonic_filter" not in roles and "preselector" not in roles:
+        out.append(Violation(
+            severity="medium", category="topology",
+            detail=f"TX architecture '{arch}' lacks a harmonic / output filter.",
+            suggested_fix="Add a post-PA band-pass filter before the antenna.",
             architecture=arch,
         ))
     return out

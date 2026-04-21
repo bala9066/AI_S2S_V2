@@ -348,3 +348,212 @@ def test_format_violations_renders_markdown_table():
     )])
     assert "| critical |" in md
     assert "missing mixer" in md
+
+
+# ---------------------------------------------------------------------------
+# Transmitter architectures
+# ---------------------------------------------------------------------------
+
+class TestTxLinearPaChain:
+
+    def _full_linear_tx(self):
+        return (
+            "flowchart LR\n"
+            "  BB[Baseband Source] --> DRV[Driver Amp]\n"
+            "  DRV --> PA[Class-AB Power Amplifier]\n"
+            "  PA --> HF[Harmonic Filter]\n"
+            "  HF --> ANT[Antenna]\n"
+        )
+
+    def test_full_linear_tx_chain_passes(self):
+        v = validate(self._full_linear_tx(), architecture="tx_driver_pa_classab")
+        severities = [x.severity for x in v if x.category == "topology"]
+        assert "critical" not in severities
+        assert "high" not in severities
+
+    def test_missing_pa_flagged_critical(self):
+        m = (
+            "flowchart LR\n"
+            "  BB[Baseband] --> HF[Harmonic Filter]\n"
+            "  HF --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_driver_pa_classab")
+        assert any(
+            x.severity == "critical" and "driver" in x.detail.lower()
+            for x in v
+        )
+
+    def test_missing_harmonic_filter_flagged_high(self):
+        m = (
+            "flowchart LR\n"
+            "  BB[Baseband] --> DRV[Driver]\n"
+            "  DRV --> PA[Class-AB PA]\n"
+            "  PA --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_driver_pa_classab")
+        assert any(
+            x.severity == "high" and "harmonic" in x.detail.lower()
+            for x in v
+        )
+
+    def test_lna_in_tx_chain_flagged_medium(self):
+        """A receiver LNA accidentally placed in a TX design — flag it."""
+        m = (
+            "flowchart LR\n"
+            "  BB[Baseband] --> LNA[LNA]\n"
+            "  LNA --> PA[Class-AB PA]\n"
+            "  PA --> HF[Harmonic Filter]\n"
+            "  HF --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_driver_pa_classab")
+        assert any(
+            x.severity == "medium"
+            and "lna" in x.detail.lower()
+            and "receiver" in x.detail.lower()
+            for x in v
+        )
+
+    def test_rx_lna_check_skipped_when_tx_architecture(self):
+        """TX projects must NOT trigger the 'no LNA found' receiver check."""
+        v = validate(
+            "flowchart LR\n"
+            "  DRV[Driver] --> PA[Class-AB PA]\n"
+            "  PA --> HF[Harmonic Filter] --> ANT[Antenna]\n",
+            architecture="tx_driver_pa_classab",
+        )
+        assert not any(
+            "noise figure" in x.detail.lower()
+            or "friis sensitivity" in x.detail.lower()
+            for x in v
+        )
+
+    def test_dpd_without_dac_or_fpga_flagged(self):
+        m = (
+            "flowchart LR\n"
+            "  BB[Baseband] --> DRV[Driver]\n"
+            "  DRV --> PA[Doherty PA]\n"
+            "  PA --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_dpd_linearized")
+        assert any(
+            "dpd" in x.detail.lower() or "predistortion" in x.detail.lower()
+            for x in v
+        )
+
+
+class TestTxSaturatedPa:
+
+    def test_pulsed_radar_without_isolator_flagged_medium(self):
+        m = (
+            "flowchart LR\n"
+            "  BB[Pulse Gen] --> DRV[Driver]\n"
+            "  DRV --> PA[Class-C PA]\n"
+            "  PA --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_pulse_radar")
+        assert any(
+            x.severity == "medium"
+            and ("isolator" in x.detail.lower() or "circulator" in x.detail.lower())
+            for x in v
+        )
+
+    def test_pulsed_radar_with_circulator_passes(self):
+        m = (
+            "flowchart LR\n"
+            "  BB[Pulse Gen] --> DRV[Driver]\n"
+            "  DRV --> PA[Class-C PA]\n"
+            "  PA --> HF[Harmonic Filter] --> CIRC[Circulator] --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_pulse_radar")
+        assert not any(
+            "isolator" in x.detail.lower() or "circulator" in x.detail.lower()
+            for x in v
+        )
+
+    def test_saturated_without_harmonic_filter_flagged_high(self):
+        m = (
+            "flowchart LR\n"
+            "  BB[Source] --> DRV[Driver]\n"
+            "  DRV --> PA[Class-E PA]\n"
+            "  PA --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_class_c_pulsed")
+        assert any(
+            x.severity == "high" and "harmonic" in x.detail.lower()
+            for x in v
+        )
+
+
+class TestTxUpconversion:
+
+    def test_iq_mod_upconvert_requires_iq_modulator(self):
+        m = (
+            "flowchart LR\n"
+            "  DAC[Baseband DAC] --> DRV[Driver]\n"
+            "  DRV --> PA[PA] --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_iq_mod_upconvert")
+        assert any(
+            x.severity == "critical" and "iq" in x.detail.lower()
+            for x in v
+        )
+
+    def test_iq_mod_upconvert_with_modulator_passes(self):
+        m = (
+            "flowchart LR\n"
+            "  DAC[Baseband DAC] --> MOD[IQ Modulator]\n"
+            "  MOD --> DRV[Driver] --> PA[PA] --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_iq_mod_upconvert")
+        assert not any(x.severity == "critical" for x in v)
+
+    def test_superhet_tx_requires_mixer_and_lo(self):
+        m = (
+            "flowchart LR\n"
+            "  IF[IF Source] --> DRV[Driver] --> PA[PA] --> HF[Output Filter] --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_superhet_upconvert")
+        criticals = [x for x in v if x.severity == "critical"]
+        assert any("mixer" in x.detail.lower() for x in criticals)
+
+    def test_direct_dac_requires_dac_node(self):
+        m = (
+            "flowchart LR\n"
+            "  BB[Source] --> DRV[Driver] --> PA[PA] --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_direct_dac")
+        assert any(
+            x.severity == "critical" and "dac" in x.detail.lower()
+            for x in v
+        )
+
+    def test_direct_dac_with_rf_dac_passes(self):
+        m = (
+            "flowchart LR\n"
+            "  FPGA[FPGA] --> DAC[RF DAC]\n"
+            "  DAC --> DRV[Driver] --> PA[PA] --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_direct_dac")
+        assert not any(x.severity == "critical" for x in v)
+
+
+class TestTxRecommendFallback:
+
+    def test_tx_recommend_gets_common_checks_only(self):
+        """tx_recommend is the 'architect picks' option — no arch-specific
+        rules fire, but the common PA-presence check still applies."""
+        m = (
+            "flowchart LR\n"
+            "  BB[Baseband] --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_recommend")
+        assert any(x.severity == "critical" and "driver" in x.detail.lower()
+                   for x in v)
+
+    def test_tx_recommend_full_chain_passes(self):
+        m = (
+            "flowchart LR\n"
+            "  BB[Source] --> DRV[Driver] --> PA[PA] --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+        )
+        v = validate(m, architecture="tx_recommend")
+        assert not any(x.severity == "critical" for x in v)
