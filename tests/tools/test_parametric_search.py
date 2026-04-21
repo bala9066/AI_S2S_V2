@@ -16,7 +16,17 @@ from tools.parametric_search import (
     _is_obsolete,
     _normalise_stage,
     find_candidates,
+    reset_cache,
 )
+
+
+# Every test clears the in-process cache first — otherwise `find_candidates`
+# results would leak across tests (the cache is process-global).
+@pytest.fixture(autouse=True)
+def _clear_parametric_cache():
+    reset_cache()
+    yield
+    reset_cache()
 
 
 def _pi(
@@ -200,3 +210,107 @@ def test_skips_mouser_when_not_configured(monkeypatch):
         out = find_candidates("lna", "")
     ms_mock.assert_not_called()
     assert [p.part_number for p in out] == ["D1"]
+
+
+# ---------------------------------------------------------------------------
+# Cache behaviour
+# ---------------------------------------------------------------------------
+
+def test_repeat_query_served_from_cache(both_configured):
+    """Second call with identical args must not hit the distributors."""
+    dk = [_pi("A", source="digikey")]
+    ms = [_pi("B", source="mouser")]
+    with patch("tools.parametric_search.digikey_api.keyword_search",
+               return_value=dk) as dk_mock, \
+         patch("tools.parametric_search.mouser_api.keyword_search",
+               return_value=ms) as ms_mock:
+        first = find_candidates("lna", "2-18 GHz")
+        second = find_candidates("lna", "2-18 GHz")
+    assert [p.part_number for p in first] == ["A", "B"]
+    assert [p.part_number for p in second] == ["A", "B"]
+    # Each distributor was called exactly once — second request was a cache hit.
+    assert dk_mock.call_count == 1
+    assert ms_mock.call_count == 1
+
+
+def test_cache_key_is_case_insensitive(both_configured):
+    """Case / whitespace differences in stage or hint should collide in the cache."""
+    dk = [_pi("A", source="digikey")]
+    with patch("tools.parametric_search.digikey_api.keyword_search",
+               return_value=dk) as dk_mock, \
+         patch("tools.parametric_search.mouser_api.keyword_search", return_value=[]):
+        find_candidates("LNA", "2-18 GHz")
+        find_candidates("  lna ", "2-18 GHz")   # normalised → same key
+        find_candidates("Lna", "2-18 GHZ")      # hint case differs → same key
+    assert dk_mock.call_count == 1
+
+
+def test_cache_respects_max_per_source(both_configured):
+    """Different max_per_source must use separate cache buckets — otherwise
+    a later call asking for 10 candidates could get a cached 5-result list."""
+    dk = [_pi(f"D{i}") for i in range(5)]
+    with patch("tools.parametric_search.digikey_api.keyword_search",
+               return_value=dk) as dk_mock, \
+         patch("tools.parametric_search.mouser_api.keyword_search", return_value=[]):
+        find_candidates("lna", "", max_per_source=5)
+        find_candidates("lna", "", max_per_source=10)
+    assert dk_mock.call_count == 2
+
+
+def test_cache_can_be_reset(both_configured):
+    dk = [_pi("A", source="digikey")]
+    with patch("tools.parametric_search.digikey_api.keyword_search",
+               return_value=dk) as dk_mock, \
+         patch("tools.parametric_search.mouser_api.keyword_search", return_value=[]):
+        find_candidates("lna", "x")
+        reset_cache()
+        find_candidates("lna", "x")
+    # Cache was cleared between calls → DigiKey was queried twice.
+    assert dk_mock.call_count == 2
+
+
+def test_cache_hit_honours_max_total(both_configured):
+    """max_total is applied *after* the cache — changing it between calls
+    must slice the cached shortlist correctly."""
+    dk = [_pi(f"D{i}") for i in range(5)]
+    ms = [_pi(f"M{i}") for i in range(5)]
+    with patch("tools.parametric_search.digikey_api.keyword_search", return_value=dk), \
+         patch("tools.parametric_search.mouser_api.keyword_search", return_value=ms):
+        first = find_candidates("lna", "", max_per_source=5, max_total=10)
+        second = find_candidates("lna", "", max_per_source=5, max_total=3)
+    assert len(first) == 10
+    assert len(second) == 3
+
+
+# ---------------------------------------------------------------------------
+# Parallel execution
+# ---------------------------------------------------------------------------
+
+def test_digikey_and_mouser_queried_in_parallel(both_configured):
+    """Wall-clock time must be ≈ max(DigiKey, Mouser), not their sum.
+
+    We simulate each distributor taking 200ms. Sequential would take
+    ~400ms; parallel should finish in ~220ms or less.
+    """
+    import time as _time
+
+    def slow_dk(*_a, **_kw):
+        _time.sleep(0.2)
+        return [_pi("A", source="digikey")]
+
+    def slow_ms(*_a, **_kw):
+        _time.sleep(0.2)
+        return [_pi("B", source="mouser")]
+
+    with patch("tools.parametric_search.digikey_api.keyword_search",
+               side_effect=slow_dk), \
+         patch("tools.parametric_search.mouser_api.keyword_search",
+               side_effect=slow_ms):
+        t0 = _time.monotonic()
+        out = find_candidates("lna", "parallel-test")
+        elapsed = _time.monotonic() - t0
+
+    assert [p.part_number for p in out] == ["A", "B"]
+    # Generous upper bound (0.35s) to absorb CI jitter but still well
+    # below the 0.4s sequential lower bound.
+    assert elapsed < 0.35, f"expected parallel exec, got {elapsed:.3f}s"

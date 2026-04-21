@@ -36,7 +36,7 @@ def is_configured() -> bool:
 
 # ---------------------------------------------------------------------------
 
-def lookup(part_number: str, *, timeout_s: float = 6.0) -> Optional[PartInfo]:
+def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
     """Search Mouser for a manufacturer part number.
 
     Returns a PartInfo on match, None otherwise (API not configured /

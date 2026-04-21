@@ -78,6 +78,34 @@ def test_flags_cascade_claim_inflation():
     assert any(i.category == "cascade_mismatch" for i in rep.issues)
 
 
+def test_cascade_audit_tolerates_non_numeric_claims():
+    """Regression for `p1_finalize.audit_failed: float() argument must be a
+    string or a real number, not 'NoneType'`.  The LLM occasionally emits
+    dicts / lists / "N/A" strings under one of the cascade claim keys;
+    that single bad claim must NOT crash the entire audit — the bad key
+    is skipped and the rest of the checks still run."""
+    rep = audit(
+        phase_id="P1",
+        bom_stages=_good_bom(),
+        claimed_cascade={
+            # Each of these would historically crash with TypeError when
+            # float() was called unconditionally.
+            "noise_figure_db":  {"value": 2.0, "units": "dB"},  # nested dict
+            "total_gain_db":    ["list", "not", "number"],      # list
+            "iip3_dbm_input":   "N/A",                          # unparsable string
+            "sensitivity_dbm":  None,                           # explicit None (already guarded)
+        },
+        citations=[],
+        claimed_parts=_good_parts(),
+        known_parts=KNOWN_PARTS,
+    )
+    # Audit completes without raising — this is the core regression guarantee.
+    assert rep is not None
+    # No cascade_mismatch issues should be emitted since every claim was
+    # unparseable and therefore skipped.
+    assert not any(i.category == "cascade_mismatch" for i in rep.issues)
+
+
 def test_flags_fabricated_citation():
     rep = audit(
         phase_id="P1",

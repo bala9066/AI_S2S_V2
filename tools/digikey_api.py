@@ -181,7 +181,7 @@ def _get_token() -> Optional[str]:
 # Part lookup
 # ---------------------------------------------------------------------------
 
-def lookup(part_number: str, *, timeout_s: float = 6.0) -> Optional[PartInfo]:
+def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
     """Search DigiKey for a manufacturer part number.
 
     Returns:

@@ -1582,12 +1582,31 @@ class RequirementsAgent(BaseAgent):
                 "and architecture has been captured. Do NOT ask for MDS/sensitivity, "
                 "max input, architecture, or any spec already listed above — they "
                 "are all in the payload. Do NOT call `show_clarification_cards`. "
-                "Call `generate_requirements` tool IMMEDIATELY as your FIRST content "
-                "block using the supplied specs, derived MDS, and cascade notes. "
+                "\n\n"
+                "MANDATORY TOOL-CHAINING SEQUENCE (follow exactly):\n"
+                "STEP 1 — RETRIEVAL: Call `find_candidate_parts` ONCE for every "
+                "distinct signal-chain stage that will appear in "
+                "component_recommendations (e.g. lna, mixer, limiter, preselector, "
+                "bpf, splitter, adc, dac, pll, ldo, buck, tcxo, mcu, fpga). For "
+                "each call pass a concrete `stage` id and a compact `spec_hint` "
+                "(<= 10 words) built from the Tier-1 specs — e.g. stage='lna' "
+                "hint='2-18 GHz NF<2dB SMT'. You may issue multiple tool calls in "
+                "parallel in a single assistant turn. Do this BEFORE any other "
+                "tool call. If a stage returns zero candidates, immediately retry "
+                "`find_candidate_parts` with a wider hint.\n"
+                "STEP 2 — GENERATION: Only after the retrieval step, call "
+                "`generate_requirements` as your FINAL tool call. Every MPN in "
+                "`component_recommendations` MUST be copied verbatim from one of "
+                "the `find_candidate_parts` `candidates[].part_number` values "
+                "returned during this turn; copy the corresponding `datasheet_url` "
+                "verbatim too. Inventing an MPN or altering the distributor's "
+                "datasheet URL will fail the `not_from_candidate_pool` audit gate. "
+                "If no candidate fits a stage after a second widened retrieval, "
+                "OMIT that stage from the BOM rather than inventing a part.\n"
+                "\n"
                 "Output the complete BOM, requirements list, block_diagram_mermaid, "
                 "architecture_mermaid, design_parameters, and component_recommendations "
-                "— with `datasheet_url` for every component. No preamble, no prose "
-                "before the tool call. "
+                "— with `datasheet_url` for every component. "
                 "TOPOLOGY MANDATE (apply before emitting the diagram): "
                 "(1) Every RF chain MUST include the canonical stages in order: "
                 "Antenna -> SMA -> Limiter -> Preselector (SAW / ceramic / cavity BPF) "
@@ -6259,8 +6278,11 @@ typical passive/active bands).</p>
         for i, comp in enumerate(comps, 1):
             part = comp.get('primary_part', 'See BOM')
             mfr  = comp.get('primary_manufacturer', '')
-            ds_url = _verified_url(comp.get('datasheet_url', '').strip(), part, mfr)
-            dk_url = comp.get('digikey_url', '').strip()
+            # Use `or ''` guard — dict.get returns None when the key exists with
+            # value None (common now that find_candidate_parts may surface
+            # candidates with datasheet_url=None from Mouser's data gaps).
+            ds_url = _verified_url((comp.get('datasheet_url') or '').strip(), part, mfr)
+            dk_url = (comp.get('digikey_url') or '').strip()
 
             # Primary heading with part number as a link if datasheet available
             part_str = f"[{part}]({ds_url})" if ds_url else part
@@ -6301,7 +6323,7 @@ typical passive/active bands).</p>
                 for alt in alts:
                     alt_pn  = alt.get('part_number', '')
                     alt_mfr = alt.get('manufacturer', mfr)
-                    alt_ds  = _verified_url(alt.get('datasheet_url', '').strip(), alt_pn, alt_mfr)
+                    alt_ds  = _verified_url((alt.get('datasheet_url') or '').strip(), alt_pn, alt_mfr)
                     alt_pn_str = f"[{alt_pn}]({alt_ds})" if alt_ds else alt_pn
                     lines.append(
                         f"- **{alt_pn_str}** ({alt_mfr}): "
