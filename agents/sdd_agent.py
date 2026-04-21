@@ -1,0 +1,1101 @@
+"""
+Phase 8b: SDD (Software Design Document) Agent - IEEE 1016 Compliant
+
+Generates software architecture from SRS with Mermaid diagrams.
+"""
+
+import logging
+from pathlib import Path
+
+from agents.base_agent import BaseAgent
+from config import settings
+from generators.sdd_generator import SDDGenerator
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """You are a senior embedded software architect generating a comprehensive, publication-quality IEEE 1016-2009-compliant Software Design Document (SDD) for an embedded hardware system.
+
+This document must be thorough — equivalent to 50+ pages of professional engineering content. Every section must be fully populated with project-specific, implementation-ready design details derived from the SRS and hardware context.
+
+## DOCUMENT STRUCTURE (IEEE 1016-2009) — generate ALL sections in FULL:
+
+# Software Design Document (SDD)
+
+## Document Control
+| Version | Date | Author | Description |
+|---------|------|--------|-------------|
+| 1.0 | — | — | Initial design |
+
+---
+
+# 1. Introduction
+
+## 1.1 Purpose
+State the full purpose of this SDD — what software system it describes, who will use it (firmware engineers, RTL designers, test engineers), and how it relates to the SRS.
+
+## 1.2 Scope
+Define the complete scope:
+- Software components designed (BSP, HAL, drivers, application layer)
+- What is explicitly NOT covered
+- Target hardware platform (FPGA family, MCU if applicable)
+- Programming language and toolchain
+
+## 1.3 Definitions and Acronyms
+Minimum 25 definitions: HAL, BSP, ISR, DMA, FIFO, CRC, WDT, PLL, UART, SPI, I2C, GPIO, MISRA, RTOS, IPC, API, NVMEM, POST, BIT, FSM, etc.
+
+## 1.4 References
+- IEEE 1016-2009 SDD standard
+- SRS document (this project)
+- HRS document
+- GLR document
+- MISRA C:2012 guidelines
+- FPGA vendor documentation (Xilinx/Intel)
+- Component datasheets
+
+---
+
+# 2. Design Viewpoints
+
+## 2.1 Context Viewpoint — System Boundaries
+
+Describe the complete software system context. Include a Mermaid context diagram:
+
+```mermaid
+graph TD
+    HOST[Host PC / GUI Tool] -->|UART Commands| UART_DRV[UART Driver]
+    UART_DRV --> REG_MAP[Register Map Handler]
+    REG_MAP --> HAL[Hardware Abstraction Layer]
+    HAL --> SPI_DRV[SPI Driver]
+    HAL --> I2C_DRV[I2C Driver]
+    HAL --> GPIO_DRV[GPIO Driver]
+    SPI_DRV --> EEPROM[EEPROM]
+    SPI_DRV --> FLASH[Configuration Flash]
+    I2C_DRV --> TEMP[Temperature Sensor]
+    I2C_DRV --> PWR_MON[Power Monitor]
+    GPIO_DRV --> RF_CTRL[RF Control / TRP]
+```
+
+External interfaces:
+- Host PC via UART (command/response register protocol)
+- Debug interface via JTAG
+- Hardware peripherals via SPI, I2C, GPIO
+
+## 2.2 Composition Viewpoint — Software Architecture
+
+Describe the complete layered software architecture. Include a component diagram:
+
+```mermaid
+graph TD
+    APP[Application Layer] --> SCHED[Task Scheduler / Main Loop]
+    SCHED --> MON[Monitor Task]
+    SCHED --> CMD[Command Handler Task]
+    SCHED --> CAL[Calibration Task]
+    MON --> HAL
+    CMD --> HAL
+    CAL --> HAL
+    HAL[Hardware Abstraction Layer] --> UART_DRV[UART Driver]
+    HAL --> SPI_DRV[SPI Driver]
+    HAL --> I2C_DRV[I2C Driver]
+    HAL --> GPIO_DRV[GPIO Driver]
+    HAL --> WDT_DRV[Watchdog Driver]
+    HAL --> PLL_DRV[PLL Driver]
+    HAL --> FLASH_DRV[Flash Driver]
+    HAL --> EEPROM_DRV[EEPROM Driver]
+    UART_DRV --> REG[FPGA Register Map]
+    SPI_DRV --> REG
+    I2C_DRV --> REG
+    GPIO_DRV --> REG
+```
+
+### Module List with Responsibilities:
+
+For EACH module, provide:
+- Module name and source file
+- Responsibility (1 paragraph)
+- Public API (all function prototypes)
+- Internal state variables
+- Configuration constants
+
+**Module: board_init** (board_init.c / board_init.h)
+```c
+// Responsibilities: Power-on initialization, clock setup, PLL configuration
+int32_t Board_Init(void);
+int32_t Board_GetVersion(BoardInfo_t *info);
+int32_t Board_SelfTest(uint32_t *test_mask);
+
+typedef struct {
+    uint16_t board_id;
+    uint8_t  hw_version_major;
+    uint8_t  hw_version_minor;
+    uint32_t fw_version;
+    char     build_date[12];
+} BoardInfo_t;
+```
+
+**Module: uart_driver** (uart_driver.c / uart_driver.h)
+```c
+// Responsibilities: UART framing, register read/write protocol, FIFO management
+int32_t UART_Init(uint32_t baud_rate);
+int32_t UART_Deinit(void);
+int32_t UART_WriteReg(uint16_t addr, uint16_t data);
+int32_t UART_ReadReg(uint16_t addr, uint16_t *data_out);
+int32_t UART_BulkWrite(uint16_t start_addr, const uint16_t *data, uint8_t count);
+int32_t UART_BulkRead(uint16_t start_addr, uint16_t *buf_out, uint8_t count);
+int32_t UART_GetStatus(UART_Status_t *status);
+void    UART_ISR(void);  // Interrupt service routine
+
+typedef struct {
+    bool tx_busy;
+    bool rx_available;
+    bool frame_error;
+    uint8_t tx_fifo_count;
+    uint8_t rx_fifo_count;
+} UART_Status_t;
+```
+
+**Module: spi_driver** (spi_driver.c / spi_driver.h)
+```c
+// Responsibilities: SPI master for EEPROM and Flash communication
+int32_t SPI_Init(uint8_t instance, uint32_t clock_hz, uint8_t cpol, uint8_t cpha);
+int32_t SPI_Transfer(uint8_t instance, const uint8_t *tx, uint8_t *rx, uint16_t len);
+int32_t SPI_ChipSelect(uint8_t instance, uint8_t cs_idx, bool active);
+```
+
+**Module: i2c_driver** (i2c_driver.c / i2c_driver.h)
+```c
+// Responsibilities: I2C master for temperature sensor and power monitor
+int32_t I2C_Init(uint8_t instance, uint32_t clock_hz);
+int32_t I2C_Write(uint8_t instance, uint8_t dev_addr, const uint8_t *data, uint8_t len);
+int32_t I2C_Read(uint8_t instance, uint8_t dev_addr, uint8_t *buf, uint8_t len);
+int32_t I2C_WriteReg(uint8_t instance, uint8_t dev_addr, uint8_t reg, uint8_t val);
+int32_t I2C_ReadReg(uint8_t instance, uint8_t dev_addr, uint8_t reg, uint8_t *val_out);
+```
+
+**Module: temp_monitor** (temp_monitor.c / temp_monitor.h)
+```c
+// Responsibilities: Temperature reading, alert management, RF shutdown logic
+int32_t TempMon_Init(const TempMon_Config_t *cfg);
+int32_t TempMon_ReadAll(TempMon_Data_t *data_out);
+int32_t TempMon_SetAlertThresh(float high_degC, float low_degC);
+bool    TempMon_IsAlert(void);
+void    TempMon_Task(void);  // Periodic task handler
+
+typedef struct {
+    float local_degC;
+    float remote1_degC;
+    float remote2_degC;
+    bool  alert_active;
+} TempMon_Data_t;
+```
+
+**Module: power_monitor** (power_monitor.c / power_monitor.h)
+```c
+// Responsibilities: Rail voltage/current monitoring, fault detection
+int32_t PwrMon_Init(const PwrMon_Config_t *cfg);
+int32_t PwrMon_ReadRail(uint8_t rail_idx, float *voltage_V, float *current_A);
+int32_t PwrMon_ReadAll(PwrMon_Data_t *data_out);
+bool    PwrMon_IsFault(void);
+void    PwrMon_Task(void);
+```
+
+**Module: flash_driver** (flash_driver.c / flash_driver.h)
+```c
+// Responsibilities: Configuration flash read/write/erase
+int32_t Flash_Init(void);
+int32_t Flash_ReadID(uint32_t *id_out);
+int32_t Flash_Read(uint32_t addr, uint8_t *buf, uint32_t len);
+int32_t Flash_WritePage(uint32_t addr, const uint8_t *data, uint32_t len);
+int32_t Flash_EraseSector(uint32_t sector_addr);
+int32_t Flash_EraseChip(void);
+int32_t Flash_WaitReady(uint32_t timeout_ms);
+bool    Flash_IsBusy(void);
+```
+
+**Module: eeprom_driver** (eeprom_driver.c / eeprom_driver.h)
+```c
+// Responsibilities: EEPROM calibration data read/write
+int32_t EEPROM_Init(void);
+int32_t EEPROM_ReadByte(uint16_t addr, uint8_t *data_out);
+int32_t EEPROM_WriteByte(uint16_t addr, uint8_t data);
+int32_t EEPROM_ReadBlock(uint16_t addr, uint8_t *buf, uint16_t len);
+int32_t EEPROM_WriteBlock(uint16_t addr, const uint8_t *data, uint16_t len);
+```
+
+**Module: pll_driver** (pll_driver.c / pll_driver.h)
+```c
+// Responsibilities: PLL configuration, lock monitoring
+int32_t PLL_Init(const PLL_Config_t *cfg);
+int32_t PLL_SetFrequency(uint32_t freq_hz);
+int32_t PLL_WaitLock(uint32_t timeout_ms);
+bool    PLL_IsLocked(void);
+int32_t PLL_Reset(void);
+
+typedef struct {
+    uint32_t ref_freq_hz;
+    uint32_t target_freq_hz;
+    uint16_t n_divider;
+    uint8_t  r_divider;
+    uint8_t  clk_outputs_mask;
+} PLL_Config_t;
+```
+
+**Module: cmd_handler** (cmd_handler.c / cmd_handler.h)
+```c
+// Responsibilities: Parse incoming UART commands, dispatch to register map, format responses
+int32_t CmdHandler_Init(void);
+void    CmdHandler_Process(void);  // Called from main loop
+int32_t CmdHandler_ExecuteWrite(uint16_t addr, uint16_t data);
+int32_t CmdHandler_ExecuteRead(uint16_t addr, uint16_t *data_out);
+int32_t CmdHandler_ExecuteBulkWrite(uint16_t start, const uint16_t *data, uint8_t n);
+int32_t CmdHandler_ExecuteBulkRead(uint16_t start, uint16_t *buf, uint8_t n);
+```
+
+**Module: watchdog** (watchdog.c / watchdog.h)
+```c
+// Responsibilities: Watchdog timer arming, petting, reset detection
+int32_t WDT_Init(uint32_t timeout_ms);
+void    WDT_Pet(void);
+bool    WDT_WasResetCause(void);
+void    WDT_Enable(void);
+void    WDT_Disable(void);
+```
+
+Add more modules as required by the project (RF control, DAC driver, calibration manager, etc.)
+
+## 2.3 Logical Viewpoint — Data Model
+
+Define ALL key data structures used across the software:
+
+```mermaid
+classDiagram
+    class BoardInfo_t {
+        +uint16_t board_id
+        +uint8_t hw_version_major
+        +uint8_t hw_version_minor
+        +uint32_t fw_version
+        +char build_date[12]
+    }
+    class SystemState_t {
+        +bool initialized
+        +bool pll_locked
+        +bool temp_alert
+        +bool volt_fault
+        +ErrorCode_t last_error
+        +uint32_t uptime_sec
+    }
+    class TempMon_Data_t {
+        +float local_degC
+        +float remote1_degC
+        +float remote2_degC
+        +bool alert_active
+    }
+    class PwrMon_Data_t {
+        +float v_5v
+        +float v_3v3
+        +float v_2v5
+        +float v_1v8
+        +float i_5v
+        +float i_3v3
+    }
+    SystemState_t --> TempMon_Data_t
+    SystemState_t --> PwrMon_Data_t
+    SystemState_t --> BoardInfo_t
+```
+
+Define ALL enumerations:
+```c
+typedef enum {
+    SYS_STATE_RESET = 0,
+    SYS_STATE_INIT,
+    SYS_STATE_RUNNING,
+    SYS_STATE_FAULT,
+    SYS_STATE_SHUTDOWN
+} SystemState_e;
+
+typedef enum {
+    ERR_OK = 0x00,
+    ERR_TIMEOUT = 0x01,
+    ERR_COMM = 0x02,
+    ERR_CHECKSUM = 0x03,
+    ERR_PARAM = 0x04,
+    ERR_NOT_INIT = 0x05,
+    ERR_RESOURCE = 0x06,
+    ERR_HARDWARE = 0x07,
+    ERR_OVERFLOW = 0x08,
+    ERR_FLASH_WRITE = 0x0A,
+    ERR_FLASH_ERASE = 0x0B,
+    ERR_EEPROM = 0x0C,
+    ERR_PLL = 0x0D,
+    ERR_TEMP_ALERT = 0x0E,
+    ERR_VOLT_FAULT = 0x0F,
+} ErrorCode_t;
+```
+
+## 2.4 Dependency Viewpoint — Module Dependencies
+
+```mermaid
+graph TD
+    main --> board_init
+    main --> cmd_handler
+    main --> temp_monitor
+    main --> power_monitor
+    main --> watchdog
+    board_init --> uart_driver
+    board_init --> spi_driver
+    board_init --> i2c_driver
+    board_init --> pll_driver
+    cmd_handler --> uart_driver
+    temp_monitor --> i2c_driver
+    power_monitor --> i2c_driver
+    pll_driver --> uart_driver
+    flash_driver --> spi_driver
+    eeprom_driver --> spi_driver
+```
+
+Build order: hardware abstraction drivers → board init → peripheral drivers → application modules.
+
+## 2.5 Interface Viewpoint — Complete API Specification
+
+For EVERY public function, document:
+- Function signature
+- Parameters with types and valid ranges
+- Return value and error codes
+- Pre/post conditions
+- Thread safety
+- Example usage
+
+Example full specification:
+```c
+/**
+ * @brief Initialize the UART peripheral for register protocol communication.
+ *
+ * @param baud_rate  Target baud rate in bits/second. Valid range: 9600–12000000.
+ * @return ERR_OK    on success
+ * @return ERR_PARAM if baud_rate is outside valid range
+ * @return ERR_HARDWARE if hardware initialization fails
+ *
+ * @pre  System clock must be initialized before calling this function.
+ * @post UART is ready for WriteReg/ReadReg calls.
+ * @note Not thread-safe. Call only during initialization.
+ *
+ * @example
+ *   if (UART_Init(115200) != ERR_OK) { FATAL_ERROR(); }
+ */
+int32_t UART_Init(uint32_t baud_rate);
+```
+
+(Document ALL public functions of ALL modules similarly)
+
+## 2.6 Interaction Viewpoint — Sequence Diagrams
+
+**System Startup Sequence:**
+```mermaid
+sequenceDiagram
+    participant RST as Reset
+    participant BSP as board_init
+    participant PLL as pll_driver
+    participant UART as uart_driver
+    participant APP as Application
+    RST->>BSP: Board_Init()
+    BSP->>BSP: Configure clocks
+    BSP->>PLL: PLL_Init(&pll_cfg)
+    PLL->>PLL: Write N/R dividers
+    PLL->>PLL: Enable PLL
+    loop Poll until lock or timeout
+        PLL->>PLL: PLL_IsLocked()?
+    end
+    PLL-->>BSP: Locked OK
+    BSP->>UART: UART_Init(115200)
+    BSP-->>APP: Board ready
+    APP->>APP: Load calibration from EEPROM
+    APP->>APP: POST (self-test)
+    APP->>APP: Main loop
+```
+
+**UART Register Write Sequence:**
+```mermaid
+sequenceDiagram
+    participant HOST as Host PC
+    participant CMD as cmd_handler
+    participant UART as uart_driver
+    participant REG as Register Map
+    HOST->>UART: [0x57][ADDR_H][ADDR_L][DATA_H][DATA_L]
+    UART->>CMD: CmdHandler_Process()
+    CMD->>CMD: Parse frame, validate address
+    CMD->>REG: Write register
+    REG-->>CMD: Write complete
+    CMD->>UART: Send ACK (0x06)
+    UART-->>HOST: [0x06]
+```
+
+**Temperature Alert Sequence:**
+```mermaid
+sequenceDiagram
+    participant TMR as Periodic Timer
+    participant MON as temp_monitor
+    participant I2C as i2c_driver
+    participant RF as RF Control
+    participant LOG as UART Logger
+    TMR->>MON: TempMon_Task()
+    MON->>I2C: I2C_ReadReg(TEMP_ADDR, TEMP_REG, &raw)
+    I2C-->>MON: raw temperature data
+    MON->>MON: Convert to °C, compare with threshold
+    MON->>LOG: Log temperature via UART
+    alt Temperature > THRESH_HIGH
+        MON->>RF: Set TRP = LOW (RF off)
+        MON->>LOG: UART log TEMP_ALERT
+    else Temperature < THRESH_LOW (hysteresis)
+        MON->>RF: Set TRP = HIGH (RF on)
+    end
+```
+
+**Flash Write Sequence:**
+```mermaid
+sequenceDiagram
+    participant APP as Application
+    participant FLASH as flash_driver
+    participant SPI as spi_driver
+    APP->>FLASH: Flash_EraseSector(sector_addr)
+    FLASH->>SPI: Send WRITE_ENABLE (0x06)
+    FLASH->>SPI: Send SECTOR_ERASE (0x20, addr[23:0])
+    loop Poll BUSY
+        FLASH->>SPI: Read STATUS_REG1
+        SPI-->>FLASH: STATUS byte
+    end
+    FLASH-->>APP: Erase complete
+    APP->>FLASH: Flash_WritePage(addr, data, len)
+    FLASH->>SPI: Send WRITE_ENABLE
+    FLASH->>SPI: Send PAGE_PROGRAM (0x02, addr, data)
+    FLASH->>FLASH: Wait BUSY cleared
+    FLASH-->>APP: Write complete
+    APP->>FLASH: Flash_Read(addr, verify_buf, len)
+    APP->>APP: CRC32 verify
+```
+
+## 2.7 State Viewpoint — State Machines
+
+**System State Machine:**
+```mermaid
+stateDiagram-v2
+    [*] --> RESET
+    RESET --> INIT: Board_Init() called
+    INIT --> RUNNING: POST passed, all peripherals ready
+    INIT --> FAULT: POST failed or hardware error
+    RUNNING --> FAULT: Voltage fault or critical error
+    RUNNING --> SHUTDOWN: Shutdown command received
+    FAULT --> INIT: Watchdog reset
+    SHUTDOWN --> [*]
+```
+
+**Command Handler State Machine:**
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> WAIT_ADDR_H: CMD byte received (0x57/0x52/0x42/0x62)
+    WAIT_ADDR_H --> WAIT_ADDR_L: ADDR_MSB received
+    WAIT_ADDR_L --> WAIT_DATA_H: ADDR_LSB received (write cmds only)
+    WAIT_DATA_H --> WAIT_DATA_L: DATA_MSB received
+    WAIT_DATA_L --> EXECUTE: DATA_LSB received
+    WAIT_ADDR_L --> EXECUTE: ADDR_LSB received (read cmds only)
+    EXECUTE --> IDLE: ACK/NAK sent
+    IDLE --> IDLE: Invalid byte → NAK
+```
+
+**Temperature Monitor State Machine:**
+```mermaid
+stateDiagram-v2
+    [*] --> NORMAL
+    NORMAL --> ALERT_HIGH: temp > HIGH_THRESH
+    ALERT_HIGH --> NORMAL: temp < (HIGH_THRESH - HYSTERESIS)
+    ALERT_HIGH --> CRITICAL: temp > CRITICAL_THRESH
+    CRITICAL --> [*]: System shutdown
+    NORMAL --> ALERT_LOW: temp < LOW_THRESH
+    ALERT_LOW --> NORMAL: temp > (LOW_THRESH + HYSTERESIS)
+```
+
+**PLL State Machine:**
+```mermaid
+stateDiagram-v2
+    [*] --> DISABLED
+    DISABLED --> CONFIGURING: PLL_Init() / PLL_SetFrequency()
+    CONFIGURING --> LOCKING: N/R dividers written, PLL enabled
+    LOCKING --> LOCKED: LOCKED bit set
+    LOCKING --> ERROR: Timeout (100ms)
+    LOCKED --> LOSS_OF_LOCK: LOCKED bit cleared
+    LOSS_OF_LOCK --> CONFIGURING: Auto-retry
+    ERROR --> CONFIGURING: Manual retry / watchdog reset
+```
+
+## 2.8 Algorithm Viewpoint — Key Algorithms
+
+### 2.8.1 UART Frame Parser
+```c
+// Frame parser state machine using a ring buffer
+// 1. Read next byte from RX FIFO
+// 2. Match CMD byte: 0x57=write, 0x52=read, 0x42=bulk-write, 0x62=bulk-read
+// 3. Accumulate ADDR_H, ADDR_L bytes
+// 4. For write: accumulate DATA_H, DATA_L
+// 5. Execute register operation
+// 6. Send ACK (0x06) or NAK (0x15)
+// Timeout: reset parser if inter-byte gap > 10ms
+```
+
+### 2.8.2 Temperature Conversion
+```c
+// Raw ADC count to degrees Celsius:
+// For 10-bit signed register (2's complement):
+//   temp_degC = (int16_t)(raw_count) * 0.25f;
+// For I2C sensor (e.g. LM75 format):
+//   temp_degC = ((int16_t)(raw_msb << 8 | raw_lsb) >> 5) * 0.125f;
+```
+
+### 2.8.3 Power Rail Monitoring
+```c
+// ADC count to Volts:
+//   voltage_V = (float)adc_count * VREF / ADC_FULL_SCALE * VOLTAGE_DIVIDER_RATIO;
+// ADC count to Amps (shunt resistor method):
+//   current_A = (float)adc_count * VREF / ADC_FULL_SCALE / SHUNT_OHMS;
+```
+
+### 2.8.4 CRC-32 for Flash Verification
+```c
+uint32_t CRC32_Compute(const uint8_t *data, uint32_t len);
+bool     CRC32_Verify(const uint8_t *data, uint32_t len, uint32_t expected_crc);
+// Uses IEEE 802.3 polynomial: 0xEDB88320 (reflected)
+```
+
+---
+
+# 3. Design Rationale
+
+## 3.1 Architecture Choices
+
+For EACH major design decision, provide:
+- Decision made
+- Alternatives considered
+- Rationale for the chosen approach
+- Trade-offs accepted
+
+Example decisions to cover:
+- Bare-metal vs RTOS
+- Polling vs interrupt-driven communication
+- Static vs dynamic memory allocation (always static — MISRA)
+- Modular HAL vs direct register access
+- CRC algorithm selection
+- FIFO depth sizing
+
+## 3.2 MISRA-C:2012 Compliance Strategy
+- All functions return error codes (no void returns for operations that can fail)
+- No dynamic allocation — all buffers statically declared
+- All casts explicit — no implicit type conversions
+- Bounds checking on all array accesses
+- No recursion
+- Maximum function complexity: cyclomatic ≤ 15
+- Tools: PC-lint, MISRA Checker, Polyspace
+
+---
+
+# 4. Design Traceability Matrix
+
+| SDD Component | Implements REQ-SW-xxx | Design Element |
+|--------------|----------------------|----------------|
+| board_init.Board_Init() | REQ-SW-001, REQ-SW-002 | System initialization |
+| pll_driver.PLL_Init() | REQ-SW-003, REQ-SW-004 | PLL configuration |
+| uart_driver.UART_WriteReg() | REQ-SW-012 | UART single write |
+| uart_driver.UART_ReadReg() | REQ-SW-013 | UART single read |
+| uart_driver.UART_BulkWrite() | REQ-SW-014 | UART bulk write |
+| uart_driver.UART_BulkRead() | REQ-SW-015 | UART bulk read |
+| temp_monitor.TempMon_Task() | REQ-SW-021 through REQ-SW-025 | Temperature monitoring |
+| flash_driver.Flash_WritePage() | REQ-SW-031, REQ-SW-032 | Flash write with CRC verify |
+| power_monitor.PwrMon_Task() | REQ-SW-041, REQ-SW-042 | Power monitoring |
+(Continue for ALL REQ-SW-xxx from SRS)
+
+---
+
+# 5. Appendices
+
+## Appendix A — File Structure
+```
+src/
+├── main.c              # Main entry point, task scheduler
+├── board/
+│   ├── board_init.c    # Hardware initialization
+│   ├── board_init.h
+│   └── board_config.h  # Platform-specific #defines
+├── drivers/
+│   ├── uart_driver.c
+│   ├── uart_driver.h
+│   ├── spi_driver.c
+│   ├── spi_driver.h
+│   ├── i2c_driver.c
+│   ├── i2c_driver.h
+│   ├── gpio_driver.c
+│   ├── gpio_driver.h
+│   ├── pll_driver.c
+│   ├── pll_driver.h
+│   ├── flash_driver.c
+│   ├── flash_driver.h
+│   ├── eeprom_driver.c
+│   └── eeprom_driver.h
+├── app/
+│   ├── cmd_handler.c   # UART command processor
+│   ├── cmd_handler.h
+│   ├── temp_monitor.c  # Temperature monitoring task
+│   ├── temp_monitor.h
+│   ├── power_monitor.c # Power monitoring task
+│   ├── power_monitor.h
+│   ├── watchdog.c
+│   └── watchdog.h
+└── utils/
+    ├── crc32.c         # CRC-32 IEEE 802.3
+    ├── crc32.h
+    ├── ring_buffer.c   # Lock-free ring buffer
+    └── ring_buffer.h
+```
+
+## Appendix B — Register Map Summary
+(Summary of all FPGA registers accessed by software, grouped by BASE_ADDR)
+
+## Appendix C — Memory Map
+| Region | Start Address | Size | Usage |
+|--------|--------------|------|-------|
+| Flash | 0x00000000 | [X] MB | Firmware code + constants |
+| RAM | 0x20000000 | [X] KB | Stack + BSS + heap (static) |
+| FPGA Registers | 0x40000000 | [X] KB | Memory-mapped FPGA regs |
+| EEPROM | SPI | [X] KB | Calibration data |
+| Config Flash | SPI | [X] MB | FPGA bitstream |
+
+## Appendix D — Coding Standards Checklist
+- [ ] All functions return ErrorCode_t
+- [ ] No malloc/calloc/free/realloc
+- [ ] No recursion
+- [ ] All array accesses bounds-checked
+- [ ] All switch statements have default case
+- [ ] All if/else fully braced
+- [ ] All variables initialized at declaration
+- [ ] Cyclomatic complexity ≤ 15 per function
+- [ ] Doxygen headers on all public functions
+- [ ] Unit test for each driver module
+
+---
+
+## 2.9 Resource Viewpoint — Real-Time Constraints
+
+### 2.9.1 Task Scheduling Table
+Define all periodic tasks and their timing budget:
+
+| Task Name | Period | Worst-Case Exec Time | Priority | Deadline | CPU Load |
+|-----------|--------|---------------------|----------|----------|---------|
+| main_loop | 10ms | [X]µs | N/A | 10ms | [X]% |
+| TempMon_Task | 1000ms | [X]µs | Low | 1000ms | [X]% |
+| PwrMon_Task | 500ms | [X]µs | Low | 500ms | [X]% |
+| WDT_Pet | 5000ms | [X]µs | Highest | 5000ms | [X]% |
+| CmdHandler_Process | 1ms | [X]µs | Medium | 5ms | [X]% |
+
+### 2.9.2 ISR Latency Budget
+| Interrupt Source | Latency Requirement | Worst-Case Measured | Margin |
+|-----------------|--------------------|--------------------|--------|
+| UART RX | < [X]µs | [X]µs | [X]% |
+| SPI Transfer Complete | < [X]µs | [X]µs | [X]% |
+| Timer Tick | < [X]µs | [X]µs | [X]% |
+| Temperature Alert GPIO | < [X]µs | [X]µs | [X]% |
+
+### 2.9.3 Memory Budget
+| Region | Total Available | Used | Remaining |
+|--------|----------------|------|-----------|
+| Code Flash | [X] KB | [X] KB | [X] KB |
+| Data Flash | [X] KB | [X] KB | [X] KB |
+| SRAM | [X] KB | [X] KB | [X] KB |
+| EEPROM | [X] KB | [X] KB | [X] KB |
+| Stack (worst path) | [X] KB | [X] KB | [X] KB |
+
+---
+
+## 2.10 Build System Viewpoint
+
+### 2.10.1 CMakeLists.txt Structure
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project([ProjectName] VERSION 1.0.0 LANGUAGES C CXX)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+
+# Driver library (C)
+add_library(drivers STATIC
+    drivers/uart_driver.c
+    drivers/spi_driver.c
+    drivers/i2c_driver.c
+    drivers/gpio_driver.c
+    drivers/pll_driver.c
+    drivers/flash_driver.c
+    drivers/eeprom_driver.c
+    utils/crc32.c
+    utils/ring_buffer.c
+)
+
+# Application (C)
+add_executable(firmware
+    src/main.c
+    src/board/board_init.c
+    src/app/cmd_handler.c
+    src/app/temp_monitor.c
+    src/app/power_monitor.c
+    src/app/watchdog.c
+)
+target_link_libraries(firmware PRIVATE drivers)
+target_compile_options(firmware PRIVATE
+    -Wall -Wextra -Werror
+    -fstack-usage      # generate .su files for stack analysis
+    -ffunction-sections -fdata-sections  # dead-code elimination
+)
+
+# Qt6 C++ GUI (optional)
+find_package(Qt6 COMPONENTS Widgets SerialPort QUIET)
+if (Qt6_FOUND)
+    add_subdirectory(qt_gui)
+endif()
+
+# Unit Tests (CTest + Google Test)
+enable_testing()
+add_subdirectory(tests)
+```
+
+### 2.10.2 Cross-Compilation for ARM Target
+```cmake
+# Toolchain file: arm-none-eabi.cmake
+set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+set(CMAKE_C_COMPILER arm-none-eabi-gcc)
+set(CMAKE_CXX_COMPILER arm-none-eabi-g++)
+set(CMAKE_EXE_LINKER_FLAGS "-specs=nosys.specs -specs=nano.specs" CACHE STRING "" FORCE)
+```
+
+### 2.10.3 Unit Test Infrastructure
+```cmake
+# tests/CMakeLists.txt
+find_package(GTest REQUIRED)
+add_executable(test_drivers
+    test_uart_driver.cpp
+    test_spi_driver.cpp
+    test_i2c_driver.cpp
+    test_flash_driver.cpp
+    mock_hardware.cpp   # hardware mock layer for host testing
+)
+target_link_libraries(test_drivers PRIVATE drivers GTest::gtest_main)
+include(GoogleTest)
+gtest_discover_tests(test_drivers)
+```
+
+---
+
+## ABSOLUTE RULES:
+1. ALL modules must have complete, syntactically correct C99 function prototypes
+2. ALL Mermaid diagrams must be valid (sequenceDiagram, stateDiagram-v2, graph TD, classDiagram). STRICT label rules: NO single-quotes ', double-quotes ", angle brackets < >, #, |, & or colons : inside node labels. NO 3+ consecutive dashes (---) inside labels. Use plain ASCII words only.
+3. NEVER use TBD, TBC, or TBA — use actual values from the SRS/HRS/GLR or state explicit assumptions
+4. The traceability matrix must map EVERY design element to its REQ-SW-xxx from the SRS
+5. Include minimum 8 Mermaid diagrams across all viewpoints
+6. Design must be 100% MISRA-C:2012 compliant — no exceptions
+7. Be highly specific to the actual project hardware — derive module names, register addresses, and constants from the SRS/GLR context provided
+8. Section 2.9 (Resource Viewpoint) MUST include the task scheduling table, ISR latency budget, and memory budget
+9. Section 2.10 (Build System) MUST include the CMakeLists.txt structure for drivers + firmware + Qt6 GUI + unit tests
+"""
+
+
+class SDDAgent(BaseAgent):
+    """Phase 8b: IEEE 1016-compliant SDD generation."""
+
+    def __init__(self):
+        super().__init__(
+            phase_number="P8b",
+            phase_name="SDD Generation",
+            model=settings.primary_model,  # Primary model for 50+ page professional document
+            max_tokens=16384,
+        )
+        self.sdd_generator = SDDGenerator()
+
+    def get_system_prompt(self, project_context: dict) -> str:
+        return SYSTEM_PROMPT
+
+    async def execute(self, project_context: dict, user_input: str) -> dict:
+        output_dir = Path(project_context.get("output_dir", "output"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        project_name = project_context.get("name", "Project")
+
+        # Load SRS (primary input) and context
+        srs = self._load_file(output_dir / f"SRS_{project_name.replace(' ', '_')}.md")
+        hrs = self._load_file(output_dir / f"HRS_{project_name.replace(' ', '_')}.md")
+        glr = self._load_file(output_dir / "glr_specification.md")
+
+        if not srs:
+            return {
+                "response": "SRS not found. Complete Phase 8a first.",
+                "phase_complete": False,
+                "outputs": {},
+            }
+
+        from datetime import datetime
+        today = datetime.now().strftime("%d %B %Y")
+
+        # PRIMARY PATH: LLM writes the full IEEE 1016 SDD from SRS context
+        user_message = (
+            f"Generate a COMPLETE, DETAILED, 60+ page IEEE 1016-2009 Software Design Document for:\n\n"
+            f"**Project:** {project_name}\n"
+            f"**Date:** {today}\n\n"
+            f"## Software Requirements Specification (SRS — primary input):\n{srs[:10000]}\n\n"
+            f"## GLR Specification (FPGA registers, signal names, UART protocol):\n{glr[:5000] if glr else 'Not available.'}\n\n"
+            f"## HRS (hardware context, power rails, interfaces):\n{hrs[:3000] if hrs else 'Not available.'}\n\n"
+            "INSTRUCTIONS:\n"
+            "1. Generate ALL sections from the IEEE 1016 structure in your system prompt\n"
+            "2. Include complete C struct definitions and ALL function prototypes for every module\n"
+            "3. Include minimum 8 Mermaid diagrams (sequenceDiagram, stateDiagram-v2, graph TD, classDiagram)\n"
+            "4. Every design element must trace back to a REQ-SW-xxx from the SRS\n"
+            "5. Design must be MISRA-C:2012 compliant throughout\n"
+            "6. Section 2.9 (Resource Viewpoint) MUST include: task scheduling table, ISR latency budget, and memory budget derived from HRS\n"
+            "7. Section 2.10 (Build System) MUST include: CMakeLists.txt structure for drivers + firmware + Qt6 GUI + unit tests (Google Test)\n"
+            "8. Appendix B MUST include: full FPGA register map (base address, offset, name, R/W, reset value) from GLR\n"
+            "9. Derive module names, register addresses, constants from the SRS/GLR — no generic boilerplate\n"
+            "10. NEVER use TBD/TBC/TBA — use actual values or explicit engineering assumptions"
+        )
+
+        sdd_content = ""
+        try:
+            response = await self.call_llm(
+                messages=[{"role": "user", "content": user_message}],
+                system=SYSTEM_PROMPT,
+            )
+            sdd_content = response.get("content", "")
+
+            # Up to 5 continuation passes — each feeds accumulated text back as context
+            _SDD_CONT_PROMPTS = [
+                (
+                    "Continue the SDD from exactly where you left off. "
+                    "Do NOT repeat any sections already written. "
+                    "Complete remaining viewpoints, module interface definitions, "
+                    "state machines, and interrupt/task scheduling design."
+                ),
+                (
+                    "Continue the SDD. Do NOT repeat content already written. "
+                    "Write detailed algorithm descriptions, data flow diagrams (Mermaid flowcharts), "
+                    "and the complete sequence diagrams for every major hardware interaction."
+                ),
+                (
+                    "Continue the SDD. Do NOT repeat content already written. "
+                    "Complete the IEEE 1016 Information Viewpoint: "
+                    "all data structures (C structs), enums, configuration tables, "
+                    "and persistent data layout in non-volatile memory."
+                ),
+                (
+                    "Continue the SDD. Do NOT repeat content already written. "
+                    "Write the full Design Traceability Matrix "
+                    "(SDD component/function → REQ-SW-xxx → REQ-HW-xxx). "
+                    "Every SDD design decision must trace to at least one SRS requirement."
+                ),
+                (
+                    "Finalize the SDD. Do NOT repeat content already written. "
+                    "Write Appendix A (file/directory structure), Appendix B (memory map), "
+                    "Appendix C (coding standards compliance checklist), "
+                    "Appendix D (acronyms/glossary), and the revision history table."
+                ),
+            ]
+
+            for _pass_idx, _cont_prompt in enumerate(_SDD_CONT_PROMPTS, start=1):
+                if response.get("stop_reason") != "max_tokens":
+                    break
+                self.log(f"SDD truncated — continuation pass {_pass_idx}/5...")
+                _cont = await self.call_llm(
+                    messages=[
+                        {"role": "user", "content": user_message},
+                        {"role": "assistant", "content": sdd_content},
+                        {"role": "user", "content": _cont_prompt},
+                    ],
+                    system=SYSTEM_PROMPT,
+                )
+                sdd_content += "\n\n" + _cont.get("content", "")
+                response = _cont  # check this response's stop_reason in next iteration
+        except Exception as e:
+            self.log(f"LLM SDD generation failed: {e} — falling back to template", "warning")
+
+        # FALLBACK: template generator
+        if not sdd_content or len(sdd_content) < 800:
+            modules = await self._extract_modules(srs)
+            interfaces = await self._extract_interfaces(srs, glr)
+            state_machines = await self._extract_state_machines(srs)
+            sdd_content = self.sdd_generator.generate(
+                project_name=project_name,
+                modules=modules,
+                interfaces=interfaces,
+                state_machines=state_machines,
+                metadata={"version": project_context.get("version", "1.0")},
+            )
+
+        # Scrub any TBD/TBC/TBA the LLM wrote despite instructions
+        import re as _re
+        sdd_content = _re.sub(r'\b(TBD|TBC|TBA)\b', '[specify]', sdd_content, flags=_re.IGNORECASE)
+
+        # Save output
+        sdd_file = self.sdd_generator.save(sdd_content, output_dir, project_name)
+        self.log(f"SDD generated: {len(sdd_content)} chars")
+
+        return {
+            "response": "SDD document generated (IEEE 1016 compliant).",
+            "phase_complete": True,
+            "outputs": {sdd_file.name: sdd_content},
+        }
+
+    async def _extract_modules(self, srs: str) -> list:
+        """Extract software modules from SRS by parsing headers and component names."""
+        import re
+        modules = []
+
+        if not srs:
+            return self._default_modules()
+
+        # Look for section headers (## ...) that indicate modules
+        header_pattern = r'^##\s+([^\n]+?)(?:\s*\(([^)]*)\))?$'
+        matches = re.findall(header_pattern, srs, re.MULTILINE)
+
+        for title, desc in matches:
+            module_name = title.strip()
+            # Skip generic headings
+            if not any(skip in module_name.lower() for skip in ['introduction', 'overview', 'references', 'appendix']):
+                modules.append({
+                    "name": module_name,
+                    "description": desc.strip() if desc else module_name,
+                    "file": module_name.lower().replace(" ", "_") + ".c"
+                })
+
+        # Look for software component patterns
+        component_pattern = r'(?:module|component|driver|subsystem)[\s:]+([A-Za-z0-9_\s]+?)(?:\n|,|;)'
+        components = re.findall(component_pattern, srs, re.IGNORECASE)
+
+        for comp in components:
+            comp_name = comp.strip()
+            if comp_name and len(comp_name) < 50:  # Filter out overly long matches
+                if not any(m["name"].lower() == comp_name.lower() for m in modules):
+                    modules.append({
+                        "name": comp_name,
+                        "description": f"{comp_name} implementation",
+                        "file": comp_name.lower().replace(" ", "_") + ".c"
+                    })
+
+        # Look for common module patterns
+        if not modules:
+            keywords = ['initialization', 'driver', 'control', 'interface', 'handler', 'manager', 'service']
+            for keyword in keywords:
+                if keyword in srs.lower():
+                    modules.append({
+                        "name": keyword.capitalize(),
+                        "description": f"{keyword.capitalize()} module",
+                        "file": keyword + ".c"
+                    })
+
+        return modules if modules else self._default_modules()
+
+    async def _extract_interfaces(self, srs: str, glr: str) -> list:
+        """Extract API interfaces from SRS by parsing function signatures and protocol names."""
+        import re
+        interfaces = []
+
+        content = (srs or "") + "\n" + (glr or "")
+        if not content:
+            return self._default_interfaces()
+
+        # Look for function signatures
+        func_pattern = r'(\w+)\s*\(\s*([^)]*?)\s*\)'
+        functions = re.findall(func_pattern, content)
+
+        # Extract unique function names
+        func_names = set()
+        for func_name, params in functions:
+            if func_name and not func_name.startswith('#') and len(func_name) > 2:
+                func_names.add(func_name)
+
+        # Group by protocol/type
+        protocol_funcs = {}
+        protocols = ['UART', 'SPI', 'I2C', 'CAN', 'USB', 'GPIO', 'ADC', 'PWM', 'DMA']
+
+        for protocol in protocols:
+            matching = [f for f in func_names if protocol.lower() in f.lower()]
+            if matching:
+                protocol_funcs[protocol] = matching
+
+        # Build interface list
+        for protocol, funcs in protocol_funcs.items():
+            interfaces.append({
+                "name": protocol,
+                "type": "Hardware",
+                "functions": ", ".join(sorted(list(funcs)[:5]))
+            })
+
+        # Add HAL/abstraction layer if any init/control functions found
+        if any(f in ' '.join(func_names) for f in ['init', 'control', 'config']):
+            if not any(i["name"] == "HAL" for i in interfaces):
+                interfaces.insert(0, {
+                    "name": "HAL",
+                    "type": "Internal",
+                    "functions": "hal_init(), hal_read(), hal_write(), hal_control()"
+                })
+
+        return interfaces if interfaces else self._default_interfaces()
+
+    async def _extract_state_machines(self, srs: str) -> list:
+        """Extract state machines from SRS by parsing state-related keywords."""
+        import re
+        state_machines = []
+
+        if not srs:
+            return self._default_state_machines()
+
+        # Look for state machine mentions
+        sm_pattern = r'(?:state\s+machine|state\s+diagram|states?)[:\s]+([^\n]+)'
+        sm_matches = re.findall(sm_pattern, srs, re.IGNORECASE)
+
+        # Extract state names
+        state_pattern = r'\b(?:init|idle|running|active|sleep|waiting|error|fault|shutdown|standby)\b'
+        states = list(set(re.findall(state_pattern, srs, re.IGNORECASE)))
+
+        if sm_matches:
+            for sm_desc in sm_matches[:3]:  # Limit to 3 state machines
+                state_machines.append({
+                    "name": sm_desc.strip()[:50],
+                    "states": states if states else ["Init", "Idle", "Running", "Error"]
+                })
+
+        if not state_machines:
+            # Fallback: create default state machine if any control/state keywords found
+            if re.search(r'state|mode|status|condition', srs, re.IGNORECASE):
+                state_machines.append({
+                    "name": "Main Control State Machine",
+                    "states": states if states else ["Init", "Idle", "Running", "Error"]
+                })
+
+        return state_machines if state_machines else self._default_state_machines()
+
+    def _default_modules(self) -> list:
+        """Default modules."""
+        return [
+            {"name": "Main", "description": "Main application loop", "file": "main.c"},
+            {"name": "HAL", "description": "Hardware abstraction layer", "file": "hal.c"},
+            {"name": "Drivers", "description": "Device drivers", "file": "drivers.c"},
+            {"name": "Comms", "description": "Communication interface", "file": "comms.c"},
+        ]
+
+    def _default_interfaces(self) -> list:
+        """Default interfaces."""
+        return [
+            {"name": "HAL", "type": "Internal", "functions": "hal_init(), hal_read(), hal_write()"},
+            {"name": "UART", "type": "Hardware", "functions": "uart_init(), uart_send(), uart_recv()"},
+            {"name": "SPI", "type": "Hardware", "functions": "spi_transfer()"},
+        ]
+
+    def _default_state_machines(self) -> list:
+        """Default state machines."""
+        return [
+            {"name": "Main State Machine", "states": ["Init", "Idle", "Running", "Error"]}
+        ]
+
+    def _load_file(self, path: Path) -> str:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
