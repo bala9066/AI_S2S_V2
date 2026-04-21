@@ -63,21 +63,77 @@ def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
             "User-Agent": "HardwarePipeline/2.0 (+mouser_api.py)",
         },
     )
-    ctx = ssl.create_default_context()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if getattr(exc, "code", None) == 404:
-            return None
-        log.info("mouser.http_error %s: %s", getattr(exc, "code", "?"), exc)
+    payload = _open_with_retry(
+        req, timeout_s=timeout_s, what=f"mouser.lookup pn={part_number}",
+    )
+    if payload is None:
         return None
-    except (urllib.error.URLError, TimeoutError, ssl.SSLError,
-            OSError, json.JSONDecodeError) as exc:
-        log.info("mouser.lookup_failed pn=%s: %s", part_number, exc)
-        return None
-
     return _parse_search_response(payload, part_number)
+
+
+# ---------------------------------------------------------------------------
+# Transport with 429 / Retry-After backoff
+# ---------------------------------------------------------------------------
+import time as _time
+
+
+def _open_with_retry(
+    req: urllib.request.Request,
+    *,
+    timeout_s: float,
+    what: str,
+    max_retries: int = 2,
+) -> Optional[dict]:
+    """Open `req` as a JSON endpoint with bounded 429 retry support.
+
+    Returns the decoded JSON payload on success, None on any failure.
+    Mouser's rate-limit errors come back as 429; Retry-After is usually
+    set. Cap the backoff at 30 s per attempt and `max_retries` total."""
+    ctx = ssl.create_default_context()
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            code = getattr(exc, "code", None)
+            if code == 404:
+                return None
+            if code == 429 and attempt < max_retries:
+                wait_s = _parse_retry_after(
+                    exc.headers if hasattr(exc, "headers") else None
+                )
+                attempt += 1
+                log.info(
+                    "mouser.429_backoff attempt=%d wait=%.1fs %s",
+                    attempt, wait_s, what,
+                )
+                _time.sleep(min(wait_s, 30.0))
+                continue
+            log.info("mouser.http_error %s code=%s: %s", what, code, exc)
+            return None
+        except (urllib.error.URLError, TimeoutError, ssl.SSLError,
+                OSError, json.JSONDecodeError) as exc:
+            log.info("mouser.transport_error %s: %s", what, exc)
+            return None
+
+
+def _parse_retry_after(headers) -> float:
+    if headers is None:
+        return 2.0
+    raw = headers.get("Retry-After", "") if hasattr(headers, "get") else ""
+    if not raw:
+        return 2.0
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        return max(0.1, (dt.timestamp() - _time.time()))
+    except Exception:
+        return 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -122,18 +178,10 @@ def keyword_search(
             "User-Agent": "HardwarePipeline/2.0 (+mouser_api.py)",
         },
     )
-    try:
-        with urllib.request.urlopen(
-            req, timeout=timeout_s, context=ssl.create_default_context(),
-        ) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        log.info("mouser.keyword_http_error %s: %s",
-                 getattr(exc, "code", "?"), exc)
-        return []
-    except (urllib.error.URLError, TimeoutError, ssl.SSLError,
-            OSError, json.JSONDecodeError) as exc:
-        log.info("mouser.keyword_failed q=%r: %s", keywords, exc)
+    payload = _open_with_retry(
+        req, timeout_s=timeout_s, what=f"mouser.keyword q={keywords!r}",
+    )
+    if payload is None:
         return []
 
     parts = ((payload or {}).get("SearchResults") or {}).get("Parts") or []
@@ -215,24 +263,87 @@ def _parse_search_response(payload: dict, requested_pn: str) -> Optional[PartInf
     price_value, price_currency = _first_price_break(best.get("PriceBreaks") or [])
     price_usd = price_value if price_currency == "USD" else None
 
-    try:
-        stock = int(best.get("AvailabilityInStock") or 0)
-    except (TypeError, ValueError):
-        stock = None
+    # Stock count — Mouser has shipped several names for this field over
+    # the years; try the common ones in order before giving up.
+    stock = None
+    for key in ("AvailabilityInStock", "Availability", "QuantityAvailable"):
+        raw = best.get(key)
+        if raw is None:
+            continue
+        try:
+            stock = int(str(raw).strip() or 0)
+            break
+        except (TypeError, ValueError):
+            continue
+
+    # Region of the stock figure — explicit field first, then infer from
+    # the response's `MouserRegionCodePrefix`, then from MOUSER_API_URL's
+    # host. Empty string when none of those resolve.
+    region = _infer_region(best, results=(payload or {}).get("SearchResults") or {})
+
+    # Prefer dedicated fields but tolerate the legacy all-caps variants.
+    mfr = (
+        best.get("Manufacturer")
+        or best.get("ManufacturerName")
+        or ""
+    )
+    desc = (
+        best.get("Description")
+        or best.get("ProductDescription")
+        or ""
+    )
+    ds_url = (
+        best.get("DataSheetUrl")
+        or best.get("DatasheetUrl")
+        or best.get("Datasheet")
+        or ""
+    )
 
     return PartInfo(
         part_number=(best.get("ManufacturerPartNumber") or requested_pn).strip(),
-        manufacturer=(best.get("Manufacturer") or "").strip(),
-        description=(best.get("Description") or "").strip(),
-        datasheet_url=(best.get("DataSheetUrl") or "").strip() or None,
+        manufacturer=str(mfr).strip(),
+        description=str(desc).strip(),
+        datasheet_url=str(ds_url).strip() or None,
         product_url=(best.get("ProductDetailUrl") or "").strip() or None,
         lifecycle_status=lifecycle,
         unit_price_usd=price_usd,
         stock_quantity=stock,
+        region=region,
         source="mouser",
         unit_price=price_value,
         unit_price_currency=price_currency,
     )
+
+
+def _infer_region(part: dict, *, results: dict) -> str:
+    """Best-effort region derivation for Mouser stock figures.
+
+    Priority:
+      1. part["Region"] / part["MouserRegion"] — explicit per-item.
+      2. results["MouserRegionCodePrefix"] — response-level (e.g. "IN").
+      3. MOUSER_API_URL host TLD — `.in` / `.de` / `.com` heuristic.
+      4. Empty string when nothing resolves.
+    """
+    for key in ("Region", "MouserRegion", "RegionCode"):
+        v = (part.get(key) or "").strip().upper()
+        if v:
+            return v[:3]
+    for key in ("MouserRegionCodePrefix", "RegionCode"):
+        v = (results.get(key) or "").strip().upper()
+        if v:
+            return v[:3]
+    # TLD heuristic
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(_config()[1]).hostname or ""
+        tld = host.rsplit(".", 1)[-1].upper()
+        if tld in {"IN", "DE", "FR", "UK", "JP", "CN", "BR", "SG", "HK"}:
+            return tld
+        if tld == "COM":
+            return "US"
+    except Exception:
+        pass
+    return ""
 
 
 def _first_price_break(breaks: list) -> tuple[Optional[float], Optional[str]]:

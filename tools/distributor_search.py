@@ -16,13 +16,27 @@ Opt-outs:
   SKIP_DISTRIBUTOR_LOOKUP=1  → never hit the network; use seed only.
   SKIP_DIGIKEY=1             → skip DigiKey, still try Mouser.
   SKIP_MOUSER=1              → skip Mouser.
+  SKIP_DATASHEET_VERIFY=1    → trust datasheet URLs without HEAD probe.
+
+Two orthogonal features that make the lookup forgiving enough for
+real-world LLM output:
+
+  - `normalize_mpn` strips common packaging / reel / revision suffixes
+    (-R7, -TR, -REEL, -01WTG, /S, …) so a strict exact-match lookup
+    can still find parts the LLM typed with a variant suffix.
+
+  - On an accepted result we HEAD-verify the distributor's datasheet
+    URL and strip it if the probe fails, so a stale URL in Mouser's
+    index can't leak into the final BOM.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -56,6 +70,72 @@ def _skip_digikey() -> bool:
 
 def _skip_mouser() -> bool:
     return os.getenv("SKIP_MOUSER", "").strip() in {"1", "true", "yes"}
+
+
+def _skip_datasheet_verify() -> bool:
+    return os.getenv("SKIP_DATASHEET_VERIFY", "").strip() in {"1", "true", "yes"}
+
+
+# ---------------------------------------------------------------------------
+# MPN normalisation — fuzzy-match suffix stripping
+# ---------------------------------------------------------------------------
+
+# Suffix patterns we strip when exact match fails, in priority order.
+# All matches are anchored to the end and are case-insensitive. Each
+# entry is a regex; order matters — longer / more-specific first so a
+# part like "ADL8107-REEL7" strips to "ADL8107", not "ADL8107-REE".
+_SUFFIX_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"[-/]REEL\d*$", re.IGNORECASE),
+    re.compile(r"[-/]TAPE$", re.IGNORECASE),
+    re.compile(r"-TR\d+$", re.IGNORECASE),           # -TR1000
+    re.compile(r"-?T&?R$", re.IGNORECASE),           # -TR, -T&R
+    re.compile(r"-CT-ND$", re.IGNORECASE),           # DigiKey ordering suffix
+    re.compile(r"-ND$", re.IGNORECASE),              # DigiKey part suffix
+    re.compile(r"-R\d+$", re.IGNORECASE),            # -R7
+    re.compile(r"/(?:TR|RL|T|R)$", re.IGNORECASE),   # /TR, /RL
+    re.compile(r"-(?:PBFREE|PBF|LF|RoHS)$", re.IGNORECASE),
+    re.compile(r"-\d{2,3}[A-Z]{2,5}$"),              # -01WTG / -300AZD
+    re.compile(r"[-/]SAMPLE$", re.IGNORECASE),
+    re.compile(r"\s+$"),                             # trailing whitespace
+)
+
+
+def normalize_mpn(part_number: str) -> str:
+    """Return an alternate MPN with packaging / revision suffixes stripped.
+
+    Returns the input unchanged when no pattern matches. Multiple
+    patterns may match in sequence — we apply the first that does and
+    stop (one strip per call); callers can feed the output back in to
+    strip further suffixes if needed.
+    """
+    if not part_number:
+        return ""
+    pn = str(part_number).strip().upper()
+    for pat in _SUFFIX_PATTERNS:
+        m = pat.search(pn)
+        if m:
+            return pn[:m.start()].rstrip("-/ ")
+    return pn
+
+
+def _fuzzy_candidates(part_number: str) -> list[str]:
+    """Return a short list of MPN variants to try: original first, then
+    progressively-stripped forms. Dedupes the list so we don't query
+    twice for the same key."""
+    seen: set[str] = set()
+    out: list[str] = []
+    candidate = part_number.strip()
+    for _ in range(3):  # three strip passes at most — covers "-R7-REEL-TR"
+        key = candidate.strip().upper()
+        if not key or key in seen:
+            break
+        seen.add(key)
+        out.append(candidate)
+        stripped = normalize_mpn(candidate)
+        if stripped == key:
+            break
+        candidate = stripped
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +182,35 @@ def _seed_lookup(part_number: str) -> Optional[PartInfo]:
 
 
 # ---------------------------------------------------------------------------
+# Datasheet HEAD verification (tier-3 hardening)
+# ---------------------------------------------------------------------------
+
+def _verify_datasheet(info: PartInfo) -> PartInfo:
+    """HEAD-probe the datasheet URL returned by the distributor. Strip
+    the URL when the probe fails AND the domain isn't on the trusted-
+    vendor allowlist. Controlled by SKIP_DATASHEET_VERIFY=1."""
+    if not info.datasheet_url or _skip_datasheet_verify():
+        return info
+    try:
+        from tools.datasheet_verify import is_trusted_vendor_url, verify_url
+    except Exception:
+        return info
+    if is_trusted_vendor_url(info.datasheet_url):
+        return info
+    try:
+        ok = verify_url(info.datasheet_url, timeout=3.0)
+    except Exception as exc:
+        log.debug("distributor_search.datasheet_probe_err url=%s: %s",
+                  info.datasheet_url, exc)
+        ok = False
+    if ok:
+        return info
+    log.info("distributor_search.datasheet_stripped url=%s pn=%s",
+             info.datasheet_url, info.part_number)
+    return replace(info, datasheet_url=None)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -116,7 +225,19 @@ def reset_cache() -> None:
 
 def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
     """Return a `PartInfo` for `part_number`, consulting in order:
-    DigiKey, Mouser, local seed. None when every tier misses."""
+    DigiKey, Mouser, local seed. None when every tier misses.
+
+    Two resilience features layered on top of the raw tiered lookup:
+
+      1. Fuzzy MPN match — if the original MPN misses everywhere, strip
+         packaging/revision suffixes (-R7, -TR1000, -REEL, -01WTG, /S,
+         etc.) and retry. The resulting PartInfo carries the distributor's
+         canonical part_number, not the stripped variant.
+      2. Datasheet URL HEAD-verify — if the distributor hit returned a
+         datasheet URL that doesn't resolve (and isn't on the trusted-
+         vendor allowlist), the URL is stripped so downstream docs
+         don't embed dead links.
+    """
     if not part_number:
         return None
     key = part_number.strip().upper()
@@ -127,14 +248,20 @@ def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
     info: Optional[PartInfo] = None
     skip_net = _skip_all_network()
 
-    if not skip_net and not _skip_digikey() and digikey_api.is_configured():
-        info = digikey_api.lookup(part_number, timeout_s=timeout_s)
+    # Try each candidate MPN (original first, then suffix-stripped
+    # variants). Short-circuit on the first tier+variant that answers.
+    for candidate in _fuzzy_candidates(part_number):
+        if not skip_net and not _skip_digikey() and digikey_api.is_configured():
+            info = digikey_api.lookup(candidate, timeout_s=timeout_s)
+        if info is None and not skip_net and not _skip_mouser() and mouser_api.is_configured():
+            info = mouser_api.lookup(candidate, timeout_s=timeout_s)
+        if info is None:
+            info = _seed_lookup(candidate)
+        if info is not None:
+            break
 
-    if info is None and not skip_net and not _skip_mouser() and mouser_api.is_configured():
-        info = mouser_api.lookup(part_number, timeout_s=timeout_s)
-
-    if info is None:
-        info = _seed_lookup(part_number)
+    if info is not None:
+        info = _verify_datasheet(info)
 
     with _cache_lock:
         _cache[key] = info

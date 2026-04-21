@@ -290,6 +290,82 @@ def run_banned_parts_audit(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+def run_price_reconciliation_audit(
+    component_recommendations: list[dict[str, Any]],
+    *,
+    pct_threshold: float = 20.0,
+    timeout_s: float = 6.0,
+) -> list[AuditIssue]:
+    """Cross-check DigiKey vs Mouser prices per MPN.
+
+    When BOTH distributors are configured AND both return a price in the
+    **same currency**, flag any component where the delta exceeds
+    `pct_threshold` percent. Currency mismatch is skipped silently (INR
+    vs USD has an FX layer we don't touch). Missing keys / lookup miss
+    on either tier → skipped. Purely advisory (severity="medium") so a
+    legitimate difference (quantity-break differences, promo pricing)
+    doesn't block the pipeline.
+
+    Issue category: `price_discrepancy`.
+    """
+    issues: list[AuditIssue] = []
+    if not component_recommendations:
+        return issues
+
+    try:
+        from tools import digikey_api, mouser_api
+    except Exception:
+        return issues
+    if not (digikey_api.is_configured() and mouser_api.is_configured()):
+        return issues  # need BOTH to compare
+
+    for c in component_recommendations:
+        pn = (
+            c.get("part_number")
+            or c.get("primary_part")
+            or c.get("mpn")
+            or ""
+        ).strip()
+        if not pn:
+            continue
+        try:
+            dk = digikey_api.lookup(pn, timeout_s=timeout_s)
+            mo = mouser_api.lookup(pn, timeout_s=timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("price_reconcile.lookup_err pn=%s: %s", pn, exc)
+            continue
+        if not (dk and mo):
+            continue
+        if dk.unit_price is None or mo.unit_price is None:
+            continue
+        if not dk.unit_price_currency or dk.unit_price_currency != mo.unit_price_currency:
+            continue  # different currencies — skip (no FX layer)
+
+        dk_p, mo_p = float(dk.unit_price), float(mo.unit_price)
+        if dk_p <= 0 or mo_p <= 0:
+            continue
+        denom = min(dk_p, mo_p)
+        delta_pct = abs(dk_p - mo_p) / denom * 100.0
+        if delta_pct < pct_threshold:
+            continue
+        cheaper = "DigiKey" if dk_p < mo_p else "Mouser"
+        issues.append(AuditIssue(
+            severity="medium",
+            category="price_discrepancy",
+            location=f"component_recommendations/{pn}",
+            detail=(
+                f"Unit price for `{pn}` differs by {delta_pct:.0f}% between "
+                f"distributors: DigiKey = {dk_p:.2f} {dk.unit_price_currency}, "
+                f"Mouser = {mo_p:.2f} {mo.unit_price_currency}. {cheaper} is cheaper."
+            ),
+            suggested_fix=(
+                "Verify the quantity break assumed for each distributor and "
+                "pick the one that matches the intended build volume."
+            ),
+        ))
+    return issues
+
+
 def run_candidate_pool_audit(
     component_recommendations: list[dict[str, Any]],
     offered_mpns: Optional[set[str]],
@@ -392,5 +468,12 @@ def run_all(
     # 5. Candidate-pool gate — advisory check that the LLM used the
     # retrieval tool. Only fires when the caller threaded the set in.
     issues.extend(run_candidate_pool_audit(enriched, offered_candidate_mpns))
+
+    # 6. Price reconciliation — compare DigiKey vs Mouser prices on
+    # MPNs that both distributors know about. Advisory (medium) so a
+    # legitimate price difference doesn't block the pipeline, but it
+    # catches the case where one distributor's stale price line could
+    # mislead the BOM cost roll-up.
+    issues.extend(run_price_reconciliation_audit(enriched, timeout_s=timeout_s))
 
     return tool_input, issues

@@ -64,6 +64,12 @@ class PartInfo:
     source: str                  # "digikey" | "mouser" | "seed" | "chromadb"
     unit_price: Optional[float] = None            # first-break price in native currency
     unit_price_currency: Optional[str] = None     # ISO-4217 code, e.g. "USD", "INR"
+    # Region the stock figure applies to. "US" / "IN" / "DE" etc. when the
+    # distributor returns it; "" when the API doesn't differentiate (DigiKey
+    # is always US-keyed for our account). Consumers showing stock numbers
+    # MUST surface this so a buyer in Bangalore doesn't see "180 in stock"
+    # and assume same-day ship when that inventory is Texas-only.
+    region: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -77,6 +83,7 @@ class PartInfo:
             "unit_price": self.unit_price,
             "unit_price_currency": self.unit_price_currency,
             "stock_quantity": self.stock_quantity,
+            "region": self.region,
             "source": self.source,
         }
 
@@ -216,26 +223,86 @@ def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
             "User-Agent": "HardwarePipeline/2.0 (+digikey_api.py)",
         },
     )
-    ctx = ssl.create_default_context()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        # 404 => part not in catalog (not a bug — the expected "invented MPN" path).
-        if getattr(exc, "code", None) == 404:
-            log.debug("digikey.mpn_not_found: %s", part_number)
-            return None
-        # 401 -> token stale; wipe the cache so the next call retries once.
-        if getattr(exc, "code", None) == 401:
-            reset_cache()
-        log.info("digikey.http_error %s: %s", getattr(exc, "code", "?"), exc)
+    payload = _open_with_retry(
+        req, timeout_s=timeout_s, what=f"digikey.lookup pn={part_number}",
+    )
+    if payload is None:
         return None
-    except (urllib.error.URLError, TimeoutError, ssl.SSLError,
-            OSError, json.JSONDecodeError) as exc:
-        log.info("digikey.lookup_failed pn=%s: %s", part_number, exc)
-        return None
-
     return _parse_product_details(payload, part_number)
+
+
+# ---------------------------------------------------------------------------
+# Transport with 429 / Retry-After backoff
+# ---------------------------------------------------------------------------
+
+def _open_with_retry(
+    req: urllib.request.Request,
+    *,
+    timeout_s: float,
+    what: str,
+    max_retries: int = 2,
+) -> Optional[dict]:
+    """Open `req` as a JSON endpoint with bounded 429 retry support.
+
+    Returns the decoded JSON payload on success, None on any failure
+    (404, 401, network error, too-many-retries). 401 resets the token
+    cache. 429 reads Retry-After (seconds) and sleeps before retrying,
+    capped at 30 s per attempt and `max_retries` attempts total.
+
+    All callers in this module should go through this function instead
+    of urlopen directly so the retry policy stays in one place.
+    """
+    ctx = ssl.create_default_context()
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            code = getattr(exc, "code", None)
+            if code == 404:
+                log.debug("digikey.not_found %s", what)
+                return None
+            if code == 401:
+                reset_cache()
+                log.info("digikey.401_stale_token %s", what)
+                return None
+            if code == 429 and attempt < max_retries:
+                wait_s = _parse_retry_after(exc.headers if hasattr(exc, "headers") else None)
+                attempt += 1
+                log.info(
+                    "digikey.429_backoff attempt=%d wait=%.1fs %s",
+                    attempt, wait_s, what,
+                )
+                time.sleep(min(wait_s, 30.0))
+                continue
+            log.info("digikey.http_error %s code=%s: %s", what, code, exc)
+            return None
+        except (urllib.error.URLError, TimeoutError, ssl.SSLError,
+                OSError, json.JSONDecodeError) as exc:
+            log.info("digikey.transport_error %s: %s", what, exc)
+            return None
+
+
+def _parse_retry_after(headers) -> float:
+    """Interpret a Retry-After header: either delta-seconds or HTTP-date.
+    Fall back to 2 s if parsing fails."""
+    if headers is None:
+        return 2.0
+    raw = headers.get("Retry-After", "") if hasattr(headers, "get") else ""
+    if not raw:
+        return 2.0
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        pass
+    # HTTP-date form — best-effort parse
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        return max(0.1, (dt.timestamp() - time.time()))
+    except Exception:
+        return 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -286,20 +353,10 @@ def keyword_search(
             "User-Agent": "HardwarePipeline/2.0 (+digikey_api.py)",
         },
     )
-    try:
-        with urllib.request.urlopen(
-            req, timeout=timeout_s, context=ssl.create_default_context(),
-        ) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if getattr(exc, "code", None) == 401:
-            reset_cache()
-        log.info("digikey.keyword_http_error %s: %s",
-                 getattr(exc, "code", "?"), exc)
-        return []
-    except (urllib.error.URLError, TimeoutError, ssl.SSLError,
-            OSError, json.JSONDecodeError) as exc:
-        log.info("digikey.keyword_failed q=%r: %s", keywords, exc)
+    payload = _open_with_retry(
+        req, timeout_s=timeout_s, what=f"digikey.keyword q={keywords!r}",
+    )
+    if payload is None:
         return []
 
     products = (payload or {}).get("Products") or []
@@ -413,6 +470,12 @@ def _parse_product_details(payload: dict, requested_pn: str) -> Optional[PartInf
         product_url=str(product_url).strip() if product_url else None,
         lifecycle_status=lifecycle,
         unit_price_usd=price,
+        unit_price=price,
+        unit_price_currency="USD" if price is not None else None,
         stock_quantity=stock,
+        # DigiKey API v3/v4 returns US inventory for our account. Regional
+        # DigiKey sites are separately provisioned; if we ever add EU or
+        # APAC keys, parse the locale-site from _client_config() headers.
+        region="US",
         source="digikey",
     )
