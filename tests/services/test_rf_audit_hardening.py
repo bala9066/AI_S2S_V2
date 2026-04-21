@@ -197,6 +197,161 @@ class TestPhaseNoiseWiring:
 # P2.9 — BOM↔schematic linkage wiring
 # ---------------------------------------------------------------------------
 
+class TestTxCascadeAudit:
+    """run_tx_cascade_audit → AuditIssue list + run_all wiring."""
+
+    def test_rx_project_returns_no_issues(self, monkeypatch):
+        """Pure RX project — must not emit any TX audit issues."""
+        from services.rf_audit import run_tx_cascade_audit
+        issues = run_tx_cascade_audit(
+            [{"part_number": "LNA1", "category": "RF-LNA",
+              "key_specs": {"nf_db": 1.5, "gain_db": 15}}],
+            {"direction": "rx", "noise_figure_db": 3.0},
+        )
+        assert issues == []
+
+    def test_no_design_parameters_returns_no_issues(self):
+        from services.rf_audit import run_tx_cascade_audit
+        assert run_tx_cascade_audit(
+            [{"part_number": "PA1", "category": "RF-PA",
+              "key_specs": {"gain_db": 30, "pout_dbm": 40, "oip3_dbm": 45}}],
+            None,
+        ) == []
+
+    def test_pout_shortfall_flagged_high(self):
+        """Claim +40 dBm, cascade delivers +20 dBm → high-severity shortfall."""
+        from services.rf_audit import run_tx_cascade_audit
+        components = [
+            {"part_number": "DRV1", "category": "RF-Driver",
+             "key_specs": {"gain_db": 10, "pout_dbm": 15, "oip3_dbm": 25}},
+            {"part_number": "PA1", "category": "RF-PA",
+             "key_specs": {"gain_db": 20, "pout_dbm": 25, "oip3_dbm": 35}},
+        ]
+        dp = {
+            "direction": "tx",
+            "pout_dbm": 40,  # claim +40 dBm
+            "tx_input_power_dbm": -10.0,
+        }
+        issues = run_tx_cascade_audit(components, dp)
+        # Cascade: -10 + 10 + 20 = +20 dBm. Claim 40 dBm → shortfall 20 dB.
+        pout_issues = [i for i in issues if i.category == "tx_pout_shortfall"]
+        assert len(pout_issues) == 1
+        assert pout_issues[0].severity == "high"
+        assert "20" in pout_issues[0].detail or "+20" in pout_issues[0].detail
+
+    def test_oip3_shortfall_flagged_high(self):
+        """PA OIP3 well below claim → flagged."""
+        from services.rf_audit import run_tx_cascade_audit
+        components = [
+            {"part_number": "PA_LOW_LIN", "category": "RF-PA",
+             "key_specs": {"gain_db": 25, "oip3_dbm": 30, "pout_dbm": 35}},
+        ]
+        dp = {
+            "direction": "tx",
+            "oip3_dbm": 45,  # claim +45 dBm OIP3 (PA only delivers 30)
+            "tx_input_power_dbm": -10.0,
+        }
+        issues = run_tx_cascade_audit(components, dp)
+        oip3 = [i for i in issues if i.category == "tx_oip3_shortfall"]
+        assert len(oip3) == 1
+        assert oip3[0].severity == "high"
+
+    def test_compression_warning_becomes_critical(self):
+        """PA driven past its Pout spec → tx_compression critical issue."""
+        from services.rf_audit import run_tx_cascade_audit
+        components = [
+            {"part_number": "DRV1", "category": "RF-Driver",
+             "key_specs": {"gain_db": 20, "pout_dbm": 20}},
+            {"part_number": "PA_SMALL", "category": "RF-PA",
+             "key_specs": {"gain_db": 25, "pout_dbm": 30, "oip3_dbm": 40}},
+        ]
+        # Drive into PA: -10 + 20 = +10 dBm; PA output: +10 + 25 = +35 dBm.
+        # PA spec Pout=+30 dBm → 5 dB over spec → compression warning.
+        dp = {"direction": "tx", "tx_input_power_dbm": -10.0}
+        issues = run_tx_cascade_audit(components, dp)
+        comp = [i for i in issues if i.category == "tx_compression"]
+        assert len(comp) >= 1
+        assert comp[0].severity == "critical"
+        assert "PA_SMALL" in comp[0].location
+
+    def test_all_claims_met_emits_no_issues(self):
+        from services.rf_audit import run_tx_cascade_audit
+        components = [
+            {"part_number": "DRV1", "category": "RF-Driver",
+             "key_specs": {"gain_db": 15, "pout_dbm": 10, "oip3_dbm": 30}},
+            {"part_number": "PA_OK", "category": "RF-PA",
+             # Pdc sized so system PAE = Pout(100 mW) / Pdc(0.22 W) ≈ 45 %
+             "key_specs": {"gain_db": 25, "pout_dbm": 45, "oip3_dbm": 50,
+                           "pae_pct": 45, "pdc_w": 0.22}},
+        ]
+        # Drive = -20 + 15 + 25 = +20 dBm (100 mW). All within spec.
+        dp = {
+            "direction": "tx",
+            "pout_dbm": 20,
+            "oip3_dbm": 40,
+            "pae_pct": 40,
+            "tx_input_power_dbm": -20.0,
+        }
+        issues = run_tx_cascade_audit(components, dp)
+        assert issues == []
+
+    def test_run_all_integrates_tx_cascade(self, monkeypatch):
+        """Full run_all on a TX project surfaces the Pout shortfall."""
+        monkeypatch.setenv("SKIP_DISTRIBUTOR_LOOKUP", "1")
+        monkeypatch.setenv("SKIP_DATASHEET_VERIFY", "1")
+        from services.rf_audit import run_all
+        tool_input = {
+            "block_diagram_mermaid": (
+                "flowchart LR\n"
+                "  BB[Baseband] --> DRV[Driver]\n"
+                "  DRV --> PA[Class-AB PA]\n"
+                "  PA --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+            ),
+            "component_recommendations": [
+                {"part_number": "DRV1", "category": "RF-Driver",
+                 "key_specs": {"gain_db": 10, "pout_dbm": 15}},
+                {"part_number": "PA1", "category": "RF-PA",
+                 "key_specs": {"gain_db": 20, "pout_dbm": 25, "oip3_dbm": 35}},
+            ],
+            "design_parameters": {
+                "direction": "tx",
+                "pout_dbm": 40,  # aggressive claim → will fail
+                "tx_input_power_dbm": -10.0,
+            },
+        }
+        _, issues = run_all(tool_input, architecture="tx_driver_pa_classab")
+        assert any(i.category == "tx_pout_shortfall" for i in issues)
+
+    def test_run_all_skips_tx_cascade_on_rx_project(self, monkeypatch):
+        monkeypatch.setenv("SKIP_DISTRIBUTOR_LOOKUP", "1")
+        monkeypatch.setenv("SKIP_DATASHEET_VERIFY", "1")
+        from services.rf_audit import run_all
+        tool_input = {
+            "block_diagram_mermaid": (
+                "flowchart LR\n"
+                "  ANT[Antenna] --> LNA[LNA] --> MIX[Mixer]\n"
+                "  LO[LO] --> MIX\n"
+                "  MIX --> IF[IF Filter] --> ADC[ADC]\n"
+            ),
+            "component_recommendations": [
+                {"part_number": "LNA1", "category": "RF-LNA",
+                 "key_specs": {"nf_db": 1.5, "gain_db": 15}},
+            ],
+            "design_parameters": {
+                "direction": "rx",
+                "noise_figure_db": 3.0,
+            },
+        }
+        _, issues = run_all(tool_input, architecture="superhet_single")
+        assert not any(
+            i.category in (
+                "tx_pout_shortfall", "tx_oip3_shortfall",
+                "tx_pae_shortfall", "tx_compression",
+            )
+            for i in issues
+        )
+
+
 class TestBomLinkageWiring:
 
     def test_run_all_flags_missing_bom_part_when_nodes_supplied(self, monkeypatch):

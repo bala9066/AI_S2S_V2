@@ -486,6 +486,135 @@ def run_phase_noise_audit(
     return [AuditIssue(**i) for i in raw]
 
 
+def run_tx_cascade_audit(
+    component_recommendations: list[dict[str, Any]],
+    design_parameters: Optional[dict[str, Any]],
+) -> list[AuditIssue]:
+    """TX cascade verdict → AuditIssues. Runs `tools/rf_cascade.py`
+    in TX direction and emits structured issues when the claimed
+    Pout / OIP3 / PAE targets aren't met, or when any stage is
+    computed to be in compression (drive > datasheet Pout spec).
+
+    Fires only when the project is a transmitter — detected from
+    `design_parameters.direction == "tx"` or `project_type == "transmitter"`.
+    Silently returns [] on receiver projects so the RX audit stays lean.
+    """
+    if not design_parameters or not component_recommendations:
+        return []
+    direction = str(
+        design_parameters.get("direction")
+        or design_parameters.get("project_type")
+        or ""
+    ).strip().lower()
+    if direction != "tx":
+        return []
+
+    try:
+        from tools.rf_cascade import compute_cascade
+    except Exception:
+        return []
+
+    cascade = compute_cascade(
+        list(component_recommendations),
+        direction="tx",
+        claimed_pout_dbm=design_parameters.get("pout_dbm")
+                         or design_parameters.get("output_power_dbm"),
+        claimed_oip3_dbm=design_parameters.get("oip3_dbm"),
+        claimed_total_gain_db=design_parameters.get("total_gain_db"),
+        claimed_pae_pct=design_parameters.get("pae_pct"),
+        input_power_dbm=float(
+            design_parameters.get("tx_input_power_dbm") or -20.0
+        ),
+    )
+
+    issues: list[AuditIssue] = []
+    totals = cascade.get("totals") or {}
+    claims = cascade.get("claims") or {}
+    verdict = cascade.get("verdict") or {}
+
+    # Pout shortfall — high severity because it changes link-budget /
+    # regulatory conformance directly.
+    if verdict.get("pout_pass") is False:
+        headroom = verdict.get("pout_headroom_db")
+        issues.append(AuditIssue(
+            severity="high",
+            category="tx_pout_shortfall",
+            location="design_parameters/pout_dbm",
+            detail=(
+                f"TX cascade Pout {totals.get('pout_dbm'):.1f} dBm misses the "
+                f"claimed {claims.get('pout_dbm'):.1f} dBm target "
+                f"(Δ {headroom:+.1f} dB). Driver / PA gain or PA saturation "
+                "spec is insufficient for the claimed output power."
+            ),
+            suggested_fix=(
+                "Raise driver / PA gain, swap in a higher-Pout PA, or relax "
+                "the Pout requirement."
+            ),
+        ))
+
+    # OIP3 shortfall — high severity (linearity is a hard floor for
+    # modulated comms / multi-tone radar).
+    if verdict.get("oip3_pass") is False:
+        headroom = verdict.get("oip3_headroom_db")
+        issues.append(AuditIssue(
+            severity="high",
+            category="tx_oip3_shortfall",
+            location="design_parameters/oip3_dbm",
+            detail=(
+                f"TX cascade OIP3 {totals.get('oip3_dbm'):.1f} dBm misses the "
+                f"claimed {claims.get('oip3_dbm'):.1f} dBm target "
+                f"(Δ {headroom:+.1f} dB). The last stage's OIP3 dominates the "
+                "cascade — swap for a higher-linearity PA or add backoff."
+            ),
+            suggested_fix=(
+                "Select a PA with OIP3 ≥ claim + 3 dB margin, or move to a "
+                "Doherty / DPD-linearized architecture."
+            ),
+        ))
+
+    # PAE shortfall — medium (often accepted with a Pdc budget increase).
+    if verdict.get("pae_pass") is False:
+        delta = verdict.get("pae_delta_pct")
+        measured = totals.get("pae_pct")
+        claimed = claims.get("pae_pct")
+        issues.append(AuditIssue(
+            severity="medium",
+            category="tx_pae_shortfall",
+            location="design_parameters/pae_pct",
+            detail=(
+                f"Computed system PAE {measured:.1f} % misses the claimed "
+                f"{claimed:.1f} % target (Δ {delta:+.1f} %). Thermal / DC "
+                "power budget will exceed plan."
+            ),
+            suggested_fix=(
+                "Switch the PA to a higher-efficiency class (C / E / F / "
+                "Doherty) or relax the PAE target."
+            ),
+        ))
+
+    # Compression — critical. Any stage computed to be driven beyond
+    # its datasheet Pout spec will ship in hard saturation, producing
+    # excess harmonics and potentially damaging the device.
+    comp_warnings = totals.get("compression_warnings") or []
+    for w in comp_warnings:
+        issues.append(AuditIssue(
+            severity="critical",
+            category="tx_compression",
+            location=f"components/{(w.split(':', 1)[0] or 'stage').strip()}",
+            detail=(
+                "TX stage is computed to be in hard compression: " + w +
+                ". Ship-as-is will clip, saturate, and produce out-of-spec "
+                "harmonics."
+            ),
+            suggested_fix=(
+                "Reduce upstream drive level (add attenuator, lower VGA), "
+                "or replace the stage with a higher-Pout device."
+            ),
+        ))
+
+    return issues
+
+
 def run_bom_linkage_audit(
     component_recommendations: list[dict[str, Any]],
     netlist_nodes: Optional[list[dict[str, Any]]],
@@ -627,7 +756,14 @@ def run_all(
         else tool_input.get("design_parameters")
     issues.extend(run_phase_noise_audit(enriched, dp))
 
-    # 8. BOM ↔ schematic linkage (P2.9) — runs only in P4 context
+    # 8. TX cascade verdict → AuditIssues. Fires only when
+    # design_parameters.direction == "tx". Surfaces Pout / OIP3 / PAE
+    # shortfalls and per-stage compression warnings that the existing
+    # CascadeChart already shows — same information, now in the audit
+    # report so overall_pass reflects TX-specific failures.
+    issues.extend(run_tx_cascade_audit(enriched, dp))
+
+    # 9. BOM ↔ schematic linkage (P2.9) — runs only in P4 context
     # where `netlist_nodes` exists. Flags missing + invented parts
     # between the BOM and the generated schematic.
     issues.extend(run_bom_linkage_audit(enriched, netlist_nodes))
