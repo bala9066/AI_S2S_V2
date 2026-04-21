@@ -127,19 +127,29 @@ def check_cascade_vs_claims(
         computed = getattr(rep, attr)
         if computed is None:
             continue
-        delta = abs(float(claimed[key]) - float(computed))
+        # Guard against non-numeric claims — the LLM sometimes ships nested
+        # dicts, lists, or "N/A" strings under these keys. A bad claim must
+        # NOT crash the whole audit (previously surfaced as
+        # `p1_finalize.audit_failed: float() argument must be a string or a
+        # real number, not 'NoneType'`).
+        try:
+            claimed_f = float(claimed[key])
+            computed_f = float(computed)
+        except (TypeError, ValueError):
+            continue
+        delta = abs(claimed_f - computed_f)
         if delta > tolerance_db:
             issues.append(_issue(
                 severity="high",
                 category="cascade_mismatch",
                 location=f"cascade.{key}",
                 detail=(
-                    f"Agent claimed {key} = {claimed[key]:.2f} but cascade "
-                    f"validator computes {computed:.2f} "
+                    f"Agent claimed {key} = {claimed_f:.2f} but cascade "
+                    f"validator computes {computed_f:.2f} "
                     f"(delta {delta:.2f} dB > {tolerance_db} dB tolerance)."
                 ),
                 suggested_fix=(
-                    f"Update the claimed {key} to {computed:.2f} OR revisit the "
+                    f"Update the claimed {key} to {computed_f:.2f} OR revisit the "
                     "BOM (stage gains / NFs / IIP3s) to meet the claim."
                 ),
             ))

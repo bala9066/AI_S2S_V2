@@ -290,16 +290,71 @@ def run_banned_parts_audit(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+def run_candidate_pool_audit(
+    component_recommendations: list[dict[str, Any]],
+    offered_mpns: Optional[set[str]],
+) -> list[AuditIssue]:
+    """Flag BOM entries whose MPN was NOT surfaced by find_candidate_parts.
+
+    Retrieval-augmented selection requires the LLM to pick from the
+    distributor shortlist.  When `offered_mpns` is empty / None we skip
+    the check silently — not every conversation uses the retrieval tool
+    yet (e.g. legacy runs, air-gap mode).  When the set is non-empty we
+    flag every component whose MPN is not in it at severity="high":
+    the part may still be real (rf_audit's hallucination check covers
+    that), but it bypassed the process gate and deserves reviewer
+    attention.
+    """
+    if not offered_mpns or not component_recommendations:
+        return []
+    offered_upper = {m.strip().upper() for m in offered_mpns if m}
+    issues: list[AuditIssue] = []
+    for c in component_recommendations:
+        pn = (
+            c.get("part_number")
+            or c.get("primary_part")
+            or c.get("mpn")
+            or ""
+        ).strip()
+        if not pn:
+            continue
+        if pn.upper() in offered_upper:
+            continue
+        issues.append(AuditIssue(
+            severity="high",
+            category="not_from_candidate_pool",
+            location=f"component_recommendations/{pn}",
+            detail=(
+                f"Part `{pn}` was not in the `find_candidate_parts` shortlist "
+                "for this turn — the LLM either skipped the retrieval step or "
+                "picked an MPN outside the returned candidates."
+            ),
+            suggested_fix=(
+                "Re-run P1 and ensure the LLM calls find_candidate_parts for "
+                "every signal-chain stage, then selects only from the returned "
+                "`candidates[].part_number` list."
+            ),
+        ))
+    return issues
+
+
 def run_all(
     tool_input: dict[str, Any],
     architecture: Optional[str],
     *,
     timeout_s: float = 4.0,
+    offered_candidate_mpns: Optional[set[str]] = None,
 ) -> tuple[dict[str, Any], list[AuditIssue]]:
     """Run every post-LLM check and return (possibly-mutated tool_input,
     combined issues). The tool_input is returned with banned parts
     removed from `component_recommendations` so the BOM the user sees is
-    pre-filtered."""
+    pre-filtered.
+
+    When `offered_candidate_mpns` is supplied (the set of MPNs returned
+    by `find_candidate_parts` during the same conversation turn), an
+    extra `not_from_candidate_pool` audit issue is emitted for any BOM
+    entry that bypassed the shortlist.
+    """
     issues: list[AuditIssue] = []
 
     # 1. Topology
@@ -333,5 +388,9 @@ def run_all(
     # should mostly be authoritative already, but any that still slipped
     # through get validated here as a belt-and-braces check).
     issues.extend(run_datasheet_audit(enriched, timeout_s=timeout_s))
+
+    # 5. Candidate-pool gate — advisory check that the LLM used the
+    # retrieval tool. Only fires when the caller threaded the set in.
+    issues.extend(run_candidate_pool_audit(enriched, offered_candidate_mpns))
 
     return tool_input, issues

@@ -203,6 +203,7 @@ def finalize_p1(
     llm_model: Optional[str] = None,
     llm_model_version: Optional[str] = None,
     architecture: Optional[str] = None,
+    offered_candidate_mpns: Optional[set[str]] = None,
 ) -> dict[str, Any]:
     """
     Freeze the lock and run the red-team audit. Returns a bundle:
@@ -263,7 +264,11 @@ def finalize_p1(
     # ── Post-LLM structural checks (topology / datasheets / banned parts) ──
     # Mutates `tool_input` to strip banned parts before they reach downstream
     # docs, and produces AuditIssue rows we merge into the red-team report.
-    tool_input, rf_issues = _run_rf_audit(tool_input, architecture=architecture)
+    tool_input, rf_issues = _run_rf_audit(
+        tool_input,
+        architecture=architecture,
+        offered_candidate_mpns=offered_candidate_mpns,
+    )
 
     # Build audit inputs
     bom_stages = _tool_bom_to_stages(

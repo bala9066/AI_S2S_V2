@@ -332,3 +332,81 @@ def test_run_all_handles_bom_key_alias(monkeypatch):
     new_input, issues = run_all(tool_input, architecture="recommend")
     assert new_input["bom"] == []
     assert any(i.category == "banned_part" for i in issues)
+
+
+# ---------------------------------------------------------------------------
+# Candidate-pool audit — gate for retrieval-augmented selection
+# ---------------------------------------------------------------------------
+
+def test_candidate_pool_audit_flags_mpns_outside_pool(monkeypatch):
+    """When the LLM is supposed to pick from find_candidate_parts but
+    emits an MPN that was never surfaced, `not_from_candidate_pool`
+    must fire."""
+    from services.rf_audit import run_candidate_pool_audit
+    bom = [
+        {"part_number": "ADL8107",  "manufacturer": "Analog Devices"},  # in pool
+        {"part_number": "ROGUE-99", "manufacturer": "Nobody"},          # NOT in pool
+    ]
+    offered = {"ADL8107", "PMA3-83LN+", "HMC8410"}
+    issues = run_candidate_pool_audit(bom, offered)
+    categories = [i.category for i in issues]
+    assert categories == ["not_from_candidate_pool"]
+    assert "ROGUE-99" in issues[0].detail
+    assert issues[0].severity == "high"
+
+
+def test_candidate_pool_audit_is_case_insensitive():
+    """MPN casing from the LLM may differ from the distributor's canonical
+    case. Treat them equal — an `adl8107` pick against an `ADL8107` offer
+    is a hit, not a miss."""
+    from services.rf_audit import run_candidate_pool_audit
+    bom = [{"part_number": "adl8107"}]
+    offered = {"ADL8107"}
+    assert run_candidate_pool_audit(bom, offered) == []
+
+
+def test_candidate_pool_audit_silent_when_no_offers(monkeypatch):
+    """Backward-compat: runs that never used the retrieval tool (legacy
+    conversations, air-gap mode) must NOT be penalised — skip silently
+    when `offered_mpns` is None or empty."""
+    from services.rf_audit import run_candidate_pool_audit
+    bom = [{"part_number": "ANY-PART"}]
+    assert run_candidate_pool_audit(bom, None) == []
+    assert run_candidate_pool_audit(bom, set()) == []
+
+
+def test_run_all_threads_offered_mpns_through(monkeypatch):
+    """The new `offered_candidate_mpns` kwarg on run_all must propagate
+    into the candidate-pool audit — end-to-end regression."""
+    monkeypatch.setenv("SKIP_DATASHEET_VERIFY", "1")
+    tool_input = {
+        "block_diagram_mermaid": "flowchart TD\n LNA[LNA] --> OUT[Output]",
+        "component_recommendations": [
+            {"part_number": "FROM-POOL",    "manufacturer": "X"},
+            {"part_number": "OUTSIDE-POOL", "manufacturer": "Y"},
+        ],
+    }
+    # Stub part validation so it doesn't hit the network.
+    with patch("services.rf_audit.run_part_validation_audit",
+               return_value=(tool_input["component_recommendations"], [])):
+        _, issues = run_all(
+            tool_input,
+            architecture="recommend",
+            offered_candidate_mpns={"FROM-POOL"},
+        )
+    pool_issues = [i for i in issues if i.category == "not_from_candidate_pool"]
+    assert len(pool_issues) == 1
+    assert "OUTSIDE-POOL" in pool_issues[0].detail
+
+
+def test_run_all_without_offered_mpns_does_not_emit_pool_issues(monkeypatch):
+    """No pool issues when the caller doesn't thread the set in (default behaviour)."""
+    monkeypatch.setenv("SKIP_DATASHEET_VERIFY", "1")
+    tool_input = {
+        "block_diagram_mermaid": "flowchart TD\n LNA[LNA] --> OUT[Output]",
+        "component_recommendations": [{"part_number": "ANY", "manufacturer": "X"}],
+    }
+    with patch("services.rf_audit.run_part_validation_audit",
+               return_value=(tool_input["component_recommendations"], [])):
+        _, issues = run_all(tool_input, architecture="recommend")
+    assert not any(i.category == "not_from_candidate_pool" for i in issues)

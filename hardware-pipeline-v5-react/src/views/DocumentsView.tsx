@@ -282,6 +282,26 @@ function sanitizeMermaidCode(raw: string): string {
     return true;
   }).join('\n');
 
+  // ── 13. Strip malformed `class` statements the LLM sometimes emits.
+  //        A valid Mermaid classDef-binding line is `class <nodeList> <className>`
+  //        (e.g. `class LNA1,LNA2 lna`).  When the LLM truncates mid-token we
+  //        get fragments like `class L` or `class LNA,` which crash the parser
+  //        with `Parse error … Expecting 'SEMI', 'NEWLINE'`.  Drop any `class`
+  //        line whose node list is empty, ends in a comma, or lacks a trailing
+  //        className token — those carry no visual information and are almost
+  //        always the source of the "DIAGRAM SOURCE — Syntax error" fallback.
+  code = code.split('\n').filter(line => {
+    const m = line.match(/^\s*class\s+(.*)$/);
+    if (!m) return true;                              // not a `class` statement
+    const rest = m[1].trim();
+    if (!rest) return false;                          // `class` alone
+    if (rest.endsWith(',')) return false;             // `class LNA,`
+    const tokens = rest.split(/\s+/);
+    if (tokens.length < 2) return false;              // `class L` (no className)
+    if (!/^[A-Za-z_]\w*$/.test(tokens[tokens.length - 1])) return false;
+    return true;
+  }).join('\n');
+
   return code;
 }
 

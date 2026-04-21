@@ -114,7 +114,7 @@ def reset_cache() -> None:
     digikey_api.reset_cache()
 
 
-def lookup(part_number: str, *, timeout_s: float = 6.0) -> Optional[PartInfo]:
+def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
     """Return a `PartInfo` for `part_number`, consulting in order:
     DigiKey, Mouser, local seed. None when every tier misses."""
     if not part_number:
@@ -142,7 +142,7 @@ def lookup(part_number: str, *, timeout_s: float = 6.0) -> Optional[PartInfo]:
 
 
 def batch_lookup(
-    part_numbers: list[str], *, timeout_s: float = 6.0,
+    part_numbers: list[str], *, timeout_s: float = 12.0,
 ) -> dict[str, Optional[PartInfo]]:
     """Convenience wrapper — dict {part_number: PartInfo | None}. Serial
     for simplicity; most BOMs are <50 parts and latency dominates network

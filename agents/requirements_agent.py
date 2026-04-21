@@ -757,6 +757,7 @@ If any of these are missing from your tool call, you MUST add them before submit
 - For Mermaid diagrams, ALWAYS start with a valid diagram type on the FIRST line (e.g. `flowchart TD`). NEVER put `TD` or `LR` alone on line 2.
 - Keep Mermaid node labels concise — 2-5 words max. STRICT rules: NO angle brackets < >, NO raw HTML, NO &, @, #, |, double-quotes ", single-quotes ', or colons : inside labels. Use plain ASCII only. NO %%{{init}}%% frontmatter. NO %% comments. NEVER use 3 or more consecutive dashes (---) inside a label as they are parsed as edge arrows.
 - Mermaid edge syntax: EVERY edge MUST have an arrow. Pipe-labels `|label|` ONLY appear AFTER an arrow, e.g. `A -->|signal| B`. NEVER write `A |label| B` without the arrow — it is a parse error. Also NEVER put two nodes on the same line without an arrow between them (e.g. `A B[...]` is invalid — it must be `A --> B[...]`). The `end` keyword that closes a `subgraph` MUST be on its own line — never on the same line as another statement.
+- **MANDATORY RETRIEVAL STEP — `find_candidate_parts` BEFORE `generate_requirements`:** For every signal-chain stage that ends up in `component_recommendations` (LNA, mixer, filter/preselector, limiter, ADC, DAC, PLL/VCO, LDO, MCU, FPGA, TCXO, etc.), call the `find_candidate_parts` tool FIRST with the canonical `stage` id and a short `spec_hint` (freq range / NF / package / resolution — ~10 words max). You may batch multiple `find_candidate_parts` calls in sequence before emitting `generate_requirements`. When selecting the MPN for each stage you MUST pick from the returned `candidates[].part_number` list and copy `datasheet_url` verbatim from the same candidate. If a stage has zero candidates, widen the hint and call again, or omit the stage — never invent an MPN. Picks that do not trace back to a `find_candidate_parts` result will fail the `not_from_candidate_pool` audit gate.
 - **ANTI-HALLUCINATION RULE**: Do NOT fabricate component part numbers. ONLY use part numbers you are CONFIDENT exist and are currently in production. If unsure, use the manufacturer family name + key specs (e.g., "Analog Devices HMC-series LNA, 2-18 GHz, 2 dB NF") instead of guessing a specific part number. NEVER write TBD, TBC, TBA, or "to be determined/confirmed" anywhere. Every spec value must come from a confirmed requirement or a real datasheet — NEVER invent performance numbers.
 - **LIFECYCLE GATE — NO STALE PARTS**: Every `component_recommendations` entry MUST be a part that is **currently in active production**. You MUST set `lifecycle_status` to "active" for every component; if you cannot confirm the part is in active production (e.g. manufacturer still lists it on its product page without "NRND" / "Not Recommended for New Designs" / "Last Time Buy" / "Obsolete" / "Discontinued" banners), DO NOT recommend it. If a classic part you would normally recommend is now NRND or EOL, pick its successor family instead. Explicitly banned stale parts (DO NOT use these under any circumstances): `HMC-C024`, `HMC-1040`, `HMC1040LP5CE`, `HMC1040LP4E`, `HMC1020LP4E`, `HMC516`, `HMC-C070`, `HMC-C072`, `HMC-ALH435`, `HMC-ALH508`, `MCR03ERTJ201` (Rohm chip resistor — DigiKey discontinued), any Hittite-branded MPNs that begin with `HMC-` followed by a three-digit number and end with the letter `C` (Analog Devices' Hittite acquisition parts from the 2008-2012 catalogue — most are now NRND). **Preferred currently-shipping alternatives (use these families):**
   - **Broadband RF LNA (2-18 / 6-18 GHz):** Analog Devices `HMC8410`, `HMC8411`, `ADL8104`, `ADL8106`; Qorvo `QPL9057`, `TQL9066`, `TQL9092`; Mini-Circuits `PMA3-83LN+`, `PSA4-5043+`, `PMA-5451+`; NXP `BGA7210N6`; MACOM `MAAL-011111`
@@ -1170,6 +1171,56 @@ SEARCH_COMPONENTS_TOOL = {
 }
 
 
+# Retrieval-augmented selection — live distributor query returning real
+# MPNs + datasheet URLs. Closes the hallucination gap: the LLM picks FROM
+# a shortlist of verified parts instead of inventing MPNs from training
+# knowledge. Populate `component_recommendations` using these results.
+FIND_CANDIDATE_PARTS_TOOL = {
+    "name": "find_candidate_parts",
+    "description": (
+        "Query DigiKey + Mouser live for real, in-stock parts matching a "
+        "signal-chain stage and spec hint. Returns a shortlist of actual "
+        "MPNs with manufacturer, description, lifecycle, and datasheet URL. "
+        "Call this BEFORE generate_requirements for every stage that needs "
+        "a concrete component — LNA, mixer, filter, ADC, etc. — then use "
+        "ONLY the MPNs returned here in component_recommendations. "
+        "DO NOT invent part numbers; if no candidates are returned, widen "
+        "the hint and call again, or omit the stage from the BOM."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "stage": {
+                "type": "string",
+                "description": (
+                    "Canonical signal-chain stage. Use one of: lna, driver_amp, "
+                    "gain_block, pa, mixer, limiter, bpf, lpf, hpf, preselector, "
+                    "saw, splitter, balun, attenuator, switch, vco, pll, adc, "
+                    "dac, fpga, mcu, ldo, buck, bias_tee, tcxo, ocxo. Free-text "
+                    "is accepted as a fallback."
+                ),
+            },
+            "spec_hint": {
+                "type": "string",
+                "description": (
+                    "Short free-text spec constraints — frequency range, noise "
+                    "figure, package, resolution, etc. Example: "
+                    "'2-18 GHz NF<2dB SMT' or '12-bit 1 GSPS JESD204B'. Keep it "
+                    "under ~10 words — distributor keyword engines degrade on "
+                    "overly long queries."
+                ),
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Cap on candidates returned (default 5, max 10).",
+                "default": 5,
+            },
+        },
+        "required": ["stage"],
+    },
+}
+
+
 class RequirementsAgent(BaseAgent):
     """Phase 1: Conversational requirements capture and component selection."""
 
@@ -1177,7 +1228,7 @@ class RequirementsAgent(BaseAgent):
         # Provide tools for direct requirement generation
         # Include CLARIFICATION_TOOL so the LLM can present structured question
         # cards during Rounds 1-3 of the 4-round elicitation flow.
-        tools = [CLARIFICATION_TOOL, GENERATE_REQUIREMENTS_TOOL]
+        tools = [CLARIFICATION_TOOL, GENERATE_REQUIREMENTS_TOOL, FIND_CANDIDATE_PARTS_TOOL]
         if COMPONENT_SEARCH_AVAILABLE:
             tools.append(SEARCH_COMPONENTS_TOOL)
 
@@ -1194,6 +1245,12 @@ class RequirementsAgent(BaseAgent):
             self.component_search = ComponentSearchTool()
         else:
             self.component_search = None
+
+        # Per-request accumulator: every MPN the distributor shortlist tool
+        # surfaced this conversation turn. Threaded into p1_finalize →
+        # rf_audit so we can flag `component_recommendations` MPNs that
+        # bypassed the shortlist.  Reset at the top of each execute().
+        self._offered_candidate_mpns: set[str] = set()
 
     def get_system_prompt(self, project_context: dict) -> str:
         base = SYSTEM_PROMPT.format(
@@ -1485,6 +1542,11 @@ class RequirementsAgent(BaseAgent):
         """
         Execute Phase 1 — Direct Generation approach.
         """
+        # Reset the per-turn candidate-pool accumulator.  The distributor
+        # shortlist is per-conversation-turn — previous turns' offered
+        # MPNs must not bleed into this turn's audit gate.
+        self._offered_candidate_mpns = set()
+
         system = self.get_system_prompt(project_context)
 
         # Build message list from conversation history
@@ -1520,12 +1582,31 @@ class RequirementsAgent(BaseAgent):
                 "and architecture has been captured. Do NOT ask for MDS/sensitivity, "
                 "max input, architecture, or any spec already listed above — they "
                 "are all in the payload. Do NOT call `show_clarification_cards`. "
-                "Call `generate_requirements` tool IMMEDIATELY as your FIRST content "
-                "block using the supplied specs, derived MDS, and cascade notes. "
+                "\n\n"
+                "MANDATORY TOOL-CHAINING SEQUENCE (follow exactly):\n"
+                "STEP 1 — RETRIEVAL: Call `find_candidate_parts` ONCE for every "
+                "distinct signal-chain stage that will appear in "
+                "component_recommendations (e.g. lna, mixer, limiter, preselector, "
+                "bpf, splitter, adc, dac, pll, ldo, buck, tcxo, mcu, fpga). For "
+                "each call pass a concrete `stage` id and a compact `spec_hint` "
+                "(<= 10 words) built from the Tier-1 specs — e.g. stage='lna' "
+                "hint='2-18 GHz NF<2dB SMT'. You may issue multiple tool calls in "
+                "parallel in a single assistant turn. Do this BEFORE any other "
+                "tool call. If a stage returns zero candidates, immediately retry "
+                "`find_candidate_parts` with a wider hint.\n"
+                "STEP 2 — GENERATION: Only after the retrieval step, call "
+                "`generate_requirements` as your FINAL tool call. Every MPN in "
+                "`component_recommendations` MUST be copied verbatim from one of "
+                "the `find_candidate_parts` `candidates[].part_number` values "
+                "returned during this turn; copy the corresponding `datasheet_url` "
+                "verbatim too. Inventing an MPN or altering the distributor's "
+                "datasheet URL will fail the `not_from_candidate_pool` audit gate. "
+                "If no candidate fits a stage after a second widened retrieval, "
+                "OMIT that stage from the BOM rather than inventing a part.\n"
+                "\n"
                 "Output the complete BOM, requirements list, block_diagram_mermaid, "
                 "architecture_mermaid, design_parameters, and component_recommendations "
-                "— with `datasheet_url` for every component. No preamble, no prose "
-                "before the tool call. "
+                "— with `datasheet_url` for every component. "
                 "TOPOLOGY MANDATE (apply before emitting the diagram): "
                 "(1) Every RF chain MUST include the canonical stages in order: "
                 "Antenna -> SMA -> Limiter -> Preselector (SAW / ceramic / cavity BPF) "
@@ -1816,6 +1897,7 @@ class RequirementsAgent(BaseAgent):
         tool_handlers: dict = {
             "generate_requirements": _capture_generate_requirements,
             "show_clarification_cards": _capture_clarification_cards,
+            "find_candidate_parts": self._handle_find_candidate_parts,
         }
         if COMPONENT_SEARCH_AVAILABLE and self.component_search:
             tool_handlers["search_components"] = self._handle_search_components
@@ -2038,6 +2120,9 @@ class RequirementsAgent(BaseAgent):
                     design_type=project_context.get("design_type"),
                     llm_model=getattr(self, "model", None),
                     architecture=generate_req_input.get("architecture"),
+                    # Set of MPNs surfaced by find_candidate_parts this turn —
+                    # the audit flags any BOM entry that bypassed the shortlist.
+                    offered_candidate_mpns=set(self._offered_candidate_mpns),
                 )
                 # Merge lock + audit artefacts so chat_service persists them.
                 for fname, fcontent in finalize_bundle.get("outputs", {}).items():
@@ -2406,6 +2491,78 @@ class RequirementsAgent(BaseAgent):
                 "error": str(e),
                 "message": "Component search failed. Using LLM knowledge for recommendations."
             }
+
+    async def _handle_find_candidate_parts(self, input_data: dict) -> dict:
+        """Handle find_candidate_parts — retrieval-augmented selection.
+
+        Queries DigiKey + Mouser live for real MPNs matching the stage
+        and spec hint.  Every MPN surfaced here is accumulated in
+        `self._offered_candidate_mpns` so the post-LLM audit can verify
+        that `component_recommendations` picked from this shortlist.
+        """
+        stage = (input_data.get("stage") or "").strip()
+        hint = (input_data.get("spec_hint") or "").strip()
+        try:
+            max_results = int(input_data.get("max_results", 5))
+        except (TypeError, ValueError):
+            max_results = 5
+        max_results = max(1, min(max_results, 10))
+
+        if not stage:
+            return {"stage": stage, "candidates": [], "count": 0,
+                    "message": "stage is required"}
+
+        try:
+            from tools.parametric_search import find_candidates
+            candidates = find_candidates(
+                stage, hint,
+                max_per_source=max_results,
+                max_total=max_results * 2,
+                timeout_s=12.0,
+            )
+        except Exception as exc:
+            self.log(f"find_candidate_parts failed: {exc}", "warning")
+            return {"stage": stage, "candidates": [], "count": 0,
+                    "error": str(exc),
+                    "message": "Retrieval failed. Do not invent MPNs — ask the user for guidance."}
+
+        # Remember every MPN we surfaced — this is the authoritative
+        # shortlist the audit will gate against.
+        for c in candidates:
+            mpn = (c.part_number or "").strip().upper()
+            if mpn:
+                self._offered_candidate_mpns.add(mpn)
+
+        self.log(
+            f"find_candidate_parts stage={stage!r} hint={hint!r} "
+            f"-> {len(candidates)} candidates (offered_total={len(self._offered_candidate_mpns)})",
+            "info",
+        )
+
+        return {
+            "stage": stage,
+            "spec_hint": hint,
+            "count": len(candidates),
+            "candidates": [
+                {
+                    "part_number": c.part_number,
+                    "manufacturer": c.manufacturer,
+                    "description": c.description,
+                    "datasheet_url": c.datasheet_url,
+                    "product_url": c.product_url,
+                    "lifecycle_status": c.lifecycle_status,
+                    "source": c.source,
+                }
+                for c in candidates
+            ],
+            "message": (
+                "Pick ONLY from `candidates[].part_number`. Copy `datasheet_url` verbatim. "
+                "Do not invent alternatives. If none fit, call this tool again with a wider hint."
+            ) if candidates else (
+                "No candidates found. Widen the spec_hint (e.g. drop the frequency or package), "
+                "or call again with a different stage. Do not invent an MPN."
+            ),
+        }
 
     def _generate_output_files(
         self, tool_input: dict, output_dir: str, project_name: str
@@ -6121,8 +6278,11 @@ typical passive/active bands).</p>
         for i, comp in enumerate(comps, 1):
             part = comp.get('primary_part', 'See BOM')
             mfr  = comp.get('primary_manufacturer', '')
-            ds_url = _verified_url(comp.get('datasheet_url', '').strip(), part, mfr)
-            dk_url = comp.get('digikey_url', '').strip()
+            # Use `or ''` guard — dict.get returns None when the key exists with
+            # value None (common now that find_candidate_parts may surface
+            # candidates with datasheet_url=None from Mouser's data gaps).
+            ds_url = _verified_url((comp.get('datasheet_url') or '').strip(), part, mfr)
+            dk_url = (comp.get('digikey_url') or '').strip()
 
             # Primary heading with part number as a link if datasheet available
             part_str = f"[{part}]({ds_url})" if ds_url else part
@@ -6163,7 +6323,7 @@ typical passive/active bands).</p>
                 for alt in alts:
                     alt_pn  = alt.get('part_number', '')
                     alt_mfr = alt.get('manufacturer', mfr)
-                    alt_ds  = _verified_url(alt.get('datasheet_url', '').strip(), alt_pn, alt_mfr)
+                    alt_ds  = _verified_url((alt.get('datasheet_url') or '').strip(), alt_pn, alt_mfr)
                     alt_pn_str = f"[{alt_pn}]({alt_ds})" if alt_ds else alt_pn
                     lines.append(
                         f"- **{alt_pn_str}** ({alt_mfr}): "

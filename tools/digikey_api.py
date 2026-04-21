@@ -44,7 +44,15 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class PartInfo:
     """Normalised response from a distributor lookup. Matches the shape
-    `rf_audit` expects so DigiKey / Mouser / seed can all be fused."""
+    `rf_audit` expects so DigiKey / Mouser / seed can all be fused.
+
+    Pricing fields:
+      - `unit_price_usd` is populated ONLY when the distributor reported
+        the first-break price in USD.  Regional API keys (e.g. mouser.in
+        → INR) return localised prices; those land in `unit_price` +
+        `unit_price_currency` so callers can still show the number
+        without silently mislabeling it as dollars.
+    """
     part_number: str
     manufacturer: str
     description: str
@@ -54,6 +62,8 @@ class PartInfo:
     unit_price_usd: Optional[float]
     stock_quantity: Optional[int]
     source: str                  # "digikey" | "mouser" | "seed" | "chromadb"
+    unit_price: Optional[float] = None            # first-break price in native currency
+    unit_price_currency: Optional[str] = None     # ISO-4217 code, e.g. "USD", "INR"
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +74,8 @@ class PartInfo:
             "product_url": self.product_url,
             "lifecycle_status": self.lifecycle_status,
             "unit_price_usd": self.unit_price_usd,
+            "unit_price": self.unit_price,
+            "unit_price_currency": self.unit_price_currency,
             "stock_quantity": self.stock_quantity,
             "source": self.source,
         }
@@ -78,12 +90,21 @@ _cached_token: dict = {"access_token": None, "expires_at": 0.0}
 
 
 def _client_config() -> tuple[str, str, str]:
-    """Return (client_id, client_secret, api_base). Empty strings when
-    the env vars are missing — callers must handle that case."""
+    """Return (client_id, client_secret, api_host). Empty strings when
+    the env vars are missing — callers must handle that case.
+
+    api_host is normalised to the scheme+host (e.g. `https://api.digikey.com`).
+    The OAuth and product-details paths are versioned independently at
+    DigiKey, so we never rely on a trailing version segment here —
+    callers compose the correct path themselves.
+    """
     client_id = os.getenv("DIGIKEY_CLIENT_ID", "").strip()
     client_secret = os.getenv("DIGIKEY_CLIENT_SECRET", "").strip()
-    api_base = os.getenv("DIGIKEY_API_URL", "https://api.digikey.com/v3").rstrip("/")
-    return client_id, client_secret, api_base
+    raw = os.getenv("DIGIKEY_API_URL", "https://api.digikey.com").strip().rstrip("/")
+    # Strip any version suffix (e.g. /v3, /v1, /products/v4) — we need the host.
+    parsed = urllib.parse.urlparse(raw)
+    api_host = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else raw
+    return client_id, client_secret, api_host
 
 
 def is_configured() -> bool:
@@ -105,10 +126,12 @@ def reset_cache() -> None:
 def _fetch_token(*, timeout_s: float = 8.0) -> Optional[str]:
     """Request a fresh access token. Returns None on any failure so the
     caller can fall through to Mouser / seed lookups."""
-    client_id, client_secret, api_base = _client_config()
+    client_id, client_secret, api_host = _client_config()
     if not (client_id and client_secret):
         return None
-    token_url = f"{api_base}/oauth2/token"
+    # DigiKey's OAuth2 endpoint is anchored at /v1 regardless of which
+    # Product Information API version the caller is using.
+    token_url = f"{api_host}/v1/oauth2/token"
     body = urllib.parse.urlencode({
         "client_id": client_id,
         "client_secret": client_secret,
@@ -158,7 +181,7 @@ def _get_token() -> Optional[str]:
 # Part lookup
 # ---------------------------------------------------------------------------
 
-def lookup(part_number: str, *, timeout_s: float = 6.0) -> Optional[PartInfo]:
+def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
     """Search DigiKey for a manufacturer part number.
 
     Returns:
@@ -177,8 +200,10 @@ def lookup(part_number: str, *, timeout_s: float = 6.0) -> Optional[PartInfo]:
     if not token:
         return None
 
-    client_id, _, api_base = _client_config()
-    url = f"{api_base}/products/search/{urllib.parse.quote(part_number)}/productdetails"
+    client_id, _, api_host = _client_config()
+    # Current DigiKey Product Information API is v4; path is stable even
+    # though OAuth lives under /v1. Encode the MPN for safety.
+    url = f"{api_host}/products/v4/search/{urllib.parse.quote(part_number)}/productdetails"
     req = urllib.request.Request(
         url, method="GET",
         headers={
@@ -211,6 +236,81 @@ def lookup(part_number: str, *, timeout_s: float = 6.0) -> Optional[PartInfo]:
         return None
 
     return _parse_product_details(payload, part_number)
+
+
+# ---------------------------------------------------------------------------
+# Keyword search — parametric candidate retrieval
+# ---------------------------------------------------------------------------
+
+def keyword_search(
+    keywords: str,
+    *,
+    limit: int = 10,
+    timeout_s: float = 10.0,
+) -> list[PartInfo]:
+    """Query DigiKey's v4 keyword endpoint and return a list of PartInfo.
+
+    Unlike `lookup`, this is a *retrieval* call: the caller supplies a
+    natural-language query (e.g. `"LNA 2-18 GHz"`) and DigiKey returns
+    the best-matching MPNs. Used by `tools.parametric_search` to build
+    a real-part shortlist for the LLM to pick from.
+
+    Returns an empty list on any failure — callers fall through to
+    Mouser / seed as with `lookup`.
+    """
+    if not keywords:
+        return []
+    if not is_configured():
+        return []
+    token = _get_token()
+    if not token:
+        return []
+
+    client_id, _, api_host = _client_config()
+    url = f"{api_host}/products/v4/search/keyword"
+    body = json.dumps({
+        "Keywords": keywords,
+        "Limit": max(1, min(limit, 50)),
+        "Offset": 0,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-DIGIKEY-Client-Id": client_id,
+            "X-DIGIKEY-Locale-Site": "US",
+            "X-DIGIKEY-Locale-Language": "en",
+            "X-DIGIKEY-Locale-Currency": "USD",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "HardwarePipeline/2.0 (+digikey_api.py)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(
+            req, timeout=timeout_s, context=ssl.create_default_context(),
+        ) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if getattr(exc, "code", None) == 401:
+            reset_cache()
+        log.info("digikey.keyword_http_error %s: %s",
+                 getattr(exc, "code", "?"), exc)
+        return []
+    except (urllib.error.URLError, TimeoutError, ssl.SSLError,
+            OSError, json.JSONDecodeError) as exc:
+        log.info("digikey.keyword_failed q=%r: %s", keywords, exc)
+        return []
+
+    products = (payload or {}).get("Products") or []
+    out: list[PartInfo] = []
+    for prod in products:
+        # Each product has the same shape as the `Product` inside a
+        # productdetails response — reuse the same parser.
+        info = _parse_product_details({"Product": prod}, "")
+        if info is not None:
+            out.append(info)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -251,12 +351,27 @@ def _parse_product_details(payload: dict, requested_pn: str) -> Optional[PartInf
         or details.get("ManufacturerProductNumber")
         or requested_pn
     )
-    description = (
-        details.get("ProductDescription")
-        or details.get("DetailedDescription")
-        or ""
-    )
+    # v3 exposed ProductDescription as a flat string; v4 nests it under
+    # Description = {"ProductDescription": str, "DetailedDescription": str}.
+    desc_obj = details.get("Description")
+    if isinstance(desc_obj, dict):
+        description = (
+            desc_obj.get("ProductDescription")
+            or desc_obj.get("DetailedDescription")
+            or ""
+        )
+    else:
+        description = (
+            details.get("ProductDescription")
+            or details.get("DetailedDescription")
+            or (desc_obj if isinstance(desc_obj, str) else "")
+            or ""
+        )
     datasheet_url = details.get("PrimaryDatasheet") or details.get("DatasheetUrl")
+    # DigiKey v4 sometimes returns protocol-relative URLs (`//mm.digikey.com/...`).
+    # Normalise to https so downstream consumers (docs, audit, UI) can link safely.
+    if isinstance(datasheet_url, str) and datasheet_url.startswith("//"):
+        datasheet_url = "https:" + datasheet_url
     product_url = details.get("ProductUrl") or details.get("ProductPath")
 
     # Lifecycle status

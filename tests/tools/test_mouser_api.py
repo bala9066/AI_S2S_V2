@@ -150,3 +150,86 @@ def test_network_error_returns_none(configured):
 def test_malformed_json_returns_none(configured):
     with _mock_urlopen("not json"):
         assert lookup("X") is None
+
+
+# ---------------------------------------------------------------------------
+# Currency + lifecycle extensions — regression tests for SP4320-01WTG
+# ---------------------------------------------------------------------------
+
+def _price_response(*, price: str, currency: str = "",
+                    lifecycle: str = "Active",
+                    datasheet: str = "https://ds/x.pdf") -> str:
+    """Build a minimal Mouser search/partnumber response with a single
+    price break. Used by the currency + lifecycle tests below."""
+    return json.dumps({
+        "SearchResults": {
+            "NumberOfResult": 1,
+            "Parts": [{
+                "ManufacturerPartNumber": "X",
+                "Manufacturer": "Acme",
+                "Description": "Test part",
+                "DataSheetUrl": datasheet,
+                "ProductDetailUrl": "https://www.mouser.com/X",
+                "LifecycleStatus": lifecycle,
+                "AvailabilityInStock": "100",
+                "PriceBreaks": [{"Quantity": 1, "Price": price, "Currency": currency}],
+            }],
+        }
+    })
+
+
+def test_price_in_usd_populates_unit_price_usd(configured):
+    with _mock_urlopen(_price_response(price="$4.58", currency="USD")):
+        info = lookup("X")
+    assert info is not None
+    assert info.unit_price_usd == 4.58
+    assert info.unit_price == 4.58
+    assert info.unit_price_currency == "USD"
+
+
+def test_price_in_inr_does_not_pollute_usd_field(configured):
+    """Regression for SP4320-01WTG: India-region Mouser keys return INR
+    price strings. Parser must NOT mislabel them as USD — the numeric
+    lands in `unit_price` + `unit_price_currency`, and `unit_price_usd`
+    stays None so accounting code downstream cannot silently treat ₹61.50
+    as $61.50."""
+    with _mock_urlopen(_price_response(price="\u20B961.50", currency="INR")):
+        info = lookup("X")
+    assert info is not None
+    assert info.unit_price_usd is None, "INR price must not leak into USD field"
+    assert info.unit_price == 61.5
+    assert info.unit_price_currency == "INR"
+
+
+def test_price_currency_inferred_from_symbol_when_field_blank(configured):
+    """Some older Mouser responses omit the Currency field and only send
+    the symbol in the Price string — fall back to symbol matching."""
+    with _mock_urlopen(_price_response(price="€4,58", currency="")):
+        info = lookup("X")
+    assert info is not None
+    # European decimal comma → 4.58
+    assert info.unit_price == 4.58
+    assert info.unit_price_currency == "EUR"
+    assert info.unit_price_usd is None
+
+
+def test_new_product_lifecycle_counts_as_active(configured):
+    """Mouser returns 'New Product' for recently-added MPNs. These are
+    shippable — the audit must not downgrade them to 'unknown'."""
+    with _mock_urlopen(_price_response(price="$1.00", currency="USD",
+                                       lifecycle="New Product")):
+        info = lookup("X")
+    assert info is not None
+    assert info.lifecycle_status == "active"
+
+
+def test_missing_datasheet_does_not_fail_lookup(configured):
+    """Mouser sometimes returns an empty DataSheetUrl (data gap on the
+    distributor's side). Lookup must still succeed with the other fields."""
+    with _mock_urlopen(_price_response(price="$1.00", currency="USD",
+                                       datasheet="")):
+        info = lookup("X")
+    assert info is not None
+    assert info.datasheet_url is None
+    assert info.unit_price_usd == 1.0
+    assert info.manufacturer == "Acme"
