@@ -166,6 +166,39 @@ export const ALL_SPECS: SpecDef[] = [
 ];
 
 /* ================================================================
+   TRANSMITTER TIER-1 SPECS — shown instead of ALL_SPECS when the
+   project was created with project_type='transmitter'. RF-performance
+   questions here are all TX-flavoured (Pout / PAE / ACPR / OIP3
+   instead of NF / MDS / SFDR).
+   ================================================================ */
+export const TX_SPECS: SpecDef[] = [
+  /* Frequency + bandwidth (shared vocab with RX) */
+  { id: 'freq_range',     q: 'Target operating frequency / band?',                 drives: 'PA device technology + match network',     chips: ['< 1 GHz (HF/VHF/UHF)','1-3 GHz (L/S)','3-6 GHz (C)','6-18 GHz (X/Ku)','> 18 GHz (K/Ka/mmWave)','Other'], scopes: ['full','front-end','downconversion','dsp'] },
+  { id: 'ibw',            q: 'Instantaneous (modulation) bandwidth?',              drives: 'Driver + PA BW + matching BW',             chips: ['< 1 MHz','1-20 MHz','20-100 MHz','100-500 MHz','> 500 MHz','Other'], scopes: ['full','front-end','downconversion','dsp'] },
+  /* Output power + linearity (TX-specific) */
+  { id: 'pout_dbm',       q: 'Target saturated output power Pout_sat (dBm)?',      drives: 'PA device selection + combining',          chips: ['+20 dBm (100 mW)','+30 dBm (1 W)','+37 dBm (5 W)','+40 dBm (10 W)','+47 dBm (50 W)','+50 dBm (100 W)','Other'], scopes: ['full','front-end'] },
+  { id: 'p1db_output',    q: 'Target output P1dB (dBm)?',                          drives: 'Backoff from saturation / linearity margin', chips: ['+10 dBm','+20 dBm','+30 dBm','+37 dBm','+40 dBm','Other'],   scopes: ['full','front-end'] },
+  { id: 'oip3_dbm',       q: 'Target output IP3 (OIP3, dBm)?',                     drives: 'Driver + PA linearity spec',               chips: ['+30 dBm','+40 dBm','+45 dBm','+50 dBm','Other'],              scopes: ['full','front-end'] },
+  { id: 'modulation_tx',  q: 'Modulation / waveform?',                             drives: 'PA class + backoff, DPD requirement',      chips: ['CW','Pulsed','QPSK/OQPSK','16-QAM','64-QAM','256-QAM','OFDM','FMCW','Other'], scopes: ['full','front-end','downconversion','dsp'] },
+  /* Spectral purity / compliance */
+  { id: 'harmonic_rej',   q: 'Harmonic rejection (dBc at 2f0 / 3f0)?',             drives: 'Post-PA harmonic filter order',            chips: ['-30 dBc','-40 dBc','-50 dBc','-60 dBc','MIL-STD spec','FCC Part 15/97','Other'], scopes: ['full','front-end'] },
+  { id: 'aclr_dbc',       q: 'ACPR / ACLR (adjacent-channel, dBc)?',               drives: 'Backoff + DPD linearization need',         chips: ['-30 dBc','-40 dBc','-45 dBc (5G)','-50 dBc (LTE)','-60 dBc','N/A CW','Other'], scopes: ['full','front-end'] },
+  { id: 'spur_mask',      q: 'Spurious emission mask?',                            drives: 'Filter topology + shielding',              chips: ['MIL-STD-461','FCC Part 15 Class A','FCC Part 15 Class B','ETSI EN 300','None','Other'], scopes: ['full','front-end','downconversion','dsp'] },
+  /* Efficiency + thermal */
+  { id: 'pae_pct',        q: 'Power-added efficiency (PAE) target?',               drives: 'PA class selection (AB / Doherty / C/E/F)', chips: ['> 20 % (linear AB)','> 35 % (Doherty)','> 50 % (saturated)','> 65 % (Class E/F)','Other'], scopes: ['full','front-end'] },
+  { id: 'supply_voltage', q: 'PA drain supply rail?',                              drives: 'GaN/LDMOS/GaAs selection + DC-DC',         chips: ['+5 V (GaAs)','+12 V','+28 V (GaN)','+48 V (LDMOS)','Multi-rail','Other'], scopes: ['full','front-end','downconversion','dsp'] },
+  { id: 'power_budget',   q: 'Total DC power budget (W)?',                         drives: 'Heatsink / thermal envelope',              chips: ['< 10 W','10-50 W','50-200 W','> 200 W','Auto','Other'],       scopes: ['full','front-end','downconversion','dsp'] },
+  /* Duty cycle (pulsed TX) */
+  { id: 'duty_cycle',     q: 'Duty cycle (pulsed TX)?',                            drives: 'Gate modulation + thermal average',        chips: ['CW (100%)','> 50%','10-50%','1-10%','< 1% (radar)','Other'], scopes: ['full','front-end'] },
+  /* Output protection */
+  { id: 'vswr_survival',  q: 'VSWR survivability?',                                drives: 'Circulator / isolator requirement',        chips: ['2:1 (matched)','3:1','5:1','∞:1 (open/short)','Other'],       scopes: ['full','front-end'] },
+  /* Environmental — shared with RX */
+  { id: 'temp_class',     q: 'Operating temperature class?',                       drives: 'Component grade + thermals',               chips: ['Commercial 0 to 70 °C','Industrial -40 to 85 °C','Military -55 to 125 °C','Space / rad-hard','Other'], scopes: ['full','front-end','downconversion','dsp'] },
+  { id: 'vibration',      q: 'Vibration / shock environment?',                     drives: 'Enclosure + connector',                    chips: ['Benign (lab)','MIL-STD-810 light','MIL-STD-810 heavy','Airborne','Naval','Other'], scopes: ['full','front-end','downconversion','dsp'] },
+  { id: 'ip_rating',      q: 'Ingress protection?',                                drives: 'Seal + housing',                           chips: ['IP20 (lab)','IP54 (outdoor)','IP67 (rugged)','IP68','N/A'],   scopes: ['full','front-end','downconversion','dsp'] },
+];
+
+/* ================================================================
    WIZARD STATE TYPE — used by helpers + show_if predicates.
    ================================================================ */
 export interface WizardState {
@@ -506,13 +539,21 @@ export function specLabel(c: SpecDef, scope: DesignScope | null): string {
   return c.q;
 }
 
-export function filterSpecsByScope(scope: DesignScope, mdsLockEnabled: boolean): { shown: SpecDef[]; hidden: SpecDef[] } {
-  const shown = ALL_SPECS.filter(c => {
+export function filterSpecsByScope(
+  scope: DesignScope,
+  mdsLockEnabled: boolean,
+  projectType: string | null = 'receiver',
+): { shown: SpecDef[]; hidden: SpecDef[] } {
+  // Switch to the TX spec catalogue when the project is a transmitter.
+  // TX_SPECS replaces the NF/MDS/SFDR questions with Pout/PAE/ACPR/OIP3
+  // — the receiver-flavoured questions are meaningless for a TX chain.
+  const source = projectType === 'transmitter' ? TX_SPECS : ALL_SPECS;
+  const shown = source.filter(c => {
     if (!c.scopes.includes(scope)) return false;
     if (c.advanced && !mdsLockEnabled) return false;
     return true;
   });
-  const hidden = ALL_SPECS.filter(c => {
+  const hidden = source.filter(c => {
     if (c.advanced) return false;
     return !c.scopes.includes(scope);
   });

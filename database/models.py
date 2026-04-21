@@ -59,6 +59,12 @@ class ProjectDB(Base):
     # apply and the /phases/{id}/execute endpoint can reject out-of-scope
     # runs with a 409. Added via migration 003.
     design_scope = Column(String(32), default="full", nullable=False)
+    # Project direction: "receiver" (default) or "transmitter". Drives which
+    # Round-1 question set the P1 agent shows (TX supplement prepended when
+    # transmitter), which architecture catalogue the wizard offers, and
+    # which branch of tools/rf_cascade.py is used for cascade analysis.
+    # Added via migration 004.
+    project_type = Column(String(32), default="receiver", nullable=False)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 

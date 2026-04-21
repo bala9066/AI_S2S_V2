@@ -1,4 +1,4 @@
-import type { Project, Statuses, StatusesRaw, DesignScope } from './types';
+import type { Project, Statuses, StatusesRaw, DesignScope, ProjectType } from './types';
 
 // Same-origin when served by FastAPI (port 8000 or behind a proxy).
 // Fall back to explicit localhost:8000 when opened directly as file:// or via Vite dev server.
@@ -47,6 +47,7 @@ export const api = {
     description: string;
     design_type: string;
     design_scope?: DesignScope;
+    project_type?: ProjectType;
   }) =>
     req<Project>('/api/v1/projects', { method: 'POST', body: JSON.stringify(data) }),
 

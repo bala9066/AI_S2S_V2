@@ -14,11 +14,24 @@ export interface Project {
   design_type?: string;
   /** Wizard-selected scope — authoritative on the backend (ProjectDB.design_scope). */
   design_scope?: DesignScope;
+  /** "receiver" (default) or "transmitter" — picked at project creation.
+   *  Drives wizard flow (which architecture catalogue to show), which
+   *  Round-1 questions the P1 agent asks, and which direction branch
+   *  of tools/rf_cascade.py computes the cascade. Authoritative on the
+   *  backend (ProjectDB.project_type). */
+  project_type?: ProjectType;
   status?: string;
   output_dir?: string;
   created_at?: string;
   conversation_history?: unknown[];
 }
+
+export type ProjectType = 'receiver' | 'transmitter';
+
+export const PROJECT_TYPE_LABELS: Record<ProjectType, string> = {
+  'receiver':    'Receiver',
+  'transmitter': 'Transmitter',
+};
 
 export type Statuses = Record<string, PhaseStatusValue>;
 

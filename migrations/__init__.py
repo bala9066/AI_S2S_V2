@@ -113,10 +113,27 @@ def _apply_003(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def _apply_004(conn: sqlite3.Connection) -> bool:
+    """004 — project_type column on projects.
+
+    Distinguishes receiver vs transmitter projects. Idempotent — existing
+    rows get 'receiver' automatically on ALTER TABLE ADD COLUMN.
+    """
+    if not _table_exists(conn, "projects"):
+        return False
+    if _column_exists(conn, "projects", "project_type"):
+        return False
+    conn.execute(
+        "ALTER TABLE projects ADD COLUMN project_type TEXT NOT NULL DEFAULT 'receiver'"
+    )
+    return True
+
+
 _MIGRATIONS = [
     ("001_requirements_lock", _apply_001),
     ("002_pipeline_runs_llm_calls", _apply_002),
     ("003_design_scope", _apply_003),
+    ("004_project_type", _apply_004),
 ]
 
 

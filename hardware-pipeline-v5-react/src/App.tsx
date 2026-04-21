@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { Project, Statuses, StatusesRaw, AppMode, CenterTab, DesignScope } from './types';
+import type { Project, Statuses, StatusesRaw, AppMode, CenterTab, DesignScope, ProjectType } from './types';
 import type { ChatMessage } from './views/ChatView';
 import { newMsgId } from './views/ChatView';
 import { PHASES, isUnlocked } from './data/phases';
@@ -351,11 +351,12 @@ export default function App() {
     name: string,
     description: string,
     design_type: string,
+    project_type: ProjectType,
     design_scope?: DesignScope,
   ) => {
     try {
       const p = await api.createProject({
-        name, description, design_type,
+        name, description, design_type, project_type,
         design_scope: design_scope ?? 'full',
       });
       setProject(p);

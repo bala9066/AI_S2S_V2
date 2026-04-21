@@ -54,6 +54,7 @@ def _project_to_dict(p: ProjectDB) -> dict:
         "description": p.description or "",
         "design_type": p.design_type or "general",
         "design_scope": getattr(p, "design_scope", None) or "full",
+        "project_type": getattr(p, "project_type", None) or "receiver",
         "current_phase": p.current_phase or "P1",
         "phase_statuses": dict(p.phase_statuses or {}),
         "conversation_history": list(p.conversation_history or []),
@@ -124,6 +125,7 @@ class ProjectService:
         description: str = "",
         design_type: str = "rf",
         design_scope: str = "full",
+        project_type: str = "receiver",
     ) -> dict:
         """Create a project in the DB and its output directory."""
         scope = (design_scope or "full").strip().lower()
@@ -131,6 +133,12 @@ class ProjectService:
             raise ValueError(
                 f"Invalid design_scope '{design_scope}'. "
                 f"Must be one of: {sorted(VALID_DESIGN_SCOPES)}"
+            )
+        ptype = (project_type or "receiver").strip().lower()
+        if ptype not in ("receiver", "transmitter"):
+            raise ValueError(
+                f"Invalid project_type '{project_type}'. "
+                "Must be 'receiver' or 'transmitter'."
             )
         session = get_session()
         try:
@@ -140,6 +148,7 @@ class ProjectService:
                 description=description,
                 design_type=design_type,
                 design_scope=scope,
+                project_type=ptype,
                 output_dir=str(output_dir),
                 current_phase="P1",
                 phase_statuses={},
@@ -150,7 +159,8 @@ class ProjectService:
             session.refresh(db)
             log.info(
                 "project.created",
-                extra={"project_id": db.id, "project_name": name, "design_scope": scope},
+                extra={"project_id": db.id, "project_name": name,
+                       "design_scope": scope, "project_type": ptype},
             )
             return _project_to_dict(db)
         except Exception:

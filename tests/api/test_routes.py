@@ -120,6 +120,40 @@ def test_create_project_ignores_product_id_if_sent(client):
     assert "product_id" not in r.json()
 
 
+def test_create_project_defaults_to_receiver(client):
+    r = client.post("/api/v1/projects", json={"name": "DefaultType"})
+    assert r.status_code == 201
+    assert r.json()["project_type"] == "receiver"
+
+
+def test_create_project_accepts_transmitter(client):
+    r = client.post(
+        "/api/v1/projects",
+        json={"name": "GaNPaChain", "project_type": "transmitter"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["project_type"] == "transmitter"
+
+
+def test_create_project_rejects_invalid_project_type(client):
+    r = client.post(
+        "/api/v1/projects",
+        json={"name": "BadType", "project_type": "banana"},
+    )
+    assert r.status_code == 400
+    assert "project_type" in r.json()["detail"]
+
+
+def test_get_project_surfaces_project_type(client):
+    created = client.post(
+        "/api/v1/projects",
+        json={"name": "RoundTrip", "project_type": "transmitter"},
+    ).json()
+    r = client.get(f"/api/v1/projects/{created['id']}")
+    assert r.status_code == 200
+    assert r.json()["project_type"] == "transmitter"
+
+
 # ---------------------------------------------------------------------------
 # PATCH /api/v1/projects/{id}/design-scope
 # ---------------------------------------------------------------------------

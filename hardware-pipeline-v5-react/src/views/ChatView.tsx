@@ -9,7 +9,7 @@ import {
   PROJECT_TYPES,
   SCOPE_DESC, APPLICATIONS, ALL_ARCHITECTURES,
   emptyWizardState, archById, specLabel,
-  filterSpecsByScope, filterArchByScopeAndApp,
+  filterSpecsByScope, filterArchByScopeAndApp, filterTxArchByScopeAndApp,
   resolveDeepDiveQs, resolveAppQs, allInlineSuggestions,
   derivedMDS, firedCascadeMessages, archRationale,
   AUTO_SUGGESTIONS,
@@ -2248,7 +2248,22 @@ function WizardFrame(p: WizardFrameProps) {
     if (!wizard.scope || !wizard.application) {
       return <div style={{ padding: 20, color: 'var(--text3)' }}>Missing scope/application, go back.</div>;
     }
-    const { linear, detector, strong } = filterArchByScopeAndApp(wizard.scope, wizard.application);
+    // TX projects use the transmitter architecture catalogue (9 options
+    // grouped into linear PA chains, saturated PAs, and upconversion
+    // front-ends) instead of the 14 receiver topologies.
+    const isTx = wizard.projectType === 'transmitter';
+    const { linear, detector, strong } = isTx
+      ? (() => {
+          const tx = filterTxArchByScopeAndApp(wizard.scope, wizard.application);
+          // Fold all TX categories into the existing "linear + detector" slots
+          // so the rendering code below doesn't need to fork.
+          return {
+            linear: [...tx.linear_pa, ...tx.upconvert],
+            detector: tx.saturated_pa,  // rendered as a separate group like RX detectors
+            strong: tx.strong,
+          };
+        })()
+      : filterArchByScopeAndApp(wizard.scope, wizard.application);
     const archBlock = (arch: typeof linear[number]) => {
       const isSel = wizard.architecture === arch.id;
       const isStrong = strong.includes(arch.id);
@@ -2322,7 +2337,7 @@ function WizardFrame(p: WizardFrameProps) {
   // ── Stage 4 — SPECS ──────────────────────────────────────────────────
   if (stage === 4) {
     if (!wizard.scope) return null;
-    const { shown, hidden } = filterSpecsByScope(wizard.scope, wizard.mdsLockEnabled);
+    const { shown, hidden } = filterSpecsByScope(wizard.scope, wizard.mdsLockEnabled, wizard.projectType);
     const mds = derivedMDS(wizard);
     const allAnswered = shown.filter(q => !q.advanced).every(q => wizard.specs[q.id]);
     return (
@@ -2663,9 +2678,13 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
   // Core wizard state — scope preloaded from parent prop (persisted in App.tsx
   // via handleScopeChange / localStorage) so a half-finished wizard survives
   // F5 across the Stage-1 decision.
+  // project_type is set at project creation (CreateProjectModal) and stored
+  // on the backend. Seed the wizard from it so TX projects automatically
+  // land in the transmitter architecture + spec catalogues.
   const [wizard, setWizard] = useState<WizardState>(() => ({
     ...emptyWizardState(),
     scope: scope ?? null,
+    projectType: project?.project_type ?? 'receiver',
   }));
   // "Other" free-text overrides per question id (shared across stages 4/5).
   const [wizOtherActive, setWizOtherActive] = useState<string | null>(null);
@@ -2724,6 +2743,15 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope]);
+
+  // Sync wizard.projectType with the loaded project's type. Matters when
+  // the user switches between an RX and a TX project without a reload.
+  useEffect(() => {
+    if (phaseStatus === 'completed') return;
+    const pt = project?.project_type ?? 'receiver';
+    setWizard(w => (w.projectType === pt ? w : { ...w, projectType: pt }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.project_type]);
 
   useEffect(() => {
     if (pipelineStarted) setApproveClicked(true);
@@ -3195,7 +3223,7 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
     parts.push('');
     parts.push('SYSTEM SPECIFICATIONS (Tier-1):');
     if (s.scope) {
-      const { shown } = filterSpecsByScope(s.scope, s.mdsLockEnabled);
+      const { shown } = filterSpecsByScope(s.scope, s.mdsLockEnabled, s.projectType);
       shown.forEach(spec => {
         const v = s.specs[spec.id];
         if (v) parts.push(`• ${specLabel(spec, s.scope)} -> ${v}`);
