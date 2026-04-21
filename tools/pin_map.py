@@ -272,12 +272,15 @@ def _validate_against_curated(
             ))
             continue
 
-        # Pin-name vs. datasheet mismatch (only check when BOTH are present)
+        # Pin-name vs. datasheet mismatch (only check when BOTH are present).
+        # Promoted to `high` in P1.6: a mis-labelled pin on a real MPN is a
+        # direct integration error (VCC connected to an RF port, etc.) and
+        # must reject the component, not just warn about it.
         if num is not None and name and str(num) in real_pins:
             expected_name = str(real_pins[str(num)].get("name") or "").strip()
             if expected_name and not _names_match(expected_name, name):
                 issues.append(_issue(
-                    "medium", "pin_name_mismatch",
+                    "high", "pin_name_mismatch",
                     f"component/{who}/pin/{num}",
                     (
                         f"Pin {num} on `{part_number}` labelled '{name}' but "
@@ -286,6 +289,98 @@ def _validate_against_curated(
                     f"Rename pin {num} to '{expected_name}' or fix the schematic.",
                 ))
     return issues
+
+
+# ---------------------------------------------------------------------------
+# Component-level acceptance gate (P1.6)
+# ---------------------------------------------------------------------------
+
+def component_should_reject(issues: list[dict[str, Any]]) -> bool:
+    """Return True when pin-validation issues are severe enough that the
+    component cannot ship as-is. Used by netlist_agent to strip the
+    component from the schematic_data output."""
+    return any(
+        i.get("severity") in ("critical", "high")
+        and i.get("category") in ("invalid_pin_number", "pin_name_mismatch")
+        for i in issues or []
+    )
+
+
+def reject_invalid_components(
+    netlist_data: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Walk schematic_data and remove any component whose pin list fails
+    validation with critical/high severity. Returns the filtered netlist
+    + a list of rejection issues suitable for the DRC report."""
+    import copy
+    nd = copy.deepcopy(netlist_data) if netlist_data else {}
+    rejections: list[dict[str, Any]] = []
+
+    # Build reject-set from schematic components
+    to_reject: set[str] = set()
+    schematic = nd.get("schematic_data") or {}
+    for sheet in schematic.get("sheets") or []:
+        kept = []
+        for comp in sheet.get("components") or []:
+            ref = str(comp.get("ref") or comp.get("reference_designator")
+                      or comp.get("id") or "").strip()
+            mpn = str(comp.get("part_number") or "").strip()
+            # Pull package from matching node if present
+            pkg = str(comp.get("package") or "").strip()
+            if not pkg:
+                for n in nd.get("nodes") or []:
+                    n_ref = str(n.get("reference_designator")
+                                or n.get("instance_id")
+                                or n.get("id") or "").strip()
+                    if n_ref == ref:
+                        pkg = str(n.get("package")
+                                  or (n.get("properties") or {}).get("package")
+                                  or "").strip()
+                        break
+            pins = comp.get("pins") or []
+            issues = validate_component_pins(
+                part_number=mpn, emitted_pins=pins,
+                package=pkg, ref=ref or mpn,
+            )
+            if component_should_reject(issues):
+                to_reject.add(ref)
+                rejections.append({
+                    "severity": "critical",
+                    "rule": "pin_map_reject",
+                    "location": f"component/{ref or mpn}",
+                    "detail": (
+                        f"Component `{ref}` ({mpn}) rejected because pin "
+                        f"validation produced {len(issues)} critical/high "
+                        "issue(s): "
+                        + "; ".join(
+                            str(i.get("detail", ""))[:80] for i in issues
+                        )[:500]
+                    ),
+                    "suggested_fix": (
+                        "Fix the pin list per the datasheet or switch to a "
+                        "curated MPN from data/pin_maps.json."
+                    ),
+                })
+            else:
+                kept.append(comp)
+        sheet["components"] = kept
+
+    # Mirror the rejection in nodes + edges so downstream KiCad .net
+    # generation doesn't emit orphan components.
+    if to_reject:
+        nd["nodes"] = [
+            n for n in (nd.get("nodes") or [])
+            if str(n.get("reference_designator")
+                   or n.get("instance_id")
+                   or n.get("id") or "").strip() not in to_reject
+        ]
+        nd["edges"] = [
+            e for e in (nd.get("edges") or [])
+            if str(e.get("from_instance") or e.get("source") or "").strip() not in to_reject
+            and str(e.get("to_instance") or e.get("target") or "").strip() not in to_reject
+        ]
+
+    return nd, rejections
 
 
 def _names_match(datasheet: str, emitted: str) -> bool:

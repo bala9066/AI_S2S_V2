@@ -133,11 +133,14 @@ def run_drc(netlist: dict[str, Any]) -> dict[str, Any]:
             })
 
     # -- 3. Floating signal nets (fewer than 2 endpoints) -------------------
+    # NOTE: power + ground nets are checked in rule 3b below, which applies
+    # different semantics — they're fine with one trace segment as long as
+    # at least one source + one sink are present somewhere in the payload.
     for name, endpoints in nets_to_endpoints.items():
         unique = {(r, p) for r, p in endpoints}
         stype = nets_to_type.get(name, "")
         if stype in ("power", "ground"):
-            continue  # rails can have a single endpoint per trace segment
+            continue
         if len(unique) < 2:
             violations.append({
                 "severity": "high", "rule": "floating_net",
@@ -145,6 +148,57 @@ def run_drc(netlist: dict[str, Any]) -> dict[str, Any]:
                 "detail": (
                     f"Net '{name}' has {len(unique)} endpoint(s); "
                     "signal nets need at least one driver + one receiver."
+                ),
+            })
+
+    # -- 3b. Dangling power / ground rails (P1.5) --------------------------
+    # A power rail with only a single endpoint (the IC's VCC pin) and
+    # nothing driving it — no regulator, no connector, no decap — is
+    # fatal in silicon. Rule 3 exempted "power" / "ground" types from
+    # the 2-endpoint requirement because segment-level layouts are
+    # legal. This rule reintroduces the check at *rail* level: every
+    # named power/ground rail in the payload must have ≥2 unique
+    # endpoints OR appear as a driver ref (regulator / connector).
+    _DRIVER_REF_PATTERNS = ("PWR", "REG", "VREG", "LDO", "PSU", "U_VREG",
+                            "J_PWR", "J1", "J_VCC", "CONN")
+
+    def _looks_like_driver(ref: str) -> bool:
+        r = (ref or "").upper()
+        return any(r.startswith(p) for p in _DRIVER_REF_PATTERNS)
+
+    for name, endpoints in nets_to_endpoints.items():
+        stype = nets_to_type.get(name, "")
+        if stype not in ("power", "ground"):
+            # Also catch nets named like rails even if signal_type wasn't set
+            if not (_is_power(name) or _is_ground(name) or name in power_nets
+                    or name in ground_nets):
+                continue
+        unique = {(r, p) for r, p in endpoints}
+        if len(unique) < 2:
+            violations.append({
+                "severity": "high", "rule": "dangling_power_rail",
+                "location": f"net/{name}",
+                "detail": (
+                    f"Power/ground rail '{name}' has only {len(unique)} "
+                    "endpoint(s); no driver found. The rail isn't connected "
+                    "to a regulator, supply connector, or bulk cap."
+                ),
+            })
+            continue
+        # Rail has ≥2 endpoints — verify at least one looks like a driver
+        # (regulator output, supply connector, battery, etc.).  A rail
+        # where every endpoint is an IC Vcc pin with no upstream source
+        # is a silent integration failure.
+        refs = {r for r, _ in unique}
+        if not any(_looks_like_driver(r) for r in refs):
+            violations.append({
+                "severity": "medium", "rule": "power_rail_no_driver",
+                "location": f"net/{name}",
+                "detail": (
+                    f"Power/ground rail '{name}' has {len(unique)} endpoints "
+                    "but none of the reference designators look like a driver "
+                    "(PWR*, REG*, LDO*, CONN*). Verify a supply source is "
+                    "actually connected."
                 ),
             })
 
@@ -182,6 +236,49 @@ def run_drc(netlist: dict[str, Any]) -> dict[str, Any]:
                     ),
                 })
 
+    # -- 5b. Clock-domain crossing without declared synchronisers (P2.7) ---
+    # A design that references ≥2 distinct clock nets AND carries any
+    # signal edge between their associated components without a CDC
+    # synchroniser is a metastability risk. We can't parse RTL from a
+    # schematic JSON, so we use a conservative heuristic: if ≥2 clock
+    # nets exist and no node carries a name / MPN hint for a CDC cell
+    # (FIFO, synchroniser, dual-port RAM), raise a medium-severity
+    # advisory. Caught once per design, not per-path.
+    clock_nets = {
+        n for n, st in nets_to_type.items() if st == "clock"
+    }
+    # Also treat nets named like clocks even if signal_type wasn't set.
+    for name in nets_to_endpoints:
+        if re.search(r"(?:^|_)(CLK|SCLK|MCLK|SCK|CLOCK)(?:_|$)",
+                     name, re.IGNORECASE):
+            clock_nets.add(name)
+    if len(clock_nets) >= 2:
+        # Look for CDC-cell hints in node descriptions / part numbers.
+        cdc_hints = re.compile(
+            r"(?:CDC|FIFO|SYNC|ASYNC|dual[- ]?port|2FF|synchroniser|synchronizer)",
+            re.IGNORECASE,
+        )
+        has_cdc_cell = False
+        for n in nodes:
+            blob = " ".join(str(n.get(k) or "") for k in
+                            ("part_number", "component_name", "name",
+                             "description"))
+            if cdc_hints.search(blob):
+                has_cdc_cell = True
+                break
+        if not has_cdc_cell:
+            violations.append({
+                "severity": "medium", "rule": "cdc_boundary_undeclared",
+                "location": "clocks/" + ",".join(sorted(clock_nets)),
+                "detail": (
+                    f"Design has {len(clock_nets)} distinct clock domains "
+                    "(" + ", ".join(sorted(clock_nets)) + ") but no "
+                    "CDC synchroniser / FIFO / dual-port cell is declared "
+                    "in the BOM. Metastability risk unless RTL adds 2FF "
+                    "synchronisers at every crossing."
+                ),
+            })
+
     # -- 6. Unknown component reference on an edge --------------------------
     known_refs = set(nodes_by_ref.keys())
     if known_refs:  # skip when the caller didn't pass nodes
@@ -205,7 +302,9 @@ def run_drc(netlist: dict[str, Any]) -> dict[str, Any]:
     return {
         "checks_run": [
             "shorts", "power_collision", "floating_net",
-            "power_naming", "missing_decap", "unknown_ref",
+            "dangling_power_rail", "power_rail_no_driver",
+            "power_naming", "missing_decap", "cdc_boundary_undeclared",
+            "unknown_ref",
         ],
         "violations": violations,
         "counts": counts,

@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Optional
 
 from domains._schema import AuditIssue
@@ -169,6 +171,8 @@ def _missing_url_issue(idx: int, c: dict[str, Any]) -> AuditIssue:
 def run_part_validation_audit(
     component_recommendations: list[dict[str, Any]],
     *, timeout_s: float = 6.0,
+    max_workers: int = 6,
+    overall_timeout_s: float = 60.0,
 ) -> tuple[list[dict[str, Any]], list[AuditIssue]]:
     """Look every MPN up via the distributor cascade. When a part is
     found we enrich the original component dict with the distributor's
@@ -179,36 +183,105 @@ def run_part_validation_audit(
       - `hallucinated_part` (critical) — MPN not found anywhere
       - `nrnd_part` (high) — found but flagged NRND by the distributor
       - `obsolete_part` (critical) — found but obsolete / discontinued
+      - `part_validation_timeout` (high) — overall deadline exceeded
+
+    Parallelism:
+      Looks are fanned out across `max_workers` threads (default 6) so a
+      50-part BOM doesn't block a FastAPI worker for 10+ minutes. A
+      hard overall wall-clock deadline of `overall_timeout_s` seconds
+      ensures we always return — parts that didn't finish by then are
+      flagged `part_validation_timeout` and the component is passed
+      through without enrichment.
 
     Returns (enriched_components, issues).
     """
     issues: list[AuditIssue] = []
-    enriched: list[dict[str, Any]] = []
     if not component_recommendations:
-        return enriched, issues
+        return [], issues
 
-    # When nobody is configured to look up live AND the seed file is
-    # also unreachable, we can't distinguish hallucination from "no
-    # oracle" — return without adding issues so the pipeline doesn't
-    # hard-fail on every BOM in air-gap / CI.
     live_configured = _distributor_configured()
 
-    for c in component_recommendations:
+    # Enumerate components once so positional order survives the fan-out.
+    entries: list[tuple[int, dict[str, Any], str]] = []
+    for idx, c in enumerate(component_recommendations):
         pn = (
             c.get("part_number")
             or c.get("primary_part")
             or c.get("mpn")
             or ""
         ).strip()
+        entries.append((idx, c, pn))
+
+    # Resolve MPNs in parallel. `lookups[idx]` will be None, the PartInfo,
+    # or the sentinel `_TIMEOUT` when the per-part or overall deadline
+    # fires before a worker finished.
+    _TIMEOUT = object()
+    lookups: dict[int, Any] = {}
+
+    def _resolve(pn: str):
+        if not pn:
+            return None
+        try:
+            return _distributor_lookup(pn, timeout_s=timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("distributor_lookup_failed pn=%s: %s", pn, exc)
+            return None
+
+    to_fetch = [(idx, pn) for idx, _, pn in entries if pn]
+    if to_fetch:
+        # Use as_completed's own timeout so the iterator itself unblocks
+        # at the overall deadline — even when no future has finished yet.
+        # Don't use the context manager: its __exit__ waits for in-flight
+        # tasks, which would nullify the deadline. Shut down non-blocking
+        # with cancel_futures so stragglers are abandoned, not awaited.
+        ex = ThreadPoolExecutor(max_workers=max(1, max_workers))
+        try:
+            futures = {ex.submit(_resolve, pn): idx for idx, pn in to_fetch}
+            try:
+                for fut in as_completed(futures, timeout=overall_timeout_s):
+                    idx = futures[fut]
+                    try:
+                        lookups[idx] = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("distributor_future_err idx=%d: %s", idx, exc)
+                        lookups[idx] = None
+            except FuturesTimeout:
+                pass
+            for fut, idx in futures.items():
+                if not fut.done():
+                    fut.cancel()
+                    lookups.setdefault(idx, _TIMEOUT)
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+    enriched: list[dict[str, Any]] = []
+
+    for idx, c, pn in entries:
         if not pn:
             enriched.append(c)
             continue
 
-        info = None
-        try:
-            info = _distributor_lookup(pn, timeout_s=timeout_s)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("distributor_lookup_failed pn=%s: %s", pn, exc)
+        info = lookups.get(idx)
+        if info is _TIMEOUT:
+            # The pipeline must still finish even when distributors are
+            # misbehaving; raise a distinct audit issue so the operator
+            # knows a bulk re-run is warranted.
+            issues.append(AuditIssue(
+                severity="high",
+                category="part_validation_timeout",
+                location=f"component_recommendations/{pn}",
+                detail=(
+                    f"Distributor lookup for `{pn}` did not complete within "
+                    f"the {overall_timeout_s:.0f}s overall deadline; part not "
+                    "validated this run."
+                ),
+                suggested_fix=(
+                    "Re-run the audit later, or call the distributor lookup "
+                    "tool manually for this MPN."
+                ),
+            ))
+            enriched.append(c)
+            continue
 
         if info is None:
             # MPN unknown to every oracle we tried.
@@ -226,7 +299,23 @@ def run_part_validation_audit(
                         "data/sample_components.json or a real distributor MPN."
                     ),
                 ))
-            enriched.append(c)
+                # P0.1 — blank the fields the LLM fabricated alongside the
+                # invented MPN. If we leave `datasheet_url` in place, the
+                # downstream datasheet audit may accept it because its
+                # domain is on the trusted-vendor allowlist, and a human
+                # reviewer then sees a `hallucinated_part` flag next to a
+                # plausible-looking URL + manufacturer — a dangerous mix.
+                scrubbed = {**c}
+                for k in ("datasheet_url", "datasheet",
+                          "product_url", "unit_price_usd",
+                          "lifecycle_status"):
+                    scrubbed.pop(k, None)
+                scrubbed["_hallucinated"] = True
+                enriched.append(scrubbed)
+            else:
+                # No live oracle configured — leave the component unchanged
+                # so air-gap / offline demos don't strip legitimate parts.
+                enriched.append(c)
             continue
 
         # Found — flag lifecycle issues before accepting.
@@ -366,6 +455,58 @@ def run_price_reconciliation_audit(
     return issues
 
 
+def run_phase_noise_audit(
+    component_recommendations: list[dict[str, Any]],
+    design_parameters: Optional[dict[str, Any]],
+) -> list[AuditIssue]:
+    """P2.8 — compare claimed system phase-noise floor against the LO's
+    datasheet phase-noise. Wraps `tools.phase_noise_validator`.
+
+    Skipped when `design_parameters` has no `phase_noise_dbchz` claim
+    or when no LO / synthesizer components are in the BOM.
+    """
+    if not design_parameters or not component_recommendations:
+        return []
+    claim = design_parameters.get("phase_noise_dbchz")
+    if claim is None:
+        # Some prompts use `phase_noise_floor_dbc_hz` — accept both.
+        claim = design_parameters.get("phase_noise_floor_dbc_hz")
+    if claim is None:
+        return []
+    try:
+        from tools.phase_noise_validator import validate_phase_noise
+    except Exception:
+        return []
+    offset = design_parameters.get("phase_noise_offset_hz", 10_000.0)
+    raw = validate_phase_noise(
+        claim,
+        offset_hz=float(offset) if offset else 10_000.0,
+        components=list(component_recommendations),
+    )
+    return [AuditIssue(**i) for i in raw]
+
+
+def run_bom_linkage_audit(
+    component_recommendations: list[dict[str, Any]],
+    netlist_nodes: Optional[list[dict[str, Any]]],
+) -> list[AuditIssue]:
+    """P2.9 — BOM ↔ schematic cross-reference. Fires only when the caller
+    supplies a list of netlist nodes (i.e. post-P4). Earlier phases
+    (P1 / P2 / P3) get an empty list because the schematic doesn't
+    exist yet."""
+    if not netlist_nodes:
+        return []
+    try:
+        from tools.bom_linkage import validate_bom_schematic_linkage
+    except Exception:
+        return []
+    raw = validate_bom_schematic_linkage(
+        component_recommendations or [],
+        list(netlist_nodes),
+    )
+    return [AuditIssue(**i) for i in raw]
+
+
 def run_candidate_pool_audit(
     component_recommendations: list[dict[str, Any]],
     offered_mpns: Optional[set[str]],
@@ -420,6 +561,8 @@ def run_all(
     *,
     timeout_s: float = 4.0,
     offered_candidate_mpns: Optional[set[str]] = None,
+    design_parameters: Optional[dict[str, Any]] = None,
+    netlist_nodes: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[dict[str, Any], list[AuditIssue]]:
     """Run every post-LLM check and return (possibly-mutated tool_input,
     combined issues). The tool_input is returned with banned parts
@@ -475,5 +618,18 @@ def run_all(
     # catches the case where one distributor's stale price line could
     # mislead the BOM cost roll-up.
     issues.extend(run_price_reconciliation_audit(enriched, timeout_s=timeout_s))
+
+    # 7. Phase-noise budget (P2.8) — runs only when P1 supplied a
+    # `phase_noise_dbchz` claim. Compares against the dominant LO's
+    # datasheet number and flags a "the cascade can't be better than
+    # its LO" violation if the claim is too aggressive.
+    dp = design_parameters if design_parameters is not None \
+        else tool_input.get("design_parameters")
+    issues.extend(run_phase_noise_audit(enriched, dp))
+
+    # 8. BOM ↔ schematic linkage (P2.9) — runs only in P4 context
+    # where `netlist_nodes` exists. Flags missing + invented parts
+    # between the BOM and the generated schematic.
+    issues.extend(run_bom_linkage_audit(enriched, netlist_nodes))
 
     return tool_input, issues

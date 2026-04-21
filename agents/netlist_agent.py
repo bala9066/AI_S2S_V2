@@ -280,9 +280,22 @@ class NetlistAgent(BaseAgent):
                 "outputs": {},
             }
 
+        # P1.4 — surface the P1 cascade targets + scope so the netlist agent
+        # can honour them (NF, gain, IIP3, phase-noise floor, frequency range).
+        # Previously the agent only saw the BOM + prose requirements and had
+        # no structured way to check the schematic against the P1 budget.
+        design_parameters = project_context.get("design_parameters") or {}
+        design_scope = project_context.get("design_scope") or ""
+        cascade_hints = self._format_cascade_targets(design_parameters)
+
         user_message = f"""Generate a complete logical netlist for:
 
 **Project:** {project_name}
+
+### Design Parameters (P1 cascade targets — the schematic MUST honour these):
+{cascade_hints}
+
+### Design Scope: {design_scope or '(not specified)'}
 
 ### Requirements:
 {requirements[:8000]}
@@ -298,7 +311,9 @@ CRITICAL: You MUST call the `generate_netlist` tool IMMEDIATELY with:
 2. ALL pin-to-pin connections between them with correct signal types (RF, IF, power, ground, digital, clock, LVDS, analog)
 3. Power and ground nets for every power domain
 4. A Mermaid diagram showing the full connectivity
-5. Validation notes for any potential issues
+5. Validation notes for any potential issues — CALL OUT any case where a
+   selected component's datasheet spec (NF, gain, IIP3, phase noise) is
+   worse than the P1 cascade target listed above.
 
 Do NOT include schematic_data — it is auto-generated from your nodes/edges.
 Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
@@ -371,11 +386,34 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             validation = self._validate_netlist(netlist_data)
             outputs["netlist_validation.json"] = json.dumps(validation, indent=2)
 
+            # P1.6 — reject components whose pins fail validation with
+            # critical/high severity. Previously these were warnings only;
+            # now the component is stripped from schematic_data + nodes +
+            # edges before KiCad export so downstream output can't embed
+            # a schematic with invalid pin numbers.
+            try:
+                from tools.pin_map import reject_invalid_components
+                netlist_data, _rejections = reject_invalid_components(netlist_data)
+            except Exception as _rej_exc:
+                self.log(f"pin_map_reject_failed: {_rej_exc}", "warning")
+                _rejections = []
+
             # P2.7 — structured DRC (shorts, floating outputs, power-net
             # connectivity). Complements the LLM's prose validation_notes.
             try:
                 from tools.netlist_drc import run_drc
                 drc = run_drc(netlist_data)
+                # Fold in the pin-map rejections as DRC violations so the
+                # JSON audit report surfaces them exactly where the operator
+                # already looks for problems.
+                if _rejections:
+                    drc.setdefault("violations", []).extend(_rejections)
+                    drc.setdefault("counts", {})["critical"] = \
+                        drc["counts"].get("critical", 0) + len(_rejections)
+                    drc["checks_run"] = list(drc.get("checks_run") or []) + [
+                        "pin_map_reject",
+                    ]
+                    drc["overall_pass"] = False
                 # Pin-number validation (P3 — closes the "pin numbers are
                 # LLM-generated" gap): validate every schematic component
                 # against `data/pin_maps.json` or the package pin-count
@@ -480,6 +518,40 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             "phase_complete": True,  # Always complete — skeleton fallback ensures output files exist
             "outputs": outputs,
         }
+
+    @staticmethod
+    def _format_cascade_targets(design_parameters: dict) -> str:
+        """Render the P1 cascade targets as a compact bulleted block so the
+        LLM can reason about per-stage budget. Returns '(no targets)' when
+        the caller didn't pass any — the agent then operates in the
+        original BOM-only mode."""
+        if not isinstance(design_parameters, dict) or not design_parameters:
+            return "(no design parameters supplied — operating in BOM-only mode)"
+        # Pick the subset the netlist agent can actually act on. Other
+        # fields (project_summary, application, etc.) are noise here.
+        relevant = (
+            "freq_range", "freq_range_ghz",
+            "bandwidth_mhz", "instantaneous_bandwidth_mhz", "ibw",
+            "noise_figure_db", "nf_db",
+            "total_gain_db", "gain_db",
+            "iip3_dbm_input", "iip3_dbm", "iip3",
+            "p1db_dbm_out", "p1db_dbm", "p1db",
+            "sfdr_db",
+            "sensitivity_dbm", "mds_dbm",
+            "phase_noise_dbchz",
+            "supply_voltage", "vdd", "power_budget_w",
+            "lo_frequency", "lo_frequency_ghz",
+            "if_frequency", "if_frequency_mhz",
+            "architecture", "application",
+        )
+        lines = []
+        for k in relevant:
+            if k in design_parameters and design_parameters[k] is not None:
+                v = design_parameters[k]
+                lines.append(f"- {k}: {v}")
+        if not lines:
+            return "(design_parameters supplied but no cascade-relevant keys)"
+        return "\n".join(lines)
 
     def _build_visual_md(self, data: dict, project_name: str, mermaid: str) -> str:
         lines = [

@@ -114,14 +114,18 @@ def test_pin_number_out_of_range_flagged_critical():
     assert any("100" in i["detail"] for i in issues)
 
 
-def test_pin_name_mismatch_flagged_medium():
+def test_pin_name_mismatch_flagged_high():
+    """P1.6: promoted from medium → high. A mis-labelled pin on a real
+    MPN is a direct integration error — VCC routed to an RF port is not
+    a "warning", it's a fatal schematic bug. Severity high triggers
+    component rejection by `reject_invalid_components`."""
     issues = validate_component_pins(
         part_number="HMC8410LP2FE",
         emitted_pins=[{"num": "2", "name": "VCC"}],  # really RFIN
         ref="U1",
     )
     assert any(i["category"] == "pin_name_mismatch"
-               and i["severity"] == "medium" for i in issues)
+               and i["severity"] == "high" for i in issues)
 
 
 def test_pin_name_normalisation_accepts_rfin_for_rf_in():

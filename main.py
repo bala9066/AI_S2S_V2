@@ -499,18 +499,40 @@ async def get_clarification_questions(project_id: int, body: ClarifyRequest):
 
 # ── Chat (Phase 1) ─────────────────────────────────────────────────────────────
 
+# Wall-clock cap on one chat turn. The inner LLM call already has its
+# own per-request timeout, but without an outer ceiling a slow/hung LLM
+# or stalled distributor lookup would keep the HTTP connection open
+# indefinitely. 180 s covers a heavy P1 finalize (LLM + cascade +
+# audit + distributor validation) with comfortable margin.
+_CHAT_DEADLINE_S = 180.0
+
+
 @app.post("/api/v1/projects/{project_id}/chat", tags=["chat"])
 async def chat(project_id: int, body: dict):
     """Send a message to the Phase 1 requirements agent."""
+    import asyncio as _asyncio
     message = (body.get("message") or "").strip()
     if not message:
         raise HTTPException(400, "message is required")
 
     try:
-        result = await _chat_svc().send_message(project_id, message)
+        result = await _asyncio.wait_for(
+            _chat_svc().send_message(project_id, message),
+            timeout=_CHAT_DEADLINE_S,
+        )
         log.info("api.chat_ok",
                  extra={"project_id": project_id, "phase_complete": result.get("phase_complete")})
         return result
+    except _asyncio.TimeoutError:
+        log.warning(
+            "api.chat_timeout project_id=%s deadline=%.0fs",
+            project_id, _CHAT_DEADLINE_S,
+        )
+        raise HTTPException(
+            504,
+            f"Chat request exceeded the {_CHAT_DEADLINE_S:.0f}s deadline. "
+            "Try again, or shorten the request.",
+        )
     except ValueError as exc:
         raise HTTPException(404, str(exc))
     except Exception as exc:

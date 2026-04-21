@@ -957,8 +957,26 @@ Map all registers from the RDT to the register bus. Implement all FSMs identifie
         if has_adc:
             xdc_lines += [
                 "",
-                "# ADC LVDS data",
-                f"set_input_delay  -clock clk -max 2.0 [get_ports {{adc_data adc_data_valid}}]",
+                "# ADC LVDS data — dedicated sample clock from front-end",
+                f"create_clock -period 10.0 -name adc_sample_clk [get_ports adc_data_valid]",
+                f"set_input_delay  -clock adc_sample_clk -max 2.0 [get_ports {{adc_data adc_data_valid}}]",
+                # P2.7 — declare the CDC boundary explicitly. Without
+                # these constraints Vivado would apply normal setup/hold
+                # checks across the async ADC↔FPGA boundary and either
+                # flag false timing violations or, worse, silently route
+                # metastable paths. 2FF synchronisers must still exist
+                # in the RTL — these constraints only TELL the router
+                # not to bother chasing a false path.
+                "set_clock_groups -asynchronous -group clk -group adc_sample_clk",
+                "set_false_path -from [get_clocks adc_sample_clk] -to [get_clocks clk]",
+                "set_false_path -from [get_clocks clk] -to [get_clocks adc_sample_clk]",
+            ]
+        if has_spi:
+            xdc_lines += [
+                "",
+                "# SPI is a slow interface but its MISO is async relative to clk —",
+                "# declare the false path so Vivado doesn't chase setup/hold across it.",
+                "set_false_path -from [get_ports spi_miso] -to [get_clocks clk]",
             ]
         xdc = "\n".join(xdc_lines)
 
