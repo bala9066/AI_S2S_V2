@@ -318,6 +318,81 @@ export const DEEP_DIVES: Record<DesignScope, DeepDiveDef> = {
 };
 
 /* ================================================================
+   TRANSMITTER DEEP-DIVES — scope-keyed, fired when project_type='transmitter'.
+   Replaces the RX DEEP_DIVES above entirely; none of the receiver
+   questions (LNA tech, image rejection, ADC ENOB, etc.) are asked.
+   ================================================================ */
+export const TX_DEEP_DIVES: Record<DesignScope, DeepDiveDef> = {
+  'front-end': {
+    title: 'TX Front-End / PA deep-dive',
+    note: 'The PA stage sets Pout, PAE, and linearity. Device technology + biasing + post-PA filtering drive regulatory compliance.',
+    qs: [
+      { id: 'pa_topology',     q: 'PA stage topology?',                            chips: ['Single-ended','Balanced (90° hybrid)','Push-pull (balun)','Doherty (main+peak)','Combined (Wilkinson)','Other'] },
+      { id: 'pa_tech',         q: 'PA device technology?',                         chips: ['GaN HEMT','GaAs HBT','LDMOS','SiGe BiCMOS','CMOS (integrated)','Auto-pick'] },
+      { id: 'pa_class',        q: 'PA class of operation?',                        chips: ['Class A (linear)','Class AB (backoff linear)','Class B','Class C (saturated)','Class E','Class F','Doherty','Auto'] },
+      { id: 'driver_topology', q: 'Driver / pre-driver chain length?',             chips: ['1 stage (direct drive)','2 stages (pre-driver + driver)','3 stages','Auto'] },
+      { id: 'harmonic_filter', q: 'Harmonic / output filter technology?',          chips: ['LC discrete 3rd-order','LC discrete 5th-order','LC discrete 7th-order','Ceramic LPF','Cavity BPF','Waveguide (mmWave)','Auto'] },
+      { id: 'isolator_choice', q: 'Output isolation element?',                     chips: ['Ferrite isolator','Circulator (T/R shared antenna)','Directional coupler only','None','Auto'] },
+      { id: 'output_combining',q: 'Output combining (for multi-device)?',          chips: ['None (single device)','Wilkinson 2-way','Wilkinson 4-way','Hybrid combiner','Spatial / lens','Auto'] },
+      { id: 'bias_scheme',     q: 'PA biasing / envelope tracking?',               chips: ['Fixed bias','Adaptive bias (ALC)','Envelope tracking','Gate modulation (pulsed)','Auto'] },
+      { id: 'thermal_sink',    q: 'Thermal dissipation path?',                     chips: ['Top-side copper heatsink','Bottom-side metal baseplate','Flange-mount / bolt-down','Liquid cooling','TEC','Auto'] },
+      { id: 'connector_tx',    q: 'RF output connector?',                          chips: ['SMA','TNC','N-type','7/16 DIN','Waveguide','K-connector','Other'] },
+      /* Radar-conditional */
+      { id: 'tr_switch',       q: 'T/R switch topology?',                          chips: ['PIN-diode (high power)','GaAs FET','Circulator (no switch)','MEMS','N/A separate antennas'], show_if: s => s.application === 'radar' },
+    ],
+  },
+  'downconversion': {
+    title: 'TX Upconversion deep-dive',
+    note: 'Upconversion stage combines the baseband signal with the carrier. LO phase noise + image rejection at the mixer output drive system EVM / ACLR.',
+    qs: [
+      { id: 'parent_arch',     q: 'What drives your upconverter?',                 chips: ['Baseband DAC I/Q pair','IQ modulator (direct RF)','IF source + mixer','Analog synthesizer','Unknown — design agnostic'] },
+      { id: 'n_channels_tx',   q: 'Number of simultaneous TX channels?',           chips: ['1','2','4','8','MIMO (16+)','Other'] },
+      { id: 'lo_source_tx',    q: 'LO source for upconversion?',                   chips: ['TCXO + integer PLL','TCXO + fractional-N PLL','OCXO + PLL','DDS + PLL','GPS-disciplined','External 10 MHz ref','Other'] },
+      { id: 'phase_noise_tx',  q: 'TX LO phase noise @ 10 kHz offset (dBc/Hz)?',   chips: ['-90','-100','-110','-120','-130 (OCXO)','-140 (premium OCXO)','Auto'] },
+      { id: 'if_freq_tx',      q: 'IF centre frequency (superhet TX)?',            chips: ['70 MHz','140 MHz','500 MHz','1 GHz','Other'], show_if: s => s.architecture === 'tx_superhet_upconvert' },
+      { id: 'iq_imbalance',    q: 'Required I/Q imbalance tolerance?',             chips: ['< 0.1 dB / 0.5°','< 0.5 dB / 2°','< 1 dB / 5°','Auto'], show_if: s => s.architecture === 'tx_iq_mod_upconvert' },
+      { id: 'image_rej_tx',    q: 'Image rejection at upconverter output (dB)?',   chips: ['30 dB','40 dB','50 dB','> 60 dB','Other'] },
+      { id: 'mixer_type_tx',   q: 'Upconvert mixer type?',                         chips: ['Passive diode','Active FET','Gilbert cell','IQ modulator (integrated)','Auto'] },
+      { id: 'tuning_speed_tx', q: 'Frequency agility / channel switch time?',     chips: ['< 1 µs','1-10 µs','10-100 µs','> 100 µs','Static (no tuning)'] },
+    ],
+  },
+  'dsp': {
+    title: 'TX Baseband / DAC deep-dive',
+    note: 'Baseband resolution + DAC dynamic range + clock jitter set the achievable EVM and noise floor. DPD architectures need a feedback path.',
+    qs: [
+      { id: 'parent_arch',     q: 'Downstream RF chain?',                          chips: ['Analog IF + mixer','Direct IQ modulator','Direct RF DAC','Unknown — design agnostic'] },
+      { id: 'dac_sample_rate', q: 'DAC sample rate?',                              chips: ['125 Msps','500 Msps','1 Gsps','3 Gsps','> 6 Gsps (RF DAC)','Other'] },
+      { id: 'dac_resolution',  q: 'DAC resolution?',                               chips: ['10-bit','12-bit','14-bit','16-bit','Other'] },
+      { id: 'dac_sfdr',        q: 'DAC SFDR requirement (dBc)?',                   chips: ['60 dBc','70 dBc','80 dBc','> 90 dBc','Other'] },
+      { id: 'clock_jitter_tx', q: 'DAC clock aperture jitter (fs rms)?',           chips: ['< 50 fs','< 100 fs','< 250 fs','< 500 fs','< 1 ps','Auto'] },
+      { id: 'dpd_feedback',    q: 'DPD feedback path?',                            chips: ['None (open loop)','Observation ADC','Separate feedback RX','Peak detector only','Auto'], show_if: s => s.architecture === 'tx_dpd_linearized' },
+      { id: 'cfr_algo',        q: 'Crest factor reduction (CFR)?',                 chips: ['None','Clipping','Peak windowing','Noise shaping','Auto'] },
+      { id: 'fpga_family_tx',  q: 'FPGA / SoC family?',                            chips: ['Artix-7','Kintex-7','Zynq UltraScale+','Versal','Intel Agilex','Other'] },
+      { id: 'data_iface_tx',   q: 'Baseband data input interface?',                chips: ['JESD204B','JESD204C','LVDS','PCIe Gen3','10G Ethernet / VITA49','Other'] },
+    ],
+  },
+  'full': {
+    title: 'Full-Transmitter deep-dive',
+    note: 'End-to-end TX — digital baseband through PA. Subset of each block\'s critical params so the BOM is complete and the cascade math is grounded.',
+    qs: [
+      { id: 'pa_tech',         q: 'PA device technology?',                         chips: ['GaN HEMT','GaAs HBT','LDMOS','SiGe','Auto'] },
+      { id: 'pa_class',        q: 'PA class?',                                     chips: ['Class AB','Class C','Doherty','Class E/F','Auto'] },
+      { id: 'n_channels_tx',   q: 'Number of TX channels?',                        chips: ['1','2','4','8','MIMO (16+)','Other'] },
+      { id: 'lo_source_tx',    q: 'Upconvert LO source?',                          chips: ['TCXO + PLL','OCXO + PLL','DDS','External ref','Auto'] },
+      { id: 'phase_noise_tx',  q: 'LO phase noise @ 10 kHz (dBc/Hz)?',             chips: ['-100','-110','-120','-130','-140','Auto'] },
+      { id: 'dac_sample_rate', q: 'DAC sample rate?',                              chips: ['500 Msps','1 Gsps','3 Gsps','> 6 Gsps','Auto'] },
+      { id: 'dac_resolution',  q: 'DAC resolution?',                               chips: ['12-bit','14-bit','16-bit','Auto'] },
+      { id: 'dpd_feedback',    q: 'DPD feedback path?',                            chips: ['None','Observation ADC','Dedicated feedback RX','Auto'] },
+      { id: 'harmonic_filter', q: 'Post-PA filter order?',                         chips: ['3rd-order LC','5th-order LC','7th-order LC','Cavity BPF','Auto'] },
+      { id: 'isolator_choice', q: 'Output isolation?',                             chips: ['Ferrite isolator','Circulator','None (fixed load)','Auto'] },
+      { id: 'thermal_sink',    q: 'Thermal dissipation?',                          chips: ['Heatsink','Baseplate','Liquid','TEC','Auto'] },
+      { id: 'fpga_family_tx',  q: 'FPGA / SoC?',                                   chips: ['Zynq UltraScale+','Versal','Kintex-7','Auto'] },
+      { id: 'tr_switch',       q: 'T/R switching time?',                           chips: ['< 100 ns','< 1 µs','< 10 µs','N/A separate antennas'], show_if: s => s.application === 'radar' },
+    ],
+  },
+};
+
+/* ================================================================
    APPLICATION ADDENDUMS — scope-aware.
    ================================================================ */
 export interface AppQDef {
@@ -604,7 +679,12 @@ export function filterTxArchByScopeAndApp(scope: DesignScope, appId: string): {
 
 export function resolveDeepDiveQs(state: WizardState): { dive: DeepDiveDef | null; qs: DeepDiveQ[] } {
   if (!state.scope) return { dive: null, qs: [] };
-  const dive = DEEP_DIVES[state.scope];
+  // Transmitter projects get the TX_DEEP_DIVES catalogue — the RX
+  // questions (LNA tech, image rejection, ADC ENOB) are dropped entirely
+  // so the wizard Stage-5 card set is focused on PA/driver/upconvert
+  // parameters instead.
+  const source = state.projectType === 'transmitter' ? TX_DEEP_DIVES : DEEP_DIVES;
+  const dive = source[state.scope];
   if (!dive) return { dive: null, qs: [] };
   const qs = dive.qs.filter(q => !q.show_if || q.show_if(state));
   return { dive, qs };
