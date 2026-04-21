@@ -256,7 +256,11 @@ class NetlistAgent(BaseAgent):
             phase_name="Netlist Generation",
             model=settings.primary_model,  # Opus for complex reasoning
             tools=[GENERATE_NETLIST_TOOL],
-            max_tokens=8192,  # GLM-4.7 safe limit; complex designs use skeleton fallback for schematic_data
+            # 16K lets the LLM emit richer schematic_data (30+ components,
+            # multi-sheet cross-sheet routing) without truncating. Prior
+            # 8K cap frequently forced the skeleton fallback on complex
+            # defence-grade RF designs (>20 ICs with diff-pair routing).
+            max_tokens=16384,
         )
         self.netlist_generator = NetlistGenerator()
 
@@ -272,6 +276,10 @@ class NetlistAgent(BaseAgent):
         requirements = self._load_file(output_dir / "requirements.md")
         components_text = self._load_file(output_dir / "component_recommendations.md")
         hrs = self._load_file(output_dir / f"HRS_{project_name.replace(' ', '_')}.md")
+        # P1 → P4 handoff: surface the block diagram mermaid so the LLM
+        # can align the schematic topology with the P1 signal-flow intent
+        # (stage ordering, mixer/LO direction, multi-antenna layout, etc.).
+        block_diagram_md = self._load_file(output_dir / "block_diagram.md")
 
         if not requirements:
             return {
@@ -288,6 +296,11 @@ class NetlistAgent(BaseAgent):
         design_scope = project_context.get("design_scope") or ""
         cascade_hints = self._format_cascade_targets(design_parameters)
 
+        block_hint = (
+            f"\n### P1 Block Diagram (MUST align schematic topology to this signal flow):\n"
+            f"{block_diagram_md[:4000]}\n"
+        ) if block_diagram_md else ""
+
         user_message = f"""Generate a complete logical netlist for:
 
 **Project:** {project_name}
@@ -296,7 +309,7 @@ class NetlistAgent(BaseAgent):
 {cascade_hints}
 
 ### Design Scope: {design_scope or '(not specified)'}
-
+{block_hint}
 ### Requirements:
 {requirements[:8000]}
 
@@ -442,10 +455,18 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
 
             # Schematic data — if the LLM produced one, persist it. Otherwise synthesize a
             # minimal single-sheet schematic from the node/edge list so the UI always has
-            # something to render.
-            schematic_data = netlist_data.get("schematic_data")
-            if not schematic_data or not schematic_data.get("sheets"):
+            # something to render. Tag `source` so the UI can show whether the layout came
+            # from the model directly or from our deterministic synthesizer, and so downstream
+            # tooling can treat the two cases differently (auto-synth layouts are conservative
+            # and may need review for specialised topologies).
+            llm_schematic = netlist_data.get("schematic_data")
+            if llm_schematic and llm_schematic.get("sheets"):
+                schematic_data = llm_schematic
+                schematic_data["source"] = "llm_emitted"
+            else:
                 schematic_data = self._synthesize_schematic(netlist_data)
+                schematic_data["source"] = "auto_synthesized"
+                schematic_data["auto_synthesized"] = True
             outputs["schematic.json"] = json.dumps(schematic_data, indent=2)
 
             self.log(f"Netlist: {len(netlist_data.get('nodes', []))} nodes, {len(netlist_data.get('edges', []))} edges")
@@ -509,9 +530,10 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                 outputs["netlist_drc.json"] = json.dumps(drc, indent=2)
             except Exception:
                 pass
-            outputs["schematic.json"] = json.dumps(
-                self._synthesize_schematic(netlist_data), indent=2
-            )
+            _fb_schematic = self._synthesize_schematic(netlist_data)
+            _fb_schematic["source"] = "auto_synthesized"
+            _fb_schematic["auto_synthesized"] = True
+            outputs["schematic.json"] = json.dumps(_fb_schematic, indent=2)
 
         return {
             "response": response.get("content", "Netlist generated."),

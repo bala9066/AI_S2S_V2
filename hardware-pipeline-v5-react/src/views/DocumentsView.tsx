@@ -5,6 +5,7 @@ import { api } from '../api';
 import { getVisibleDocuments } from '../data/phases';
 import { loadMermaid, renderMermaid, purgeMermaidScratch } from '../utils/mermaid';
 import SchematicView from '../components/schematic/SchematicView';
+import CascadeChart from '../components/CascadeChart';
 
 interface DocFile {
   name: string;
@@ -1418,6 +1419,12 @@ export default function DocumentsView({ project, phase, status, pipelineRunning 
           )}
         </div>
       </div>
+
+      {/* P1: RF cascade analysis chart — renders when cascade_analysis.json exists.
+          Hidden for non-RF designs where the JSON is absent / empty. */}
+      {phase.id === 'P1' && project && (
+        <CascadeChart projectId={project.id} color={phase.color} />
+      )}
 
       {/* File list */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>

@@ -2643,6 +2643,26 @@ class RequirementsAgent(BaseAgent):
         except Exception as e:
             self.log(f"GLB html generation failed: {e}", "warning")
 
+        # 7. cascade_analysis.json — structured Friis NF / gain / IIP3
+        # cascade so the React UI can render a stage-by-stage chart.
+        # Pure computation (no network), always safe to emit. The JSON
+        # echoes the P1 claims so the chart can draw a pass/fail verdict.
+        try:
+            import json as _json
+            from tools.rf_cascade import compute_cascade
+            dp = tool_input.get("design_parameters") or {}
+            cascade = compute_cascade(
+                tool_input.get("component_recommendations") or [],
+                claimed_nf_db=dp.get("noise_figure_db"),
+                claimed_iip3_dbm=dp.get("iip3_dbm_input") or dp.get("iip3_dbm"),
+                claimed_total_gain_db=dp.get("total_gain_db"),
+            )
+            cascade_file = output_path / "cascade_analysis.json"
+            cascade_file.write_text(_json.dumps(cascade, indent=2), encoding="utf-8")
+            outputs["cascade_analysis.json"] = _json.dumps(cascade, indent=2)
+        except Exception as e:
+            self.log(f"cascade_analysis generation failed: {e}", "warning")
+
         self.log(f"Generated {len(outputs)} Phase 1 output files in {output_path}")
         return outputs
 
