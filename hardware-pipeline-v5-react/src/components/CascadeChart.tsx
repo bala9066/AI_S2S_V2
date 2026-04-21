@@ -5,39 +5,71 @@ interface Stage {
   name: string;
   part_number: string;
   category: string;
+  // RX
   nf_db: number | null;
   gain_db: number | null;
   iip3_dbm: number | null;
   cum_gain_db: number | null;
   cum_nf_db: number | null;
   cum_iip3_dbm: number | null;
-  nf_contribution_db: number | null;
-  iip3_contribution_dbm: number | null;
+  nf_contribution_db?: number | null;
+  iip3_contribution_dbm?: number | null;
+  // TX
+  oip3_dbm?: number | null;
+  pout_dbm?: number | null;
+  pae_pct?: number | null;
+  pdc_w?: number | null;
+  pin_dbm?: number | null;
+  pout_computed_dbm?: number | null;
+  cum_oip3_dbm?: number | null;
+  compression_warning?: boolean;
 }
 
 interface Totals {
-  nf_db: number | null;
+  // RX
+  nf_db?: number | null;
+  iip3_dbm?: number | null;
+  // TX
+  pout_dbm?: number | null;
+  oip3_dbm?: number | null;
+  pae_pct?: number | null;
+  pdc_total_w?: number | null;
+  input_power_dbm?: number | null;
+  compression_warnings?: string[];
+  // shared
   gain_db: number | null;
-  iip3_dbm: number | null;
   stage_count: number;
 }
 
 interface Claims {
-  nf_db: number | null;
-  iip3_dbm: number | null;
+  nf_db?: number | null;
+  iip3_dbm?: number | null;
   total_gain_db: number | null;
+  pout_dbm?: number | null;
+  oip3_dbm?: number | null;
+  pae_pct?: number | null;
 }
 
 interface Verdict {
-  nf_pass: boolean | null;
+  // RX
+  nf_pass?: boolean | null;
+  iip3_pass?: boolean | null;
+  nf_headroom_db?: number | null;
+  iip3_headroom_db?: number | null;
+  // TX
+  pout_pass?: boolean | null;
+  oip3_pass?: boolean | null;
+  pae_pass?: boolean | null;
+  pout_headroom_db?: number | null;
+  pae_delta_pct?: number | null;
+  no_compression?: boolean;
+  // shared
   gain_pass: boolean | null;
-  iip3_pass: boolean | null;
-  nf_headroom_db: number | null;
-  iip3_headroom_db: number | null;
   gain_delta_db: number | null;
 }
 
 interface CascadeData {
+  direction?: 'rx' | 'tx';
   stages: Stage[];
   totals: Totals;
   claims: Claims;
@@ -308,10 +340,156 @@ export default function CascadeChart({ projectId, color: _color }: Props) {
   if (err || !data) return null;  // silently hide when not applicable (non-RF designs)
   if (!data.stages || data.stages.length === 0) return null;
 
-  // Domain autosize around observed values.
+  const direction = data.direction ?? 'rx';
+  const tot = data.totals;
+  const v = data.verdict;
+  const claims = data.claims;
+
+  // --- Gain domain (shared by RX + TX) ---
   const gainVals = data.stages.flatMap(s => [
     s.gain_db, s.cum_gain_db,
   ]).filter((v): v is number => v !== null && isFinite(v));
+  const gainDom: [number, number] = gainVals.length > 0
+    ? [Math.min(0, Math.min(...gainVals) - 2), Math.max(0, Math.max(...gainVals)) + 5]
+    : [0, 30];
+
+  if (direction === 'tx') {
+    // --- TX domains ---
+    const poutVals = data.stages.flatMap(s => [
+      s.pout_dbm, s.pout_computed_dbm,
+    ]).filter((v): v is number => v !== null && v !== undefined && isFinite(v));
+    const oip3Vals = data.stages.flatMap(s => [
+      s.oip3_dbm, s.cum_oip3_dbm,
+    ]).filter((v): v is number => v !== null && v !== undefined && isFinite(v));
+
+    const poutDom: [number, number] = poutVals.length > 0
+      ? [Math.min(...poutVals) - 3, Math.max(...poutVals) + 3]
+      : [-20, 30];
+    const oip3Dom: [number, number] = oip3Vals.length > 0
+      ? [Math.min(...oip3Vals) - 3, Math.max(...oip3Vals) + 3]
+      : [0, 50];
+
+    return (
+      <div style={{ marginTop: 18, marginBottom: 20 }}>
+        <div style={{
+          fontFamily: 'Syne', fontSize: 18, fontWeight: 700,
+          color: COLORS.text, marginBottom: 4,
+        }}>
+          TX Cascade Analysis
+          <span style={{
+            marginLeft: 8, fontSize: 10,
+            padding: '2px 8px', borderRadius: 4,
+            background: 'rgba(220,38,38,0.1)',
+            color: COLORS.fail, fontFamily: "'DM Mono', monospace",
+            letterSpacing: 0.5, fontWeight: 600,
+            verticalAlign: 'middle',
+          }}>TRANSMITTER</span>
+        </div>
+        <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 14 }}>
+          Forward-cascade output power + output-referred OIP3 + PAE roll-up
+          across the {tot.stage_count}-stage TX chain
+          {tot.input_power_dbm !== null && tot.input_power_dbm !== undefined
+            ? ` (system input ${fmt(tot.input_power_dbm, 1)} dBm)`
+            : ''}.
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 18 }}>
+          <VerdictPill
+            label="System Pout"
+            pass={v.pout_pass ?? null}
+            detail={
+              tot.pout_dbm !== null && tot.pout_dbm !== undefined
+                ? `${fmt(tot.pout_dbm, 1)} dBm${claims.pout_dbm !== null && claims.pout_dbm !== undefined
+                    ? ` vs ${fmt(claims.pout_dbm, 1)} claim (${fmt(v.pout_headroom_db, 1, ' dB')})`
+                    : ''}`
+                : 'no data'
+            }
+          />
+          <VerdictPill
+            label="Total Gain"
+            pass={v.gain_pass}
+            detail={
+              tot.gain_db !== null
+                ? `${fmt(tot.gain_db, 1)} dB${claims.total_gain_db !== null
+                    ? ` vs ${fmt(claims.total_gain_db, 1)} claim (Δ ${fmt(v.gain_delta_db, 1, ' dB')})`
+                    : ''}`
+                : 'no data'
+            }
+          />
+          <VerdictPill
+            label="System OIP3"
+            pass={v.oip3_pass ?? null}
+            detail={
+              tot.oip3_dbm !== null && tot.oip3_dbm !== undefined
+                ? `${fmt(tot.oip3_dbm, 1)} dBm${claims.oip3_dbm !== null && claims.oip3_dbm !== undefined
+                    ? ` vs ${fmt(claims.oip3_dbm, 1)} claim`
+                    : ''}`
+                : 'no data'
+            }
+          />
+          <VerdictPill
+            label="System PAE"
+            pass={v.pae_pass ?? null}
+            detail={
+              tot.pae_pct !== null && tot.pae_pct !== undefined
+                ? `${fmt(tot.pae_pct, 1)} %${claims.pae_pct !== null && claims.pae_pct !== undefined
+                    ? ` vs ${fmt(claims.pae_pct, 1)} % claim`
+                    : ''}`
+                : 'no data'
+            }
+          />
+          <VerdictPill
+            label="Compression"
+            pass={v.no_compression ?? null}
+            detail={
+              (tot.compression_warnings && tot.compression_warnings.length > 0)
+                ? `${tot.compression_warnings.length} stage(s) over Pout spec`
+                : 'all stages within Pout spec'
+            }
+          />
+        </div>
+
+        <StageChart
+          stages={data.stages}
+          metric="Pout"
+          unit="dBm"
+          domain={poutDom}
+          color={COLORS.bar_iip3}
+          title="Output Power Cascade"
+          subtitle="Per-stage Pout spec vs. cumulative drive level (diamond) propagating from system input."
+          accessor={s => s.pout_dbm ?? null}
+          cumAccessor={s => s.pout_computed_dbm ?? null}
+          claim={claims.pout_dbm ?? null}
+        />
+        <StageChart
+          stages={data.stages}
+          metric="Gain"
+          unit="dB"
+          domain={gainDom}
+          color={COLORS.bar_gain}
+          title="Gain Cascade"
+          subtitle="Per-stage gain accumulating forward. Passive elements (harmonic filters, isolators) shown as negative."
+          accessor={s => s.gain_db}
+          cumAccessor={s => s.cum_gain_db}
+          claim={claims.total_gain_db}
+        />
+        <StageChart
+          stages={data.stages}
+          metric="OIP3"
+          unit="dBm"
+          domain={oip3Dom}
+          color={COLORS.bar_nf}
+          title="Output IP3 Cascade"
+          subtitle="Per-stage OIP3 vs. cumulative system OIP3 referred to each stage's output. Last-stage dominance."
+          accessor={s => s.oip3_dbm ?? null}
+          cumAccessor={s => s.cum_oip3_dbm ?? null}
+          claim={claims.oip3_dbm ?? null}
+        />
+      </div>
+    );
+  }
+
+  // --- Receiver (default) ---
   const nfVals = data.stages.flatMap(s => [
     s.nf_db, s.cum_nf_db,
   ]).filter((v): v is number => v !== null && isFinite(v));
@@ -319,19 +497,12 @@ export default function CascadeChart({ projectId, color: _color }: Props) {
     s.iip3_dbm, s.cum_iip3_dbm,
   ]).filter((v): v is number => v !== null && isFinite(v));
 
-  const gainDom: [number, number] = gainVals.length > 0
-    ? [Math.min(0, Math.min(...gainVals) - 2), Math.max(0, Math.max(...gainVals)) + 5]
-    : [0, 30];
   const nfDom: [number, number] = nfVals.length > 0
     ? [0, Math.max(...nfVals) + 2]
     : [0, 10];
   const iip3Dom: [number, number] = iip3Vals.length > 0
     ? [Math.min(...iip3Vals) - 5, Math.max(...iip3Vals) + 5]
     : [-20, 30];
-
-  const tot = data.totals;
-  const v = data.verdict;
-  const claims = data.claims;
 
   return (
     <div style={{ marginTop: 18, marginBottom: 20 }}>
@@ -352,10 +523,10 @@ export default function CascadeChart({ projectId, color: _color }: Props) {
       }}>
         <VerdictPill
           label="System NF"
-          pass={v.nf_pass}
+          pass={v.nf_pass ?? null}
           detail={
-            tot.nf_db !== null
-              ? `${fmt(tot.nf_db, 2)} dB${claims.nf_db !== null
+            tot.nf_db !== null && tot.nf_db !== undefined
+              ? `${fmt(tot.nf_db, 2)} dB${claims.nf_db !== null && claims.nf_db !== undefined
                   ? ` vs ${fmt(claims.nf_db, 2)} claim (${fmt(v.nf_headroom_db, 2, ' dB')} headroom)`
                   : ''}`
               : 'no data'
@@ -374,10 +545,10 @@ export default function CascadeChart({ projectId, color: _color }: Props) {
         />
         <VerdictPill
           label="Cascade IIP3"
-          pass={v.iip3_pass}
+          pass={v.iip3_pass ?? null}
           detail={
-            tot.iip3_dbm !== null
-              ? `${fmt(tot.iip3_dbm, 1)} dBm${claims.iip3_dbm !== null
+            tot.iip3_dbm !== null && tot.iip3_dbm !== undefined
+              ? `${fmt(tot.iip3_dbm, 1)} dBm${claims.iip3_dbm !== null && claims.iip3_dbm !== undefined
                   ? ` vs ${fmt(claims.iip3_dbm, 1)} claim (${fmt(v.iip3_headroom_db, 1, ' dB')} headroom)`
                   : ''}`
               : 'no data'
@@ -395,7 +566,7 @@ export default function CascadeChart({ projectId, color: _color }: Props) {
         subtitle="Per-stage NF vs. cumulative cascade NF (Friis: later stages divided by preceding gain)."
         accessor={s => s.nf_db}
         cumAccessor={s => s.cum_nf_db}
-        claim={claims.nf_db}
+        claim={claims.nf_db ?? null}
       />
       <StageChart
         stages={data.stages}
@@ -419,7 +590,7 @@ export default function CascadeChart({ projectId, color: _color }: Props) {
         subtitle="Per-stage IIP3 referred to that stage's input vs. cascade IIP3 referred to system input."
         accessor={s => s.iip3_dbm}
         cumAccessor={s => s.cum_iip3_dbm}
-        claim={claims.iip3_dbm}
+        claim={claims.iip3_dbm ?? null}
       />
     </div>
   );

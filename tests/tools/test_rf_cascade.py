@@ -1,4 +1,4 @@
-"""Tests for tools/rf_cascade.py — Friis cascade analysis."""
+"""Tests for tools/rf_cascade.py — RX Friis + TX forward cascade."""
 from __future__ import annotations
 
 import math
@@ -9,6 +9,7 @@ from tools.rf_cascade import compute_cascade, extract_stages
 
 
 def _stage(part, cat, nf=None, gain=None, iip3=None):
+    """RX-flavoured stage (NF + gain + IIP3)."""
     specs = {}
     if nf is not None:
         specs["nf_db"] = nf
@@ -16,6 +17,26 @@ def _stage(part, cat, nf=None, gain=None, iip3=None):
         specs["gain_db"] = gain
     if iip3 is not None:
         specs["iip3_dbm"] = iip3
+    return {
+        "part_number": part, "category": cat,
+        "component_name": part,
+        "key_specs": specs,
+    }
+
+
+def _tx_stage(part, cat, gain=None, oip3=None, pout=None, pae=None, pdc=None):
+    """TX-flavoured stage — gain + output-referred OIP3 + Pout + optional PAE."""
+    specs = {}
+    if gain is not None:
+        specs["gain_db"] = gain
+    if oip3 is not None:
+        specs["oip3_dbm"] = oip3
+    if pout is not None:
+        specs["pout_dbm"] = pout
+    if pae is not None:
+        specs["pae_pct"] = pae
+    if pdc is not None:
+        specs["pdc_w"] = pdc
     return {
         "part_number": part, "category": cat,
         "component_name": part,
@@ -175,6 +196,12 @@ class TestEdgeCases:
         assert v["gain_pass"] is None
         assert v["iip3_pass"] is None
 
+    def test_direction_defaults_to_rx(self):
+        """Omitting `direction` must keep the existing RX behaviour."""
+        r = compute_cascade([_stage("LNA", "RF-LNA", nf=1.5, gain=15)])
+        assert r.get("direction") == "rx"
+        assert "nf_db" in r["totals"]
+
     def test_cumulative_values_monotonic(self):
         """Cumulative gain should increase (or stay flat on passive loss)
         across stages; cumulative NF should never decrease."""
@@ -191,3 +218,191 @@ class TestEdgeCases:
         # NF: monotone non-decreasing
         for a, b in zip(cum_nf, cum_nf[1:]):
             assert b >= a - 1e-6
+
+
+# ===========================================================================
+# Transmitter cascade
+# ===========================================================================
+
+class TestTxForwardCascade:
+
+    def test_single_pa_pout_equals_pin_plus_gain(self):
+        """TX: one PA with G=30 dB, Pin=-10 dBm → Pout=+20 dBm."""
+        r = compute_cascade(
+            [_tx_stage("PA1", "RF-PA", gain=30, pout=25, oip3=35)],
+            direction="tx", input_power_dbm=-10.0,
+        )
+        assert r["direction"] == "tx"
+        assert r["totals"]["pout_dbm"] == pytest.approx(20.0, abs=1e-6)
+        assert r["totals"]["gain_db"] == pytest.approx(30.0, abs=1e-6)
+
+    def test_chain_pout_accumulates(self):
+        """Driver (G=15 dB) → PA (G=30 dB), Pin=-20 dBm → Pout=+25 dBm."""
+        r = compute_cascade(
+            [
+                _tx_stage("DRV", "RF-Driver", gain=15, oip3=25),
+                _tx_stage("PA",  "RF-PA",     gain=30, oip3=45, pout=40),
+            ],
+            direction="tx", input_power_dbm=-20.0,
+        )
+        assert r["totals"]["pout_dbm"] == pytest.approx(25.0, abs=1e-6)
+        # Each stage carries its own Pin/Pout_computed
+        assert r["stages"][0]["pin_dbm"] == pytest.approx(-20.0)
+        assert r["stages"][0]["pout_computed_dbm"] == pytest.approx(-5.0)
+        assert r["stages"][1]["pin_dbm"] == pytest.approx(-5.0)
+        assert r["stages"][1]["pout_computed_dbm"] == pytest.approx(25.0)
+
+    def test_last_stage_oip3_dominates(self):
+        """TX: 1/OIP3_sys = Σ 1/(G_after_k · OIP3_k,out). The PA's OIP3
+        isn't attenuated forward (G_after=1), and a well-chosen driver
+        that's ≥10 dB more linear than the PA-referred-forward won't
+        drag the system below the PA. Textbook: system OIP3 ≈ PA OIP3
+        when driver is linear enough."""
+        # Driver OIP3=30 dBm = 1 W, G_after_drv=100 (PA gain 20 dB)
+        #   reciprocal contribution: 1/(100·1) = 1e-2
+        # PA OIP3=40 dBm = 10 W, G_after=1
+        #   reciprocal contribution: 1/(1·10) = 0.1
+        # Sum = 0.11  →  OIP3_sys_w = 9.09 W  →  OIP3_sys_dbm = 39.6 dBm
+        r = compute_cascade(
+            [
+                _tx_stage("DRV", "RF-Driver", gain=20, oip3=30),
+                _tx_stage("PA",  "RF-PA",     gain=20, oip3=40),
+            ],
+            direction="tx", input_power_dbm=-20.0,
+        )
+        oip3 = r["totals"]["oip3_dbm"]
+        assert oip3 is not None
+        assert 39.0 <= oip3 <= 40.0
+
+    def test_pa_dominates_when_driver_linear(self):
+        """When the driver has far higher OIP3 than the PA (after gain
+        propagation), the final PA dominates — the 'last stage wins' case."""
+        r = compute_cascade(
+            [
+                _tx_stage("DRV", "RF-Driver", gain=15, oip3=50),  # very linear
+                _tx_stage("PA",  "RF-PA",     gain=25, oip3=40),  # PA IS the bottleneck
+            ],
+            direction="tx", input_power_dbm=-20.0,
+        )
+        oip3 = r["totals"]["oip3_dbm"]
+        assert oip3 is not None
+        # PA output-referred OIP3 = 40 dBm. Driver's reflected forward:
+        #  50 dBm + 25 dB = +75 dBm equivalent OIP3 at system output.
+        #  Recip sum ≈ 1/10^4 (PA) + 1/10^7.5 (driver) ≈ 1/10^4
+        #  → OIP3_sys ≈ 40 dBm
+        assert 39.5 <= oip3 <= 40.5
+
+    def test_compression_warning_when_drive_exceeds_pout_spec(self):
+        """PA spec says Pout=+30 dBm but the computed drive is +35 dBm."""
+        r = compute_cascade(
+            [
+                _tx_stage("DRV", "RF-Driver", gain=20, pout=15),
+                _tx_stage("PA",  "RF-PA",     gain=25, pout=30),  # claim 30 dBm max
+            ],
+            direction="tx", input_power_dbm=-10.0,
+        )
+        # Drive into PA: -10 + 20 = +10 dBm. PA output: +10 + 25 = +35 dBm.
+        # PA spec says Pout_max = 30 dBm → 5 dB over spec → warning
+        assert r["stages"][1]["compression_warning"] is True
+        assert r["totals"]["compression_warnings"]
+        assert r["verdict"]["no_compression"] is False
+
+    def test_no_compression_when_within_spec(self):
+        r = compute_cascade(
+            [
+                _tx_stage("DRV", "RF-Driver", gain=15, pout=20),
+                _tx_stage("PA",  "RF-PA",     gain=20, pout=40),
+            ],
+            direction="tx", input_power_dbm=-10.0,
+        )
+        assert r["verdict"]["no_compression"] is True
+        assert all(not s["compression_warning"] for s in r["stages"])
+
+    def test_system_pae_from_pdc_roll_up(self):
+        """System PAE = (Pout - Pin) / sum(Pdc). Pout=+30 dBm (1 W),
+        Pin=-10 dBm (0.1 mW), sum Pdc=3 W → PAE ≈ 33 %."""
+        r = compute_cascade(
+            [
+                _tx_stage("DRV", "RF-Driver", gain=20, pout=15, pae=30, pdc=0.5),
+                _tx_stage("PA",  "RF-PA",     gain=20, pout=40, pae=45, pdc=2.5),
+            ],
+            direction="tx", input_power_dbm=-10.0,
+        )
+        pae = r["totals"]["pae_pct"]
+        # (1 W - 0.0001 W) / 3 W = 33.3 %
+        assert pae == pytest.approx(33.3, abs=1.0)
+        assert r["totals"]["pdc_total_w"] == pytest.approx(3.0, abs=1e-6)
+
+    def test_pae_falls_back_to_arithmetic_mean_without_pdc(self):
+        """When Pdc isn't populated per stage, system PAE is the mean
+        of per-stage PAE values — rough but useful."""
+        r = compute_cascade(
+            [
+                _tx_stage("DRV", "RF-Driver", gain=15, pae=20),
+                _tx_stage("PA",  "RF-PA",     gain=25, pae=50),
+            ],
+            direction="tx", input_power_dbm=-10.0,
+        )
+        assert r["totals"]["pae_pct"] == pytest.approx(35.0, abs=0.1)
+
+    def test_tx_verdicts_pout_oip3_pae(self):
+        r = compute_cascade(
+            [
+                _tx_stage("DRV", "RF-Driver", gain=15, oip3=30),
+                _tx_stage("PA",  "RF-PA",     gain=25, oip3=45, pout=42, pae=45, pdc=5.0),
+            ],
+            direction="tx", input_power_dbm=-10.0,
+            claimed_pout_dbm=30.0,
+            claimed_oip3_dbm=40.0,
+            claimed_total_gain_db=40.0,
+            claimed_pae_pct=40.0,
+        )
+        v = r["verdict"]
+        # Pout computed = -10 + 15 + 25 = +30 dBm ≈ claim → pass
+        assert v["pout_pass"] is True
+        # OIP3 math (output-referred):
+        #   Driver OIP3=30 dBm=1 W, G_after=316.2 → recip = 1/(316.2·1) = 0.00316
+        #   PA OIP3=45 dBm=31.6 W, G_after=1      → recip = 1/(1·31.6)  = 0.0316
+        #   Sum = 0.0348 → OIP3_sys_w = 28.74 W → 44.6 dBm
+        # 44.6 ≥ 40 claim → pass
+        assert v["oip3_pass"] is True
+        assert v["gain_pass"] is True
+        # PAE measured = (1 W - 0.1 mW) / 5 W ≈ 20 % vs claim 40 % → fail
+        assert v["pae_pass"] is False
+
+    def test_tx_no_claims_means_verdicts_none(self):
+        r = compute_cascade(
+            [_tx_stage("PA", "RF-PA", gain=20, pout=30)],
+            direction="tx",
+        )
+        v = r["verdict"]
+        assert v["pout_pass"] is None
+        assert v["oip3_pass"] is None
+        assert v["pae_pass"] is None
+        assert v["gain_pass"] is None
+
+    def test_tx_empty_components(self):
+        r = compute_cascade([], direction="tx")
+        assert r["direction"] == "tx"
+        assert r["totals"]["stage_count"] == 0
+        assert r["totals"]["pout_dbm"] is None
+
+    def test_tx_passive_filter_after_pa_reduces_output(self):
+        """A harmonic filter after the PA with IL=1 dB pulls Pout down."""
+        r = compute_cascade(
+            [
+                _tx_stage("PA",  "RF-PA",     gain=25, oip3=40),
+                {"part_number": "HARMFILT", "category": "RF-Filter",
+                 "key_specs": {"insertion_loss_db": 1.0}},
+            ],
+            direction="tx", input_power_dbm=0.0,
+        )
+        assert r["totals"]["pout_dbm"] == pytest.approx(24.0, abs=1e-6)
+
+    def test_bogus_direction_falls_back_to_rx(self):
+        """Garbage `direction` must not crash — default to RX."""
+        r = compute_cascade(
+            [_stage("LNA", "RF-LNA", nf=1.5, gain=15)],
+            direction="banana",  # type: ignore[arg-type]
+        )
+        assert r["direction"] == "rx"

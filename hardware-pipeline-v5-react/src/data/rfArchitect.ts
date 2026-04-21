@@ -29,7 +29,7 @@ export interface ProjectTypeDef {
 
 export const PROJECT_TYPES: Record<string, ProjectTypeDef> = {
   receiver:     { id: 'receiver',     name: 'Receiver',     desc: 'Antenna → signal capture + conditioning + (optional) digitisation.',   examples: 'Receiver 5-18 GHz wideband · X-band radar RX · Ku-band SATCOM downconverter', supported: true },
-  transmitter:  { id: 'transmitter',  name: 'Transmitter',  desc: 'Signal generation + amplification + spectral cleanup.',                examples: 'Transmitter 2-8 GHz PA chain · S-band radar TX · Ku-band uplink',             supported: false },
+  transmitter:  { id: 'transmitter',  name: 'Transmitter',  desc: 'Signal generation + amplification + spectral cleanup.',                examples: 'Transmitter 2-8 GHz PA chain · S-band radar TX · Ku-band uplink',             supported: true },
   transceiver:  { id: 'transceiver',  name: 'Transceiver',  desc: 'Combined TX + RX — shared LO / antenna.',                              examples: 'SDR TRX 70 MHz-6 GHz · 5G NR front-end · Half-duplex comms link',             supported: false },
   power_supply: { id: 'power_supply', name: 'Power Supply', desc: 'DC-DC conversion — buck / boost / LLC / flyback topology.',            examples: 'DC-DC 24V → 5V, 10A · Dual-rail ±12V / 3A · PoE-PD 30W',                      supported: false },
 };
@@ -69,8 +69,17 @@ export interface ArchDef {
   name: string;
   desc: string;
   scopes: DesignScope[];
-  category: 'linear' | 'detector';
+  /** Topology family:
+   *  - linear / detector  → receiver (baseline wiring)
+   *  - tx_linear          → transmitter (linear PA chains — Class A/AB, Doherty, DPD)
+   *  - tx_saturated       → transmitter (saturated PAs — Class C/E/F, radar pulse)
+   *  - tx_upconversion    → transmitter (IQ mod or mixer-based up-convert front-end) */
+  category: 'linear' | 'detector' | 'tx_linear' | 'tx_saturated' | 'tx_upconversion';
   apps_required?: string[];
+  /** Which project_type this architecture is offered under. Defaults to
+   *  'receiver' for backward compatibility — only the new TX topologies
+   *  need to declare themselves. */
+  project_type?: 'receiver' | 'transmitter';
 }
 
 export const ALL_ARCHITECTURES: ArchDef[] = [
@@ -99,6 +108,27 @@ export const ALL_ARCHITECTURES: ArchDef[] = [
   { id: 'log_video',          name: 'Log-Video Detector',     desc: 'Log-amp detector — wide instantaneous dynamic range, no phase info.',   scopes: ['front-end','full'], category: 'detector', apps_required: ['ew'] },
 
   { id: 'recommend',          name: 'Not sure — you recommend', desc: 'Architect picks based on your specs + application.', scopes: ['front-end','downconversion','dsp','full'], category: 'linear' },
+
+  /* ============================================================
+     Transmitter architectures (project_type="transmitter").
+     Split by linearity regime + front-end topology.
+     ============================================================ */
+
+  /* Linear TX PA chains */
+  { id: 'tx_driver_pa_classab',  name: 'Driver + PA (Class A/AB)',                desc: 'Pre-driver → driver → linear Class-A/AB PA. Baseline comms / SATCOM.',     scopes: ['front-end','full'], category: 'tx_linear',       project_type: 'transmitter' },
+  { id: 'tx_doherty',            name: 'Doherty PA',                              desc: 'Main + peaking PA with 90° load-modulation network — high PAE at backoff.', scopes: ['front-end','full'], category: 'tx_linear',       project_type: 'transmitter' },
+  { id: 'tx_dpd_linearized',     name: 'DPD-Linearized PA',                       desc: 'Digital predistortion feedback path for EVM / ACLR in 5G NR, wideband LTE.', scopes: ['full'],             category: 'tx_linear',       project_type: 'transmitter' },
+
+  /* Saturated / high-efficiency TX */
+  { id: 'tx_class_c_pulsed',     name: 'Class-C / E / F Saturated PA',            desc: 'Non-linear, high-efficiency. Radar pulse, ISM, CW beacons, EW denial.',       scopes: ['front-end','full'], category: 'tx_saturated',    project_type: 'transmitter', apps_required: ['radar','ew','instr','custom'] },
+  { id: 'tx_pulse_radar',        name: 'Radar Pulsed PA Chain',                   desc: 'Driver → solid-state PA with gated bias for radar pulse shaping.',             scopes: ['full'],             category: 'tx_saturated',    project_type: 'transmitter', apps_required: ['radar'] },
+
+  /* Upconversion TX front ends */
+  { id: 'tx_iq_mod_upconvert',   name: 'IQ-Modulator Upconvert Chain',            desc: 'Baseband I/Q → IQ modulator → driver → PA. Direct-upconvert for comms.',   scopes: ['downconversion','full'], category: 'tx_upconversion', project_type: 'transmitter' },
+  { id: 'tx_superhet_upconvert', name: 'Superhet TX (IF → Mixer → PA)',           desc: 'IF source → upconverter mixer → IF/RF filter → driver → PA. Classical SATCOM TX.', scopes: ['downconversion','full'], category: 'tx_upconversion', project_type: 'transmitter' },
+  { id: 'tx_direct_dac',         name: 'Direct-DAC Synthesis → PA',               desc: 'RF DAC emits the signal directly, feeding driver → PA. Minimal analog.',     scopes: ['dsp','full'],       category: 'tx_upconversion', project_type: 'transmitter' },
+
+  { id: 'tx_recommend',          name: 'Not sure — you recommend',                desc: 'Architect picks the TX topology from your specs + application.',               scopes: ['front-end','downconversion','dsp','full'], category: 'tx_linear', project_type: 'transmitter' },
 ];
 
 /* ================================================================
@@ -505,6 +535,30 @@ export function filterArchByScopeAndApp(scope: DesignScope, appId: string): {
     return ak - bk;
   };
   return { linear: linear.slice().sort(sortFn), detector: detector.slice().sort(sortFn), hidden, strong };
+}
+
+/**
+ * Transmitter architecture filter — symmetric to `filterArchByScopeAndApp`
+ * but returns the TX-specific topologies. Grouped by linearity regime:
+ *   - `linear_pa`    Class-A/AB, Doherty, DPD-linearised
+ *   - `saturated_pa` Class-C/E/F, pulsed radar
+ *   - `upconvert`    IQ-mod, superhet, direct-DAC front ends
+ * Currently unused by the wizard (TX UI is pending) but exported so the
+ * future TX wizard can import it without another schema change.
+ */
+export function filterTxArchByScopeAndApp(scope: DesignScope, appId: string): {
+  linear_pa: ArchDef[]; saturated_pa: ArchDef[]; upconvert: ArchDef[]; hidden: ArchDef[]; strong: string[];
+} {
+  const tx = ALL_ARCHITECTURES.filter(a => a.project_type === 'transmitter');
+  const inScope = (a: ArchDef) => a.scopes.includes(scope)
+    && (!a.apps_required || a.apps_required.includes(appId));
+  const linear_pa    = tx.filter(a => a.category === 'tx_linear'       && inScope(a));
+  const saturated_pa = tx.filter(a => a.category === 'tx_saturated'    && inScope(a));
+  const upconvert    = tx.filter(a => a.category === 'tx_upconversion' && inScope(a));
+  const hidden       = tx.filter(a => !a.scopes.includes(scope));
+  const app = APPLICATIONS.find(a => a.id === appId);
+  const strong = app ? app.strong_for : [];
+  return { linear_pa, saturated_pa, upconvert, hidden, strong };
 }
 
 export function resolveDeepDiveQs(state: WizardState): { dive: DeepDiveDef | null; qs: DeepDiveQ[] } {

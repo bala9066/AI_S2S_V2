@@ -2651,11 +2651,38 @@ class RequirementsAgent(BaseAgent):
             import json as _json
             from tools.rf_cascade import compute_cascade
             dp = tool_input.get("design_parameters") or {}
+            # Direction: RX (default) / TX. Derived in priority order:
+            #   1. Explicit design_parameters.direction from wizard
+            #   2. project_type == "transmitter" (once wizard is wired)
+            #   3. Heuristic: any stage has pout_dbm or oip3_dbm → TX
+            direction = str(
+                dp.get("direction")
+                or dp.get("project_type")
+                or tool_input.get("project_type")
+                or ""
+            ).strip().lower()
+            if direction not in ("rx", "tx"):
+                # Heuristic fallback
+                comps = tool_input.get("component_recommendations") or []
+                has_tx_spec = any(
+                    (c.get("key_specs") or {}).get("pout_dbm") is not None
+                    or (c.get("key_specs") or {}).get("oip3_dbm") is not None
+                    or c.get("pout_dbm") is not None
+                    or c.get("oip3_dbm") is not None
+                    for c in comps if isinstance(c, dict)
+                )
+                direction = "tx" if has_tx_spec else "rx"
+
             cascade = compute_cascade(
                 tool_input.get("component_recommendations") or [],
+                direction=direction,
                 claimed_nf_db=dp.get("noise_figure_db"),
                 claimed_iip3_dbm=dp.get("iip3_dbm_input") or dp.get("iip3_dbm"),
                 claimed_total_gain_db=dp.get("total_gain_db"),
+                claimed_pout_dbm=dp.get("pout_dbm") or dp.get("output_power_dbm"),
+                claimed_oip3_dbm=dp.get("oip3_dbm"),
+                claimed_pae_pct=dp.get("pae_pct"),
+                input_power_dbm=float(dp.get("tx_input_power_dbm") or -20.0),
             )
             cascade_file = output_path / "cascade_analysis.json"
             cascade_file.write_text(_json.dumps(cascade, indent=2), encoding="utf-8")
