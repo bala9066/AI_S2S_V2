@@ -352,6 +352,57 @@ class TestTxCascadeAudit:
         )
 
 
+class TestPaThermalWiring:
+
+    def test_run_all_includes_thermal_overrun_on_tx_project(self, monkeypatch):
+        monkeypatch.setenv("SKIP_DISTRIBUTOR_LOOKUP", "1")
+        monkeypatch.setenv("SKIP_DATASHEET_VERIFY", "1")
+        from services.rf_audit import run_all
+        tool_input = {
+            "block_diagram_mermaid": (
+                "flowchart LR\n"
+                "  BB[Baseband] --> DRV[Driver] --> PA[PA]\n"
+                "  PA --> HF[Harmonic Filter] --> ANT[Antenna]\n"
+            ),
+            "component_recommendations": [
+                # GaN 50 W at 40 % PAE with the default (bad) heatsink
+                # → computed Tj ~ 370 °C → critical overrun
+                {"part_number": "QPD1013", "category": "RF-PA",
+                 "key_specs": {"technology": "GaN",
+                               "pdc_w": 50.0, "pae_pct": 40.0,
+                               "pout_dbm": 43}},
+            ],
+            "design_parameters": {
+                "direction": "tx",
+                "ambient_temp_c": 25.0,
+            },
+        }
+        _, issues = run_all(tool_input, architecture="tx_driver_pa_classab")
+        assert any(i.category == "pa_thermal_overrun" for i in issues)
+
+    def test_run_all_skips_thermal_on_rx_project(self, monkeypatch):
+        monkeypatch.setenv("SKIP_DISTRIBUTOR_LOOKUP", "1")
+        monkeypatch.setenv("SKIP_DATASHEET_VERIFY", "1")
+        from services.rf_audit import run_all
+        # Even with a "PA"-labelled component, RX direction skips the
+        # thermal check (receivers don't have a PA anyway).
+        tool_input = {
+            "block_diagram_mermaid":
+                "flowchart LR\n  ANT[Antenna] --> LNA[LNA] --> OUT[Out]",
+            "component_recommendations": [
+                {"part_number": "LNA1", "category": "RF-LNA",
+                 "key_specs": {"nf_db": 1.5, "gain_db": 15}},
+            ],
+            "design_parameters": {"direction": "rx"},
+        }
+        _, issues = run_all(tool_input, architecture="std_lna_filter")
+        assert not any(
+            i.category in ("pa_thermal_overrun", "pa_thermal_derating",
+                           "pa_thermal_unknown")
+            for i in issues
+        )
+
+
 class TestBomLinkageWiring:
 
     def test_run_all_flags_missing_bom_part_when_nodes_supplied(self, monkeypatch):

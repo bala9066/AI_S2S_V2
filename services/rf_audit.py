@@ -615,6 +615,49 @@ def run_tx_cascade_audit(
     return issues
 
 
+def run_pa_thermal_audit(
+    component_recommendations: list[dict[str, Any]],
+    design_parameters: Optional[dict[str, Any]],
+) -> list[AuditIssue]:
+    """PA junction-temperature check. Fires only on TX projects where
+    at least one PA carries the data needed (pdc_w + either pout_dbm or
+    pae_pct). Reads ambient + heatsink params from design_parameters
+    when the wizard supplied them; otherwise uses conservative defaults.
+    """
+    if not design_parameters or not component_recommendations:
+        return []
+    direction = str(
+        design_parameters.get("direction")
+        or design_parameters.get("project_type")
+        or ""
+    ).strip().lower()
+    if direction != "tx":
+        return []
+
+    try:
+        from tools.pa_thermal_validator import validate_pa_thermal
+    except Exception:
+        return []
+
+    raw = validate_pa_thermal(
+        list(component_recommendations),
+        ambient_temp_c=float(
+            design_parameters.get("ambient_temp_c")
+            or design_parameters.get("max_ambient_temp_c")
+            or 25.0
+        ),
+        heatsink_theta_sa=(
+            float(design_parameters["heatsink_theta_sa"])
+            if design_parameters.get("heatsink_theta_sa") is not None else None
+        ),
+        case_sink_theta_cs=(
+            float(design_parameters["case_sink_theta_cs"])
+            if design_parameters.get("case_sink_theta_cs") is not None else None
+        ),
+    )
+    return [AuditIssue(**i) for i in raw]
+
+
 def run_bom_linkage_audit(
     component_recommendations: list[dict[str, Any]],
     netlist_nodes: Optional[list[dict[str, Any]]],
@@ -763,7 +806,13 @@ def run_all(
     # report so overall_pass reflects TX-specific failures.
     issues.extend(run_tx_cascade_audit(enriched, dp))
 
-    # 9. BOM ↔ schematic linkage (P2.9) — runs only in P4 context
+    # 9. PA thermal envelope. TX-only. Computes Tj per PA from pdc_w +
+    # (pae_pct or pout_dbm), θ_jc by technology, and the caller-supplied
+    # heatsink θ. Flags critical when Tj > Tj_max, high when inside the
+    # derating margin.
+    issues.extend(run_pa_thermal_audit(enriched, dp))
+
+    # 10. BOM ↔ schematic linkage (P2.9) — runs only in P4 context
     # where `netlist_nodes` exists. Flags missing + invented parts
     # between the BOM and the generated schematic.
     issues.extend(run_bom_linkage_audit(enriched, netlist_nodes))
