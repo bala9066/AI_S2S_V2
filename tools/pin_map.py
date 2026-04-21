@@ -365,6 +365,21 @@ def reject_invalid_components(
                 kept.append(comp)
         sheet["components"] = kept
 
+        # Purge any nets whose endpoints reference a rejected component.
+        # Without this, the React canvas (SheetSchematic.tsx) renders
+        # orphan L-shaped traces to empty grid squares, and the orphan-pin
+        # sidebar flags phantom floating pins that no longer exist in
+        # components[]. KiCad .net export is already safe because edges[]
+        # is pruned below, but schematic.json needs matching treatment.
+        if to_reject:
+            sheet["nets"] = [
+                net for net in (sheet.get("nets") or [])
+                if not any(
+                    str(ep.get("ref") or "").strip() in to_reject
+                    for ep in (net.get("endpoints") or [])
+                )
+            ]
+
     # Mirror the rejection in nodes + edges so downstream KiCad .net
     # generation doesn't emit orphan components.
     if to_reject:
