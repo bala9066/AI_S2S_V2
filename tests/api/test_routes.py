@@ -307,6 +307,67 @@ def test_chat_returns_agent_response(client):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/v1/projects/{id}/export — ZIP download
+# ---------------------------------------------------------------------------
+
+class TestExportProjectZip:
+
+    def _make_project_with_outputs(self, client, tmp_path: Path):
+        """Create a project, then drop two dummy output files in its dir."""
+        p = client.post("/api/v1/projects", json={"name": "ExportTest"}).json()
+        output_dir = Path(p["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "requirements.md").write_text("# Requirements\nhello", encoding="utf-8")
+        (output_dir / "bom.json").write_text('{"parts": []}', encoding="utf-8")
+        return p
+
+    def test_export_returns_zip_when_outputs_exist(self, client, tmp_path):
+        p = self._make_project_with_outputs(client, tmp_path)
+        r = client.get(f"/api/v1/projects/{p['id']}/export")
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "application/zip"
+        assert "attachment" in r.headers["content-disposition"]
+        assert "ExportTest_documents.zip" in r.headers["content-disposition"]
+
+        # Verify the ZIP is well-formed and carries our files
+        import io, zipfile
+        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+            names = set(zf.namelist())
+            assert "requirements.md" in names
+            assert "bom.json" in names
+            assert zf.read("requirements.md").decode() == "# Requirements\nhello"
+
+    def test_export_returns_404_for_missing_project(self, client):
+        r = client.get("/api/v1/projects/999999/export")
+        assert r.status_code == 404
+
+    def test_export_returns_404_for_empty_output_dir(self, client, tmp_path):
+        """Project created but no files written yet — must 404, not empty zip."""
+        p = client.post("/api/v1/projects", json={"name": "EmptyExport"}).json()
+        Path(p["output_dir"]).mkdir(parents=True, exist_ok=True)
+        r = client.get(f"/api/v1/projects/{p['id']}/export")
+        assert r.status_code == 404
+        assert "No documents" in r.json()["detail"]
+
+    def test_export_filename_sanitises_unsafe_chars(self, client, tmp_path):
+        """Slashes / colons / spaces in the project name must not break the
+        Content-Disposition header."""
+        p = client.post(
+            "/api/v1/projects",
+            json={"name": "Weird/Name: with spaces"},
+        ).json()
+        Path(p["output_dir"]).mkdir(parents=True, exist_ok=True)
+        (Path(p["output_dir"]) / "f.md").write_text("x", encoding="utf-8")
+        r = client.get(f"/api/v1/projects/{p['id']}/export")
+        assert r.status_code == 200
+        # No raw slashes / colons / spaces in the filename
+        disp = r.headers["content-disposition"]
+        assert "/" not in disp.split('filename="')[1].rstrip('"')
+        assert ":" not in disp.split('filename="')[1].rstrip('"')
+        assert " " not in disp.split('filename="')[1].rstrip('"')
+
+
+# ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
 
