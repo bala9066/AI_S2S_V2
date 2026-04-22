@@ -4,6 +4,7 @@ import { SCOPE_LABELS } from '../types';
 import { api } from '../api';
 import { ensureMermaid, purgeMermaidScratch, nextMermaidId } from '../utils/mermaid';
 import { sanitizeMermaid } from '../utils/mermaidSanitize';
+import MermaidErrorBoundary from '../components/MermaidErrorBoundary';
 import { parseQuestionsFromAI, shouldShowQuestions, type QuestionCard as QuestionCardType } from '../data/questionSchema';
 import {
   PROJECT_TYPES,
@@ -171,7 +172,11 @@ function renderMarkdown(text: string, color: string): React.ReactNode {
       const codeText = codeLines.join('\n');
 
       if (isMermaid) {
-        elements.push(<MermaidBlock key={`mermaid-${i}`} code={codeText} color={color} />);
+        elements.push(
+          <MermaidErrorBoundary key={`mermaid-${i}`} source={codeText} color={color} label="BLOCK DIAGRAM">
+            <MermaidBlock code={codeText} color={color} />
+          </MermaidErrorBoundary>
+        );
       } else {
         elements.push(
           <div key={`code-${i}`} style={{ margin: '10px 0' }}>

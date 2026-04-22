@@ -21,6 +21,12 @@ import anthropic as _anthropic
 
 from agents.base_agent import BaseAgent, _make_sync_httpx_client
 from config import settings
+from tools.mermaid_render import (
+    MermaidSpecError,
+    render_architecture,
+    render_block_diagram,
+)
+from tools.mermaid_salvage import FALLBACK_DIAGRAM, salvage
 
 # ── Clarification card tool (tool_use forced — zero free-text risk) ──────────
 
@@ -840,9 +846,7 @@ If any of these are missing from your tool call, you MUST add them before submit
 - Use MoSCoW prioritization (Must have, Should have, Could have, Won't have) and IEEE requirement IDs: REQ-HW-001, REQ-HW-002, etc.
 - Make smart engineering assumptions (e.g., if they say "motor controller" assume industrial temp range, common MCUs, standard interfaces)
 - Prioritize RoHS-compliant components with long lifecycle status.
-- For Mermaid diagrams, ALWAYS start with a valid diagram type on the FIRST line (e.g. `flowchart TD`). NEVER put `TD` or `LR` alone on line 2.
-- Keep Mermaid node labels concise — 2-5 words max. STRICT rules: NO angle brackets < >, NO raw HTML, NO &, @, #, |, double-quotes ", single-quotes ', or colons : inside labels. Use plain ASCII only. NO %%{{init}}%% frontmatter. NO %% comments. NEVER use 3 or more consecutive dashes (---) inside a label as they are parsed as edge arrows.
-- Mermaid edge syntax: EVERY edge MUST have an arrow. Pipe-labels `|label|` ONLY appear AFTER an arrow, e.g. `A -->|signal| B`. NEVER write `A |label| B` without the arrow — it is a parse error. Also NEVER put two nodes on the same line without an arrow between them (e.g. `A B[...]` is invalid — it must be `A --> B[...]`). The `end` keyword that closes a `subgraph` MUST be on its own line — never on the same line as another statement.
+- **DIAGRAMS — use the structured `block_diagram` / `architecture` fields.** You emit JSON (direction + nodes + edges + subgraphs); the backend renders guaranteed-valid Mermaid. Do NOT write Mermaid syntax by hand unless the structured schema truly cannot express what you need — the legacy `block_diagram_mermaid` / `architecture_mermaid` string fields are retained only as a last-resort fallback and go through a salvager that produces lower-quality output.
 - **MANDATORY RETRIEVAL STEP — `find_candidate_parts` BEFORE `generate_requirements`:** For every signal-chain stage that ends up in `component_recommendations` (LNA, mixer, filter/preselector, limiter, ADC, DAC, PLL/VCO, LDO, MCU, FPGA, TCXO, etc.), call the `find_candidate_parts` tool FIRST with the canonical `stage` id and a short `spec_hint` (freq range / NF / package / resolution — ~10 words max). You may batch multiple `find_candidate_parts` calls in sequence before emitting `generate_requirements`. When selecting the MPN for each stage you MUST pick from the returned `candidates[].part_number` list and copy `datasheet_url` verbatim from the same candidate. If a stage has zero candidates, widen the hint and call again, or omit the stage — never invent an MPN. Picks that do not trace back to a `find_candidate_parts` result will fail the `not_from_candidate_pool` audit gate.
 - **ANTI-HALLUCINATION RULE**: Do NOT fabricate component part numbers. ONLY use part numbers you are CONFIDENT exist and are currently in production. If unsure, use the manufacturer family name + key specs (e.g., "Analog Devices HMC-series LNA, 2-18 GHz, 2 dB NF") instead of guessing a specific part number. NEVER write TBD, TBC, TBA, or "to be determined/confirmed" anywhere. Every spec value must come from a confirmed requirement or a real datasheet — NEVER invent performance numbers.
 - **LIFECYCLE GATE — NO STALE PARTS**: Every `component_recommendations` entry MUST be a part that is **currently in active production**. You MUST set `lifecycle_status` to "active" for every component; if you cannot confirm the part is in active production (e.g. manufacturer still lists it on its product page without "NRND" / "Not Recommended for New Designs" / "Last Time Buy" / "Obsolete" / "Discontinued" banners), DO NOT recommend it. If a classic part you would normally recommend is now NRND or EOL, pick its successor family instead. Explicitly banned stale parts (DO NOT use these under any circumstances): `HMC-C024`, `HMC-1040`, `HMC1040LP5CE`, `HMC1040LP4E`, `HMC1020LP4E`, `HMC516`, `HMC-C070`, `HMC-C072`, `HMC-ALH435`, `HMC-ALH508`, `MCR03ERTJ201` (Rohm chip resistor — DigiKey discontinued), any Hittite-branded MPNs that begin with `HMC-` followed by a three-digit number and end with the letter `C` (Analog Devices' Hittite acquisition parts from the 2008-2012 catalogue — most are now NRND). **Preferred currently-shipping alternatives (use these families):**
@@ -992,85 +996,232 @@ GENERATE_REQUIREMENTS_TOOL = {
             "block_diagram_mermaid": {
                 "type": "string",
                 "description": (
-                    "Mermaid `flowchart LR` (preferred) RF block diagram. This is "
-                    "an ENGINEERING block diagram, not a process flowchart — every "
-                    "node MUST use a shape that conveys what kind of RF block it "
-                    "is, and EVERY active / passive stage MUST carry its key specs "
-                    "inline in the label.\n"
-                    "\n"
-                    "SHAPE VOCABULARY (use these exact shapes — anything else is wrong):\n"
-                    "  - Antenna  / Output  -> `>Ant1]`  / `>Out]`           (flag — radiator / port)\n"
-                    "  - Connector / SMA / N-type -> `[/SMA/]`               (parallelogram — connector)\n"
-                    "  - PCB trace / cable        -> `[Trace 50Ohm]`         (rectangle — passive interconnect)\n"
-                    "  - Limiter / attenuator pad -> `[/Lim\\]`              (trapezoid — clamp / pad)\n"
-                    "  - LNA / amplifier / buffer / gain block -> `>LNA1]`   (flag — amplifier triangle)\n"
-                    "  - Mixer                    -> `(MIX)`                 (rounded — mixer)\n"
-                    "  - Filter / preselector / BPF / LPF / SAW -> `{{BPF}}` (hexagon — filter)\n"
-                    "  - Bias-T / DC injection    -> `{BiasT}`               (rhombus — DC inject)\n"
-                    "  - Splitter / coupler / combiner -> `{Split}`          (rhombus — power split)\n"
-                    "  - ADC / DAC / digital      -> `[\\ADC\\]`             (parallelogram alt — sampled)\n"
-                    "  - LO / synth / TCXO / OCXO -> `(LO)`                  (rounded — oscillator)\n"
-                    "\n"
-                    "PER-STAGE SPEC ANNOTATION (mandatory): each ACTIVE / PASSIVE "
-                    "node label MUST be `Role / MPN / G+xx NFy.y P1+zz` — a single "
-                    "line, fields separated by ` / `. Use real component values from "
-                    "`component_recommendations`. Example labels:\n"
-                    "  >LNA1 / HMC8410 / G+22 NF1.6 P1+22]\n"
-                    "  {{Preselector / CTF1835-2150-A / IL2.5 BW150}}\n"
-                    "  (MIX / HMC8193 / CG-7 NF10 LO+13)\n"
-                    "  [\\ADC / AD9213 / 10GSPS 12bit ENOB9.5\\]\n"
-                    "  [/Lim / RFLM-422 / IL0.4 P+30max\\]\n"
-                    "  [/SMA-F/]\n"
-                    "Connectors / antennas / PCB traces don't need spec triplets — "
-                    "their type IS the spec.\n"
-                    "\n"
-                    "CASCADE SUMMARY SUBGRAPH (mandatory): emit a SECOND subgraph "
-                    "AFTER the main signal chain, named exactly `subgraph CASCADE "
-                    "[System Cumulative Performance]`, with 4 rectangle nodes "
-                    "showing the totals computed from the BOM:\n"
-                    "  C1[Net Gain +xx dB]\n"
-                    "  C2[System NF y.y dB]\n"
-                    "  C3[Output P1dB +zz dBm]\n"
-                    "  C4[Output IIP3 +ww dBm]\n"
-                    "Use the Friis cascade values from `design_parameters` — do "
-                    "NOT recompute by hand. If a cumulative metric is unknown, "
-                    "OMIT that single node rather than guessing.\n"
-                    "\n"
-                    "CANONICAL RF CHAIN (topology — every receiver MUST include "
-                    "these stages in order): Antenna -> SMA -> Limiter -> "
-                    "Preselector (SAW / ceramic / cavity BPF) -> Bias-T -> LNA -> "
-                    "(splitter / mixer / ADC / etc.). The Preselector is MANDATORY "
-                    "and sits BETWEEN the limiter and the LNA — never omit it, "
-                    "never put it after the LNA.\n"
-                    "MULTI-ANTENNA (N>1): N separate `>AntK]` inputs, each with "
-                    "its own Limiter_i / Preselector_i / Bias-T_i / LNA_i chain. "
-                    "Do NOT combine antennas before the LNA — phase / AoA "
-                    "information must be preserved.\n"
-                    "CHANNELISED FILTER BANK (M channels): the M-way split is PER "
-                    "ANTENNA — each LNA feeds its own 1:M splitter -> M BPFs "
-                    "grouped in `subgraph Filter Bank k`. For N antennas + M "
-                    "channels there are N*M total RF outputs and N independent "
-                    "splitters (NEVER a single shared ChannelSplitter combining "
-                    "antennas).\n"
-                    "HIGH-GAIN STABILITY (> 60 dB cascaded): add a buffer amp OR "
-                    "fixed pad node between major blocks; show per-stage bias "
-                    "decoupling on the power path.\n"
-                    "\n"
-                    "FORBIDDEN: plain `[Rectangle]` boxes for amplifiers / mixers "
-                    "/ filters; multi-line labels using `<br/>` (the renderer "
-                    "strips them); unicode glyphs (Ohm, deg, mu — use ASCII "
-                    "'Ohm', 'deg', 'u'); pipe `|` inside labels (use `/`)."
+                    "LEGACY FALLBACK — prefer the structured `block_diagram` "
+                    "field below. Only populate this if you truly cannot express "
+                    "the topology as structured JSON (e.g. the diagram needs a "
+                    "Mermaid feature not exposed by the structured schema). When "
+                    "you do use it:\n"
+                    "  • Start with `flowchart LR` on line 1.\n"
+                    "  • Node label format: `Role / MPN / G+xx NFy.y P1+zz`.\n"
+                    "  • No %%{{init}}%% frontmatter, no %% comments, no `<br/>`.\n"
+                    "  • ASCII only (`Ohm` not Ω, `deg` not °, `u` not µ).\n"
+                    "  • No `|` inside labels — use `/`. No `<>\"'#@` in labels.\n"
+                    "The backend runs a salvager on any raw Mermaid you emit, but "
+                    "salvaged output is lower-quality than rendered structured "
+                    "output — use `block_diagram` whenever possible."
                 ),
+            },
+            "block_diagram": {
+                "type": "object",
+                "description": (
+                    "STRUCTURED block diagram — PREFERRED over block_diagram_mermaid. "
+                    "Emit a JSON object with `direction`, `nodes`, `edges`, and "
+                    "optional `subgraphs`. The backend renders guaranteed-valid "
+                    "Mermaid — you do NOT write Mermaid syntax directly. Shapes are "
+                    "named enums, labels are plain strings (no escaping needed, "
+                    "backend handles Ohm/deg/mu glyphs).\n"
+                    "\n"
+                    "EXAMPLE (8 GHz RF front-end):\n"
+                    '{"direction": "LR",\n'
+                    ' "nodes": [\n'
+                    '   {"id": "ANT1", "label": "Ant1\\n6-18 GHz", "shape": "flag", "stage": "antenna"},\n'
+                    '   {"id": "SMA1", "label": "SMA-F", "shape": "connector"},\n'
+                    '   {"id": "LIM1", "label": "Lim / RFLM-422 / IL 0.4 P+30max", "shape": "limiter", "stage": "limiter"},\n'
+                    '   {"id": "BPF1", "label": "Preselector / CTF-1835 / IL2.5 BW150", "shape": "filter", "stage": "preselector"},\n'
+                    '   {"id": "LNA1", "label": "LNA1 / HMC8410 / G+22 NF1.6 P1+22", "shape": "amplifier", "stage": "lna"},\n'
+                    '   {"id": "MIX1", "label": "MIX / HMC8193", "shape": "mixer", "stage": "mixer"},\n'
+                    '   {"id": "LO1",  "label": "LO / HMC830 / 5-15 GHz", "shape": "oscillator", "stage": "lo"},\n'
+                    '   {"id": "C_G",  "label": "Net Gain +37 dB", "shape": "rect"},\n'
+                    '   {"id": "C_NF", "label": "System NF 2.1 dB", "shape": "rect"}\n'
+                    ' ],\n'
+                    ' "edges": [\n'
+                    '   {"from": "ANT1", "to": "SMA1"},\n'
+                    '   {"from": "SMA1", "to": "LIM1"},\n'
+                    '   {"from": "LIM1", "to": "BPF1"},\n'
+                    '   {"from": "BPF1", "to": "LNA1"},\n'
+                    '   {"from": "LNA1", "to": "MIX1"},\n'
+                    '   {"from": "LO1",  "to": "MIX1", "label": "LO+13 dBm"}\n'
+                    ' ],\n'
+                    ' "subgraphs": [\n'
+                    '   {"id": "CASCADE", "title": "System Cumulative Performance", "nodes": ["C_G", "C_NF"]}\n'
+                    ' ]}\n'
+                    "\n"
+                    "SHAPES (pick the one that semantically fits):\n"
+                    "  antenna / output   -> \"flag\"\n"
+                    "  SMA / BNC / N-type -> \"connector\"\n"
+                    "  limiter / pad      -> \"limiter\"\n"
+                    "  LNA / PA / buffer / gain block -> \"amplifier\" (or \"flag\")\n"
+                    "  mixer              -> \"mixer\"\n"
+                    "  BPF / LPF / HPF / SAW / ceramic -> \"filter\"\n"
+                    "  bias-T / splitter / combiner / divider -> \"rhombus\"\n"
+                    "  ADC / DAC / digitiser -> \"digital\"\n"
+                    "  LO / TCXO / OCXO / PLL -> \"oscillator\"\n"
+                    "  PCB trace / cable / cumulative-performance box -> \"rect\"\n"
+                    "\n"
+                    "NODE ID RULES: `^[A-Za-z][A-Za-z0-9_]*$` (letters, digits, "
+                    "underscore; must start with a letter). Keep IDs short (`LNA1`, "
+                    "`MIX1`) — they're just references, the human-readable text "
+                    "goes in `label`.\n"
+                    "\n"
+                    "LABEL CONVENTION (every active/passive stage MUST follow): "
+                    "`Role / MPN / G+xx NFy.y P1+zz`. For connectors/antennas/"
+                    "cumulative-performance nodes, use a short descriptive label.\n"
+                    "\n"
+                    "SUBGRAPHS: use exactly one subgraph with id=`CASCADE` and "
+                    "title=`System Cumulative Performance` containing 2-4 `rect` "
+                    "nodes (Net Gain, System NF, Output P1dB, Output IIP3). Use "
+                    "values from `design_parameters` — do not recompute."
+                ),
+                "required": ["direction", "nodes", "edges"],
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "enum": ["LR", "TD", "TB", "RL", "BT"],
+                        "description": "LR for signal-chain receivers, TD for stackups.",
+                    },
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["id", "label", "shape"],
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "^[A-Za-z][A-Za-z0-9_]*$",
+                                },
+                                "label": {"type": "string"},
+                                "shape": {
+                                    "type": "string",
+                                    "enum": [
+                                        "flag", "connector", "rect", "limiter",
+                                        "amplifier", "mixer", "filter", "rhombus",
+                                        "digital", "oscillator", "stadium",
+                                        "subroutine", "cylinder", "circle",
+                                    ],
+                                },
+                                "stage": {
+                                    "type": "string",
+                                    "description": (
+                                        "Optional semantic stage id — "
+                                        "`antenna`, `limiter`, `preselector`, "
+                                        "`lna`, `mixer`, `lo`, `filter`, `adc`, "
+                                        "`dac`, `pa`. Used by auto-fix to swap "
+                                        "banned parts for candidates of the "
+                                        "same stage."
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["from", "to"],
+                            "properties": {
+                                "from": {"type": "string"},
+                                "to": {"type": "string"},
+                                "label": {"type": "string"},
+                                "style": {
+                                    "type": "string",
+                                    "enum": ["solid", "dotted", "thick"],
+                                },
+                            },
+                        },
+                    },
+                    "subgraphs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["id", "title", "nodes"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "title": {"type": "string"},
+                                "nodes": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                },
             },
             "architecture_mermaid": {
                 "type": "string",
                 "description": (
-                    "Mermaid diagram code for the system architecture. "
-                    "Show power domains, signal flow, interfaces. "
-                    "TOPOLOGY REQUIREMENT (same as block_diagram_mermaid): multi-antenna inputs and "
-                    "channelised filter-bank fan-out must be explicit — one node per antenna, one parallel "
-                    "path per filter-bank channel. Do not hide N>1 topology behind a single block."
+                    "LEGACY FALLBACK — prefer the structured `architecture` "
+                    "field. Same topology rules as `block_diagram_mermaid`: "
+                    "N-antenna and M-channel fan-out must be explicit."
                 ),
+            },
+            "architecture": {
+                "type": "object",
+                "description": (
+                    "STRUCTURED system-architecture diagram — PREFERRED over "
+                    "architecture_mermaid. Same schema as `block_diagram` "
+                    "(direction / nodes / edges / subgraphs). Focus on power "
+                    "domains, clock distribution, digital-analog boundary, and "
+                    "external interfaces. For multi-antenna or channelised "
+                    "designs: one node per antenna, one subgraph per channel."
+                ),
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "enum": ["LR", "TD", "TB", "RL", "BT"],
+                    },
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["id", "label", "shape"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "label": {"type": "string"},
+                                "shape": {
+                                    "type": "string",
+                                    "enum": [
+                                        "flag", "connector", "rect", "limiter",
+                                        "amplifier", "mixer", "filter", "rhombus",
+                                        "digital", "oscillator", "stadium",
+                                        "subroutine", "cylinder", "circle",
+                                    ],
+                                },
+                                "stage": {"type": "string"},
+                            },
+                        },
+                    },
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["from", "to"],
+                            "properties": {
+                                "from": {"type": "string"},
+                                "to": {"type": "string"},
+                                "label": {"type": "string"},
+                                "style": {
+                                    "type": "string",
+                                    "enum": ["solid", "dotted", "thick"],
+                                },
+                            },
+                        },
+                    },
+                    "subgraphs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["id", "title", "nodes"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "title": {"type": "string"},
+                                "nodes": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                },
             },
             "component_recommendations": {
                 "type": "array",
@@ -3361,16 +3512,27 @@ class RequirementsAgent(BaseAgent):
         req_file.write_text(req_content, encoding="utf-8")
         outputs["requirements.md"] = req_content
 
-        # 2. block_diagram.md
-        block_mermaid = tool_input.get("block_diagram_mermaid", "")
+        # 2. block_diagram.md — prefer structured spec; fall back to salvaged raw text
+        block_mermaid = self._render_diagram_field(
+            tool_input,
+            structured_key="block_diagram",
+            raw_key="block_diagram_mermaid",
+            default_direction="LR",
+        )
         block_mermaid = self._reflow_long_mermaid(block_mermaid)
         block_content = _scrub(f"# System Block Diagram\n## {project_name}\n\n```mermaid\n{block_mermaid}\n```\n")
         block_file = output_path / "block_diagram.md"
         block_file.write_text(block_content, encoding="utf-8")
         outputs["block_diagram.md"] = block_content
 
-        # 3. architecture.md
-        arch_mermaid = tool_input.get("architecture_mermaid", "")
+        # 3. architecture.md — same pipeline as block_diagram (structured → salvage)
+        arch_mermaid = self._render_diagram_field(
+            tool_input,
+            structured_key="architecture",
+            raw_key="architecture_mermaid",
+            default_direction="TD",
+            allow_empty=True,
+        )
         arch_mermaid = self._reflow_long_mermaid(arch_mermaid)
         if arch_mermaid:
             arch_content = f"# System Architecture\n## {project_name}\n\n```mermaid\n{arch_mermaid}\n```\n"
@@ -7571,6 +7733,61 @@ typical passive/active bands).</p>
         if out == mermaid_src:
             out = re.sub(r"^(\s*)graph\s+LR\b", r"\1graph TD", mermaid_src, count=1, flags=re.MULTILINE)
         return out
+
+    def _render_diagram_field(
+        self,
+        tool_input: dict,
+        *,
+        structured_key: str,
+        raw_key: str,
+        default_direction: str = "LR",
+        allow_empty: bool = False,
+    ) -> str:
+        """Single source of truth for turning either a structured `block_diagram`
+        spec OR a raw `block_diagram_mermaid` string into a guaranteed-parseable
+        Mermaid document.
+
+        Preference order:
+          1. `structured_key` (dict spec) — rendered by `render_block_diagram`.
+             If rendering raises `MermaidSpecError` we log and fall through to (2).
+          2. `raw_key` (raw LLM Mermaid) — run through `salvage()` which fixes
+             the most common LLM syntax mistakes (bare shapes, em-dash arrows,
+             frontmatter, unclosed brackets). If salvage cannot produce valid
+             output it returns a safe fallback diagram.
+          3. If both paths fail and `allow_empty` is True, return an empty string
+             so the caller can render a "diagram will be generated with HRS"
+             placeholder instead of an ugly fallback.
+
+        Every path returns ASCII-safe Mermaid — unicode glyphs, edge labels,
+        pipe chars, and unclosed brackets are all handled deterministically."""
+
+        structured = tool_input.get(structured_key)
+        if isinstance(structured, dict) and structured.get("nodes"):
+            try:
+                if structured_key == "architecture":
+                    return render_architecture(structured, raise_on_error=True)
+                return render_block_diagram(
+                    structured,
+                    default_direction=default_direction,
+                    raise_on_error=True,
+                )
+            except MermaidSpecError as exc:
+                self.log(
+                    f"structured {structured_key} rejected, falling back to raw mermaid: {exc}",
+                    "warning",
+                )
+
+        raw = tool_input.get(raw_key, "")
+        if not isinstance(raw, str) or not raw.strip():
+            return "" if allow_empty else FALLBACK_DIAGRAM
+
+        cleaned, fixes = salvage(raw)
+        if fixes:
+            self.log(
+                f"{raw_key}: salvaged LLM mermaid (fixes: {','.join(fixes)})",
+                "info",
+            )
+        return cleaned
 
     def _extract_components(self, response_content: str) -> list:
         """Extract component recommendations from response."""

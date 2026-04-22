@@ -6,6 +6,7 @@ import { getVisibleDocuments } from '../data/phases';
 import { loadMermaid, renderMermaid, purgeMermaidScratch } from '../utils/mermaid';
 import SchematicView from '../components/schematic/SchematicView';
 import CascadeChart from '../components/CascadeChart';
+import MermaidErrorBoundary from '../components/MermaidErrorBoundary';
 
 interface DocFile {
   name: string;
@@ -493,7 +494,9 @@ function MarkdownRenderer({ content, color }: { content: string; color: string }
           return (
             <div key={i} style={{ margin: '18px 0' }}>
               <div style={{ fontSize: 10, color: 'var(--text4)', fontFamily: "'DM Mono', monospace", marginBottom: 8, letterSpacing: '0.1em' }}>DIAGRAM</div>
-              <MermaidBlock code={part.text} color={color} />
+              <MermaidErrorBoundary source={part.text} color={color} label="DIAGRAM">
+                <MermaidBlock code={part.text} color={color} />
+              </MermaidErrorBoundary>
             </div>
           );
         }
