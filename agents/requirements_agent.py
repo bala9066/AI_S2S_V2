@@ -1396,7 +1396,15 @@ class RequirementsAgent(BaseAgent):
     # banned / obsolete / NRND part) we feed the findings back as a user
     # turn and ask the LLM to re-emit `generate_requirements`. Each retry
     # adds one extra LLM round-trip, so cap small.
-    _FIX_ON_FAIL_MAX_RETRIES = 2
+    #
+    # Perf (2026-04-22): lowered 2 -> 1. The deterministic `_auto_fix_blockers`
+    # layer runs BEFORE the first LLM retry and mechanically swaps bad MPNs
+    # for known-good candidates from the same stage bucket — this resolves
+    # the vast majority of fixable blockers in microseconds. Observed: the
+    # second LLM retry rarely converges on a different outcome than the
+    # first, and each retry costs ~3-5 min on glm-5.1 (see comment below).
+    # Cap at 1 to bound worst-case wall-clock at ~7 min instead of ~12 min.
+    _FIX_ON_FAIL_MAX_RETRIES = 1
     _FIX_ON_FAIL_CATEGORIES = frozenset({
         "hallucinated_part",
         "not_from_candidate_pool",
@@ -2598,6 +2606,12 @@ class RequirementsAgent(BaseAgent):
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             )
+            # Perf (2026-04-22): probe timeout trimmed 5s -> 2s. ADI / TI /
+            # Mouser / DigiKey live URLs respond in well under 500 ms; a 2 s
+            # wait is generous headroom and caps the tail cost when several
+            # hosts are unreachable. Worker pool lifted 12 -> 32: this is
+            # pure I/O (HEAD/GET) with no API rate limit, so more parallelism
+            # just shortens the batch count.
             def _probe(url: str) -> bool:
                 if not url or not url.startswith('http'):
                     return False
@@ -2607,7 +2621,7 @@ class RequirementsAgent(BaseAgent):
                         req = _ur2.Request(url, method=method,
                                            headers={'User-Agent': _BROWSER_UA,
                                                     'Accept': 'text/html,application/pdf,*/*'})
-                        with _ur2.urlopen(req, timeout=5) as r:
+                        with _ur2.urlopen(req, timeout=2) as r:
                             if 200 <= r.status < 400:
                                 return True
                     except Exception:
@@ -2636,7 +2650,7 @@ class RequirementsAgent(BaseAgent):
 
             probes = sorted(probe_set)
             if probes:
-                with _TPE2(max_workers=min(12, len(probes))) as pool:
+                with _TPE2(max_workers=min(32, len(probes))) as pool:
                     results = list(pool.map(_probe, probes))
                 url_live = dict(zip(probes, results))
             else:
@@ -6773,6 +6787,10 @@ typical passive/active bands).</p>
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
+        # Perf (2026-04-22): probe timeout trimmed 5s -> 2s (paired with the
+        # block diagram probe above). Live vendor URLs respond in well under
+        # 500 ms; 2 s is enough headroom without inflating the tail when a
+        # handful of hosts are unreachable.
         def _probe(url: str) -> bool:
             if not url or not url.startswith('http'):
                 return False
@@ -6782,7 +6800,7 @@ typical passive/active bands).</p>
                         'User-Agent': _BROWSER_UA,
                         'Accept': 'text/html,application/pdf,*/*',
                     })
-                    with _urllib.urlopen(req, timeout=5) as resp:
+                    with _urllib.urlopen(req, timeout=2) as resp:
                         if 200 <= resp.status < 400:
                             return True
                 except Exception:
@@ -6815,11 +6833,16 @@ typical passive/active bands).</p>
                     probe_set.add(a_llm)
             alt_cands.append(row_alts)
 
-        # Parallel HEAD probes (max 12 workers)
+        # Parallel HEAD probes. Perf (2026-04-22): raised the worker cap from
+        # 12 -> 32. HEAD is a pure-I/O call with no CPU cost, there is no
+        # vendor-side rate limit on distributor product pages, and a P1 BOM
+        # can produce 40+ candidate URLs (primary + alternatives + LLM URL
+        # across 10-15 components). With 12 workers the probe pool took a
+        # 3-wave serial hit; 32 collapses that to a single wave.
         url_ok: dict[str, bool] = {}
         probes = sorted(probe_set)
         if probes:
-            with _TPE(max_workers=min(12, len(probes))) as pool:
+            with _TPE(max_workers=min(32, len(probes))) as pool:
                 fut_map = {pool.submit(_probe, u): u for u in probes}
                 for fut in _as_completed(fut_map):
                     url_ok[fut_map[fut]] = fut.result()

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tools import distributor_search, parametric_search as _ps
 from tools.digikey_api import PartInfo
 from tools.parametric_search import (
     _build_query,
@@ -20,13 +21,18 @@ from tools.parametric_search import (
 )
 
 
-# Every test clears the in-process cache first — otherwise `find_candidates`
-# results would leak across tests (the cache is process-global).
+# Every test clears the in-process caches first — otherwise `find_candidates`
+# results would leak across tests (both caches are process-global). The
+# cross-cache warm in `find_candidates` also populates distributor_search's
+# exact-MPN cache, so resetting both keeps the two in lock-step across
+# test runs.
 @pytest.fixture(autouse=True)
 def _clear_parametric_cache():
     reset_cache()
+    distributor_search.reset_cache()
     yield
     reset_cache()
+    distributor_search.reset_cache()
 
 
 def _pi(
@@ -314,3 +320,106 @@ def test_digikey_and_mouser_queried_in_parallel(both_configured):
     # Generous upper bound (0.35s) to absorb CI jitter but still well
     # below the 0.4s sequential lower bound.
     assert elapsed < 0.35, f"expected parallel exec, got {elapsed:.3f}s"
+
+
+# ---------------------------------------------------------------------------
+# Perf guard — TTL covers a full P1 elicitation session.
+# ---------------------------------------------------------------------------
+
+def test_cache_ttl_covers_a_full_p1_session():
+    """The TTL must outlast `generate_requirements` so the finalize_p1
+    audit can reuse the shortlists warmed during find_candidate_parts.
+
+    A single `generate_requirements` call alone takes 3-5 min on glm-5.1;
+    the old 60s TTL guaranteed every audit-phase lookup missed the cache.
+    300 s (5 min) keeps the cross-cache warm (see below) effective
+    through the audit."""
+    assert _ps._CACHE_TTL_S >= 300.0, (
+        "Perf guardrail: shortening the cache TTL below 300 s reintroduces "
+        "the audit-phase cache-miss storm that drove P1 to ~12 min."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cross-cache warm — populate distributor_search's exact-MPN cache from
+# keyword-search results so the audit phase doesn't re-hit the vendor
+# APIs for parts we've already pulled shortlist data for.
+# ---------------------------------------------------------------------------
+
+def test_find_candidates_prewarms_distributor_cache(both_configured):
+    dk = [_pi("ADL8107", source="digikey")]
+    ms = [_pi("BGA7210", source="mouser")]
+    with patch("tools.parametric_search.digikey_api.keyword_search", return_value=dk), \
+         patch("tools.parametric_search.mouser_api.keyword_search", return_value=ms):
+        find_candidates("lna", "2-18 GHz")
+
+    # Both MPNs must appear in distributor_search._cache under the
+    # upper-cased key used by distributor_search.lookup.
+    assert "ADL8107" in distributor_search._cache
+    assert "BGA7210" in distributor_search._cache
+    # Stored value is the PartInfo itself, not a copy/None.
+    assert distributor_search._cache["ADL8107"].part_number == "ADL8107"
+    assert distributor_search._cache["BGA7210"].part_number == "BGA7210"
+
+
+def test_cross_cache_returns_part_on_lookup_without_api_call(both_configured):
+    """After a keyword-search warm, `distributor_search.lookup` for any
+    shortlisted MPN must serve from cache without calling DigiKey or Mouser."""
+    dk = [_pi("ADL8107", source="digikey")]
+    with patch("tools.parametric_search.digikey_api.keyword_search", return_value=dk), \
+         patch("tools.parametric_search.mouser_api.keyword_search", return_value=[]):
+        find_candidates("lna", "2-18 GHz")
+
+    # Now `lookup("ADL8107")` must hit the cache. We patch BOTH distributor
+    # APIs at the module path `distributor_search` uses, so a cache miss
+    # would surface as an assertion failure here.
+    with patch("tools.distributor_search.digikey_api.lookup") as dk_mock, \
+         patch("tools.distributor_search.mouser_api.lookup") as ms_mock:
+        info = distributor_search.lookup("ADL8107")
+    assert info is not None and info.part_number == "ADL8107"
+    dk_mock.assert_not_called()
+    ms_mock.assert_not_called()
+
+
+def test_cross_cache_does_not_overwrite_existing_entry(both_configured):
+    """If `distributor_search.lookup` has already populated an MPN (e.g. a
+    prior manual probe with its own datasheet-URL verification), the
+    parametric_search warm must NOT clobber it — lookup's result is more
+    authoritative downstream."""
+    pre_seeded = _pi("ADL8107", source="digikey", mfr="PRE-SEEDED")
+    with distributor_search._cache_lock:
+        distributor_search._cache["ADL8107"] = pre_seeded
+
+    dk = [_pi("ADL8107", source="digikey", mfr="SHOULD-NOT-WIN")]
+    with patch("tools.parametric_search.digikey_api.keyword_search", return_value=dk), \
+         patch("tools.parametric_search.mouser_api.keyword_search", return_value=[]):
+        find_candidates("lna", "2-18 GHz")
+
+    assert distributor_search._cache["ADL8107"].manufacturer == "PRE-SEEDED"
+
+
+def test_cross_cache_handles_distributor_search_import_error(
+    both_configured, monkeypatch
+):
+    """Defensive: if `tools.distributor_search` becomes unavailable for any
+    reason (e.g. a refactor removes the module, or we hit a cyclic-import
+    edge case during startup), `find_candidates` must still return results."""
+    import sys
+
+    # Snapshot then blow away the cached module. A fresh `from tools import
+    # distributor_search as _ds` inside find_candidates will then raise
+    # ImportError, which our try/except swallows at log.debug level.
+    original = sys.modules.pop("tools.distributor_search", None)
+    monkeypatch.setitem(sys.modules, "tools.distributor_search", None)
+
+    try:
+        dk = [_pi("ADL8107", source="digikey")]
+        with patch("tools.parametric_search.digikey_api.keyword_search", return_value=dk), \
+             patch("tools.parametric_search.mouser_api.keyword_search", return_value=[]):
+            out = find_candidates("lna", "2-18 GHz")
+        assert [p.part_number for p in out] == ["ADL8107"]
+    finally:
+        if original is not None:
+            sys.modules["tools.distributor_search"] = original
+        else:
+            sys.modules.pop("tools.distributor_search", None)

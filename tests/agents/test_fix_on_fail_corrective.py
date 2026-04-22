@@ -148,3 +148,24 @@ class TestSeverityFilter:
              "location": "x", "detail": "d"},
         ]}
         assert agent._build_fix_on_fail_corrective(audit) is None
+
+
+class TestRetryCap:
+    """The fix-on-fail retry budget drives worst-case P1 wall-clock: each
+    extra retry is another ~3-5 min round-trip on glm-5.1. This guard
+    fails loudly if someone bumps the cap back up without updating the
+    perf note in the agent source, which would reintroduce the 12-min
+    pathological case we fixed on 2026-04-22.
+    """
+
+    def test_max_retries_bounded_at_one(self):
+        # Deterministic `_auto_fix_blockers` handles the common case for
+        # free; one LLM retry is enough to catch the residual. Going back
+        # to 2 was observed never to converge when retry 1 didn't — all
+        # it bought was minutes of latency.
+        assert RequirementsAgent._FIX_ON_FAIL_MAX_RETRIES == 1, (
+            "Perf guardrail: raising _FIX_ON_FAIL_MAX_RETRIES inflates P1 "
+            "worst-case wall-clock by ~3-5 min per extra retry. If this "
+            "change is intentional, update the perf note in "
+            "agents/requirements_agent.py and this test together."
+        )

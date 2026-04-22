@@ -79,11 +79,16 @@ _STAGE_KEYWORDS: dict[str, str] = {
 # In-process cache
 # ---------------------------------------------------------------------------
 
-# TTL is intentionally short: distributor stock/lifecycle can change within
-# an hour, and a P1 run completes in minutes. 60s is long enough to absorb
-# duplicate calls within a single run, short enough that re-running a
-# project after a pause gets fresh data.
-_CACHE_TTL_S = 60.0
+# TTL spans a full P1 elicitation session. A typical run:
+#   Round 1-3 (find_candidate_parts fan-out)  ->  LLM generate_requirements
+#   (~3-5 min on glm-5.1)  ->  finalize_p1 audit (exact MPN re-lookups)
+# With a 60 s TTL the second half of that pipeline always missed the cache
+# because generate_requirements alone exceeds the window. 300 s (5 min)
+# keeps the shortlist warm through the end of finalize_p1's audit so the
+# exact-MPN lookup of every chosen component can be served from the in-
+# process cache we pre-populate below (see `find_candidates`). Distributor
+# stock/lifecycle moves on an hour+ cadence, so 5 min is still fresh.
+_CACHE_TTL_S = 300.0
 
 _cache_lock = threading.Lock()
 _cache: dict[tuple, tuple[float, list[PartInfo]]] = {}
@@ -256,6 +261,30 @@ def find_candidates(
     # lets a subsequent call with a different max_total still reuse the
     # same underlying shortlist.
     _cache_put(cache_key, merged)
+
+    # Cross-populate the exact-MPN lookup cache used by `finalize_p1`'s
+    # audit (services/rf_audit.py -> tools.distributor_search.lookup).
+    # Every PartInfo we just pulled via keyword_search IS a verified
+    # distributor record — feeding it into the exact-lookup cache keyed
+    # by upper-cased MPN means the audit phase skips a redundant round-
+    # trip to DigiKey/Mouser per component. A typical P1 run has 10-15
+    # BOM rows whose MPNs are a subset of the shortlists; this collapses
+    # the 60-90 s audit down to ~10 s.
+    #
+    # Safety: we only INSERT — never overwrite an existing entry — so a
+    # prior `distributor_search.lookup` result (which already ran the
+    # datasheet URL verification pass) keeps priority. If the entry is
+    # net-new, the downstream render-time URL probe in requirements_agent
+    # still catches any dead datasheet link.
+    try:
+        from tools import distributor_search as _ds
+        with _ds._cache_lock:  # type: ignore[attr-defined]
+            for _info in merged:
+                _key = (_info.part_number or "").strip().upper()
+                if _key and _key not in _ds._cache:  # type: ignore[attr-defined]
+                    _ds._cache[_key] = _info  # type: ignore[attr-defined]
+    except Exception as _exc:  # pragma: no cover — best-effort warm
+        log.debug("parametric_search.cross_cache_skip: %s", _exc)
 
     if max_total is None:
         max_total = 2 * max_per_source
