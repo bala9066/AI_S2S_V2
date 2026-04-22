@@ -1338,6 +1338,24 @@ class RequirementsAgent(BaseAgent):
         # bypassed the shortlist.  Reset at the top of each execute().
         self._offered_candidate_mpns: set[str] = set()
 
+    # Fix-on-fail retry — when the post-generation audit detects a fixable
+    # blocker (fake MPN, part outside the candidate pool, bad datasheet,
+    # banned / obsolete / NRND part) we feed the findings back as a user
+    # turn and ask the LLM to re-emit `generate_requirements`. Each retry
+    # adds one extra LLM round-trip, so cap small.
+    _FIX_ON_FAIL_MAX_RETRIES = 2
+    _FIX_ON_FAIL_CATEGORIES = frozenset({
+        "hallucinated_part",
+        "not_from_candidate_pool",
+        "obsolete_part",
+        "nrnd_part",
+        "datasheet_url",
+        "banned_part",
+        "missing_part_number",
+        "part_number",
+        "hallucination",
+    })
+
     def get_system_prompt(self, project_context: dict) -> str:
         base = SYSTEM_PROMPT.format(
             design_type=project_context.get("design_type", "general"),
@@ -2205,33 +2223,109 @@ class RequirementsAgent(BaseAgent):
             # user has confirmed requirements in Round 4. Any blocker (critical
             # / high severity) is surfaced in the chat summary so the user can
             # iterate before clicking Approve & Start Pipeline.
+            #
+            # Fix-on-fail loop: when the audit returns retry-eligible blockers
+            # (hallucinated MPN, not_from_candidate_pool, bad datasheet, banned
+            # / obsolete / NRND part) we feed the findings + verified candidate
+            # pool back to the LLM as a corrective user turn and ask it to
+            # re-emit `generate_requirements`. Capped at
+            # `_FIX_ON_FAIL_MAX_RETRIES` retries to bound cost / latency.
             finalize_bundle: dict = {}
-            _fin_t0 = _time.monotonic()
-            try:
-                from services.p1_finalize import finalize_p1
-                finalize_bundle = finalize_p1(
-                    tool_input=generate_req_input,
-                    project_id=project_context.get("project_id", ""),
-                    design_type=project_context.get("design_type"),
-                    llm_model=getattr(self, "model", None),
-                    architecture=generate_req_input.get("architecture"),
-                    # Set of MPNs surfaced by find_candidate_parts this turn —
-                    # the audit flags any BOM entry that bypassed the shortlist.
-                    offered_candidate_mpns=set(self._offered_candidate_mpns),
+            for _retry_idx in range(self._FIX_ON_FAIL_MAX_RETRIES + 1):
+                _fin_t0 = _time.monotonic()
+                try:
+                    from services.p1_finalize import finalize_p1
+                    finalize_bundle = finalize_p1(
+                        tool_input=generate_req_input,
+                        project_id=project_context.get("project_id", ""),
+                        design_type=project_context.get("design_type"),
+                        llm_model=getattr(self, "model", None),
+                        architecture=generate_req_input.get("architecture"),
+                        offered_candidate_mpns=set(self._offered_candidate_mpns),
+                    )
+                    for fname, fcontent in finalize_bundle.get("outputs", {}).items():
+                        outputs[fname] = fcontent
+                    _blocker_count = len([
+                        i for i in (finalize_bundle.get("audit_report") or {}).get("issues", [])
+                        if i.get("severity") in ("critical", "high")
+                    ])
+                    self.log(
+                        f"[v15-timing] finalize_p1 (attempt {_retry_idx + 1}/"
+                        f"{self._FIX_ON_FAIL_MAX_RETRIES + 1}): "
+                        f"{_time.monotonic() - _fin_t0:.2f}s (blockers={_blocker_count})",
+                        "info",
+                    )
+                except Exception as exc:
+                    self.log(
+                        f"finalize_p1 skipped: {exc} "
+                        f"(after {_time.monotonic() - _fin_t0:.2f}s)",
+                        "warning",
+                    )
+                    break
+
+                if _retry_idx >= self._FIX_ON_FAIL_MAX_RETRIES:
+                    break
+                corrective = self._build_fix_on_fail_corrective(
+                    finalize_bundle.get("audit_report") or {}
                 )
-                # Merge lock + audit artefacts so chat_service persists them.
-                for fname, fcontent in finalize_bundle.get("outputs", {}).items():
-                    outputs[fname] = fcontent
+                if not corrective:
+                    break
+
                 self.log(
-                    f"[v15-timing] finalize_p1: {_time.monotonic() - _fin_t0:.2f}s "
-                    f"(blockers={len([i for i in (finalize_bundle.get('audit_report') or {}).get('issues', []) if i.get('severity') in ('critical', 'high')])})",
+                    f"[fix-on-fail] retry {_retry_idx + 1}/"
+                    f"{self._FIX_ON_FAIL_MAX_RETRIES} — re-prompting LLM with "
+                    f"{_blocker_count} blocker(s)",
                     "info",
                 )
-            except Exception as exc:
+
+                _prev_input = dict(generate_req_input)
+                messages.append({"role": "user", "content": corrective})
+                generate_req_input.clear()
+
+                _retry_llm_t0 = _time.monotonic()
+                try:
+                    await self.call_llm_with_tools(
+                        messages=messages,
+                        system=system,
+                        tool_handlers=tool_handlers,
+                        terminal_tools={"generate_requirements", "show_clarification_cards"},
+                        tool_choice={"type": "any"},
+                    )
+                except Exception as exc:
+                    self.log(
+                        f"[fix-on-fail] retry LLM call failed: {exc} "
+                        f"(after {_time.monotonic() - _retry_llm_t0:.2f}s)",
+                        "warning",
+                    )
+                    generate_req_input.clear()
+                    generate_req_input.update(_prev_input)
+                    break
+
                 self.log(
-                    f"finalize_p1 skipped: {exc} "
-                    f"(after {_time.monotonic() - _fin_t0:.2f}s)",
-                    "warning",
+                    f"[fix-on-fail] LLM call: {_time.monotonic() - _retry_llm_t0:.2f}s "
+                    f"(gen_captured={bool(generate_req_input)})",
+                    "info",
+                )
+
+                if not generate_req_input:
+                    self.log(
+                        "[fix-on-fail] LLM did not re-emit generate_requirements "
+                        "— keeping previous BOM and surfacing audit blockers to user",
+                        "warning",
+                    )
+                    generate_req_input.update(_prev_input)
+                    break
+
+                _files_t0 = _time.monotonic()
+                outputs = self._generate_output_files(
+                    generate_req_input,
+                    project_context.get("output_dir", "output"),
+                    project_context.get("name", "project"),
+                )
+                self.log(
+                    f"[fix-on-fail] _generate_output_files (retry {_retry_idx + 1}): "
+                    f"{_time.monotonic() - _files_t0:.2f}s ({len(outputs)} files)",
+                    "info",
                 )
 
             # Always build the rich requirements summary from the tool data.
@@ -2586,6 +2680,75 @@ class RequirementsAgent(BaseAgent):
                 "error": str(e),
                 "message": "Component search failed. Using LLM knowledge for recommendations."
             }
+
+    def _build_fix_on_fail_corrective(self, audit_report: dict) -> Optional[str]:
+        """Build a corrective user-message when the audit detects fixable
+        blockers (fake MPNs, parts outside the candidate pool, bad datasheets,
+        banned / obsolete / NRND parts).
+
+        Returns None when there is nothing actionable for the LLM to fix on a
+        re-prompt (e.g. only cascade / topology / citation issues remain) — the
+        caller should not retry in that case.
+        """
+        issues = (audit_report or {}).get("issues") or []
+        fixable = [
+            i for i in issues
+            if i.get("severity") in ("critical", "high")
+            and i.get("category") in self._FIX_ON_FAIL_CATEGORIES
+        ]
+        if not fixable:
+            return None
+
+        by_cat: dict = {}
+        for i in fixable:
+            by_cat.setdefault(i.get("category", "?"), []).append(i)
+
+        lines = [
+            "AUDIT FAILURE — your previous `generate_requirements` call did not "
+            "pass the post-generation audit. You MUST re-emit "
+            "`generate_requirements` with the BOM corrected. Do not ask the "
+            "user — fix the BOM yourself using the verified candidate pool below.",
+            "",
+        ]
+        for cat, rows in by_cat.items():
+            lines.append(f"**{cat}** ({len(rows)} item(s)):")
+            for r in rows[:8]:
+                loc = r.get("location") or ""
+                det = (r.get("detail") or "").strip()
+                fix = (r.get("suggested_fix") or "").strip()
+                lines.append(f"  - {loc} — {det}")
+                if fix:
+                    lines.append(f"    fix: {fix}")
+            lines.append("")
+
+        pool = sorted({m for m in (self._offered_candidate_mpns or set()) if m})
+        if pool:
+            lines.append(
+                f"VERIFIED CANDIDATE POOL ({len(pool)} MPNs surfaced by "
+                "`find_candidate_parts` this turn — pick replacements ONLY from "
+                "this list and copy the MPN + `datasheet_url` verbatim from the "
+                "candidate record):"
+            )
+            for mpn in pool[:80]:
+                lines.append(f"  - {mpn}")
+            if len(pool) > 80:
+                lines.append(f"  - ... (+{len(pool) - 80} more)")
+            lines.append("")
+        else:
+            lines.append(
+                "NO candidate pool was built this turn — call "
+                "`find_candidate_parts` for every signal-chain stage FIRST, "
+                "then re-call `generate_requirements`."
+            )
+            lines.append("")
+
+        lines.append(
+            "If a stage still has no acceptable candidate after a widened "
+            "`find_candidate_parts` retry, OMIT that stage from the BOM rather "
+            "than inventing a part. Then call `generate_requirements` as your "
+            "final tool call."
+        )
+        return "\n".join(lines)
 
     async def _handle_find_candidate_parts(self, input_data: dict) -> dict:
         """Handle find_candidate_parts — retrieval-augmented selection.
