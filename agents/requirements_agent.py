@@ -992,21 +992,74 @@ GENERATE_REQUIREMENTS_TOOL = {
             "block_diagram_mermaid": {
                 "type": "string",
                 "description": (
-                    "Mermaid diagram code for the system block diagram. "
-                    "Use graph TD or graph LR format. "
-                    "CANONICAL RF CHAIN (every receiver MUST include these stages in order): "
-                    "Antenna -> SMA -> Limiter -> Preselector (SAW / ceramic / cavity BPF) -> Bias-T -> LNA -> "
-                    "(splitter / mixer / ADC / etc.). The Preselector node is MANDATORY and sits BETWEEN "
-                    "the limiter and the LNA — never omit it, never put it after the LNA. "
-                    "MULTI-ANTENNA (N>1): show N separate antenna inputs (Ant1 ... AntN), each with its own "
-                    "independent chain (Limiter_i -> Preselector_i -> Bias-T_i -> LNA_i). Do NOT combine "
-                    "antennas before the LNA — phase / AoA information must be preserved. "
-                    "CHANNELISED FILTER BANK (M channels): the M-way split is PER ANTENNA — each LNA feeds "
-                    "its own 1:M splitter -> M BPFs grouped in a `subgraph Filter Bank k`. For N antennas + "
-                    "M channels there are N*M total RF outputs and N independent splitters (NEVER a single "
-                    "shared ChannelSplitter combining antennas). "
-                    "HIGH-GAIN STABILITY (> 60 dB cascaded): add a buffer amp OR fixed pad node between major "
-                    "blocks; show per-stage bias decoupling on the power path."
+                    "Mermaid `flowchart LR` (preferred) RF block diagram. This is "
+                    "an ENGINEERING block diagram, not a process flowchart — every "
+                    "node MUST use a shape that conveys what kind of RF block it "
+                    "is, and EVERY active / passive stage MUST carry its key specs "
+                    "inline in the label.\n"
+                    "\n"
+                    "SHAPE VOCABULARY (use these exact shapes — anything else is wrong):\n"
+                    "  - Antenna  / Output  -> `>Ant1]`  / `>Out]`           (flag — radiator / port)\n"
+                    "  - Connector / SMA / N-type -> `[/SMA/]`               (parallelogram — connector)\n"
+                    "  - PCB trace / cable        -> `[Trace 50Ohm]`         (rectangle — passive interconnect)\n"
+                    "  - Limiter / attenuator pad -> `[/Lim\\]`              (trapezoid — clamp / pad)\n"
+                    "  - LNA / amplifier / buffer / gain block -> `>LNA1]`   (flag — amplifier triangle)\n"
+                    "  - Mixer                    -> `(MIX)`                 (rounded — mixer)\n"
+                    "  - Filter / preselector / BPF / LPF / SAW -> `{{BPF}}` (hexagon — filter)\n"
+                    "  - Bias-T / DC injection    -> `{BiasT}`               (rhombus — DC inject)\n"
+                    "  - Splitter / coupler / combiner -> `{Split}`          (rhombus — power split)\n"
+                    "  - ADC / DAC / digital      -> `[\\ADC\\]`             (parallelogram alt — sampled)\n"
+                    "  - LO / synth / TCXO / OCXO -> `(LO)`                  (rounded — oscillator)\n"
+                    "\n"
+                    "PER-STAGE SPEC ANNOTATION (mandatory): each ACTIVE / PASSIVE "
+                    "node label MUST be `Role / MPN / G+xx NFy.y P1+zz` — a single "
+                    "line, fields separated by ` / `. Use real component values from "
+                    "`component_recommendations`. Example labels:\n"
+                    "  >LNA1 / HMC8410 / G+22 NF1.6 P1+22]\n"
+                    "  {{Preselector / CTF1835-2150-A / IL2.5 BW150}}\n"
+                    "  (MIX / HMC8193 / CG-7 NF10 LO+13)\n"
+                    "  [\\ADC / AD9213 / 10GSPS 12bit ENOB9.5\\]\n"
+                    "  [/Lim / RFLM-422 / IL0.4 P+30max\\]\n"
+                    "  [/SMA-F/]\n"
+                    "Connectors / antennas / PCB traces don't need spec triplets — "
+                    "their type IS the spec.\n"
+                    "\n"
+                    "CASCADE SUMMARY SUBGRAPH (mandatory): emit a SECOND subgraph "
+                    "AFTER the main signal chain, named exactly `subgraph CASCADE "
+                    "[System Cumulative Performance]`, with 4 rectangle nodes "
+                    "showing the totals computed from the BOM:\n"
+                    "  C1[Net Gain +xx dB]\n"
+                    "  C2[System NF y.y dB]\n"
+                    "  C3[Output P1dB +zz dBm]\n"
+                    "  C4[Output IIP3 +ww dBm]\n"
+                    "Use the Friis cascade values from `design_parameters` — do "
+                    "NOT recompute by hand. If a cumulative metric is unknown, "
+                    "OMIT that single node rather than guessing.\n"
+                    "\n"
+                    "CANONICAL RF CHAIN (topology — every receiver MUST include "
+                    "these stages in order): Antenna -> SMA -> Limiter -> "
+                    "Preselector (SAW / ceramic / cavity BPF) -> Bias-T -> LNA -> "
+                    "(splitter / mixer / ADC / etc.). The Preselector is MANDATORY "
+                    "and sits BETWEEN the limiter and the LNA — never omit it, "
+                    "never put it after the LNA.\n"
+                    "MULTI-ANTENNA (N>1): N separate `>AntK]` inputs, each with "
+                    "its own Limiter_i / Preselector_i / Bias-T_i / LNA_i chain. "
+                    "Do NOT combine antennas before the LNA — phase / AoA "
+                    "information must be preserved.\n"
+                    "CHANNELISED FILTER BANK (M channels): the M-way split is PER "
+                    "ANTENNA — each LNA feeds its own 1:M splitter -> M BPFs "
+                    "grouped in `subgraph Filter Bank k`. For N antennas + M "
+                    "channels there are N*M total RF outputs and N independent "
+                    "splitters (NEVER a single shared ChannelSplitter combining "
+                    "antennas).\n"
+                    "HIGH-GAIN STABILITY (> 60 dB cascaded): add a buffer amp OR "
+                    "fixed pad node between major blocks; show per-stage bias "
+                    "decoupling on the power path.\n"
+                    "\n"
+                    "FORBIDDEN: plain `[Rectangle]` boxes for amplifiers / mixers "
+                    "/ filters; multi-line labels using `<br/>` (the renderer "
+                    "strips them); unicode glyphs (Ohm, deg, mu — use ASCII "
+                    "'Ohm', 'deg', 'u'); pipe `|` inside labels (use `/`)."
                 ),
             },
             "architecture_mermaid": {
@@ -1740,7 +1793,18 @@ class RequirementsAgent(BaseAgent):
                 "and `preselector_tech` to design_parameters. "
                 "(5) If cascaded gain > 60 dB, insert a buffer amp / pad node mid-chain "
                 "and note shielded-cavity + LC/ferrite rail decoupling requirements "
-                "in the requirements list.]"
+                "in the requirements list. "
+                "(6) DIAGRAM SHAPES + SPECS (see `block_diagram_mermaid` schema for "
+                "full vocabulary): use shape-coded nodes — `>Ant1]` for antennas, "
+                "`[/SMA/]` for connectors, `[/Lim\\]` for limiters / pads, `>LNA1]` "
+                "for amplifiers, `{{BPF}}` for filters / preselectors, `{BiasT}` "
+                "for bias-Ts, `{Split}` for splitters, `(MIX)` for mixers, "
+                "`[\\ADC\\]` for digitisers. EVERY active / passive node label "
+                "MUST be `Role / MPN / G+xx NFy.y P1+zz` (single line, ` / ` "
+                "separator) — never plain `[Rectangle]` boxes. After the main "
+                "chain emit `subgraph CASCADE [System Cumulative Performance]` "
+                "with rectangles for Net Gain / System NF / Output P1dB / Output "
+                "IIP3 (omit any single one if not computable).]"
             )
             if messages and messages[-1].get("role") == "user":
                 messages[-1]["content"] = _forced
@@ -2241,8 +2305,11 @@ class RequirementsAgent(BaseAgent):
                         design_type=project_context.get("design_type"),
                         llm_model=getattr(self, "model", None),
                         architecture=generate_req_input.get("architecture"),
+                        # Set of MPNs surfaced by find_candidate_parts this turn —
+                        # the audit flags any BOM entry that bypassed the shortlist.
                         offered_candidate_mpns=set(self._offered_candidate_mpns),
                     )
+                    # Merge lock + audit artefacts so chat_service persists them.
                     for fname, fcontent in finalize_bundle.get("outputs", {}).items():
                         outputs[fname] = fcontent
                     _blocker_count = len([
@@ -2278,7 +2345,10 @@ class RequirementsAgent(BaseAgent):
                     "info",
                 )
 
+                # Snapshot in case the retry fails to re-emit the tool call —
+                # we keep the previous BOM and surface its audit blockers.
                 _prev_input = dict(generate_req_input)
+
                 messages.append({"role": "user", "content": corrective})
                 generate_req_input.clear()
 
@@ -2316,6 +2386,8 @@ class RequirementsAgent(BaseAgent):
                     generate_req_input.update(_prev_input)
                     break
 
+                # Re-render output files from the corrected BOM. The next loop
+                # iteration's finalize_p1 will then audit the new payload.
                 _files_t0 = _time.monotonic()
                 outputs = self._generate_output_files(
                     generate_req_input,
