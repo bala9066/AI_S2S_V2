@@ -992,21 +992,74 @@ GENERATE_REQUIREMENTS_TOOL = {
             "block_diagram_mermaid": {
                 "type": "string",
                 "description": (
-                    "Mermaid diagram code for the system block diagram. "
-                    "Use graph TD or graph LR format. "
-                    "CANONICAL RF CHAIN (every receiver MUST include these stages in order): "
-                    "Antenna -> SMA -> Limiter -> Preselector (SAW / ceramic / cavity BPF) -> Bias-T -> LNA -> "
-                    "(splitter / mixer / ADC / etc.). The Preselector node is MANDATORY and sits BETWEEN "
-                    "the limiter and the LNA — never omit it, never put it after the LNA. "
-                    "MULTI-ANTENNA (N>1): show N separate antenna inputs (Ant1 ... AntN), each with its own "
-                    "independent chain (Limiter_i -> Preselector_i -> Bias-T_i -> LNA_i). Do NOT combine "
-                    "antennas before the LNA — phase / AoA information must be preserved. "
-                    "CHANNELISED FILTER BANK (M channels): the M-way split is PER ANTENNA — each LNA feeds "
-                    "its own 1:M splitter -> M BPFs grouped in a `subgraph Filter Bank k`. For N antennas + "
-                    "M channels there are N*M total RF outputs and N independent splitters (NEVER a single "
-                    "shared ChannelSplitter combining antennas). "
-                    "HIGH-GAIN STABILITY (> 60 dB cascaded): add a buffer amp OR fixed pad node between major "
-                    "blocks; show per-stage bias decoupling on the power path."
+                    "Mermaid `flowchart LR` (preferred) RF block diagram. This is "
+                    "an ENGINEERING block diagram, not a process flowchart — every "
+                    "node MUST use a shape that conveys what kind of RF block it "
+                    "is, and EVERY active / passive stage MUST carry its key specs "
+                    "inline in the label.\n"
+                    "\n"
+                    "SHAPE VOCABULARY (use these exact shapes — anything else is wrong):\n"
+                    "  - Antenna  / Output  -> `>Ant1]`  / `>Out]`           (flag — radiator / port)\n"
+                    "  - Connector / SMA / N-type -> `[/SMA/]`               (parallelogram — connector)\n"
+                    "  - PCB trace / cable        -> `[Trace 50Ohm]`         (rectangle — passive interconnect)\n"
+                    "  - Limiter / attenuator pad -> `[/Lim\\]`              (trapezoid — clamp / pad)\n"
+                    "  - LNA / amplifier / buffer / gain block -> `>LNA1]`   (flag — amplifier triangle)\n"
+                    "  - Mixer                    -> `(MIX)`                 (rounded — mixer)\n"
+                    "  - Filter / preselector / BPF / LPF / SAW -> `{{BPF}}` (hexagon — filter)\n"
+                    "  - Bias-T / DC injection    -> `{BiasT}`               (rhombus — DC inject)\n"
+                    "  - Splitter / coupler / combiner -> `{Split}`          (rhombus — power split)\n"
+                    "  - ADC / DAC / digital      -> `[\\ADC\\]`             (parallelogram alt — sampled)\n"
+                    "  - LO / synth / TCXO / OCXO -> `(LO)`                  (rounded — oscillator)\n"
+                    "\n"
+                    "PER-STAGE SPEC ANNOTATION (mandatory): each ACTIVE / PASSIVE "
+                    "node label MUST be `Role / MPN / G+xx NFy.y P1+zz` — a single "
+                    "line, fields separated by ` / `. Use real component values from "
+                    "`component_recommendations`. Example labels:\n"
+                    "  >LNA1 / HMC8410 / G+22 NF1.6 P1+22]\n"
+                    "  {{Preselector / CTF1835-2150-A / IL2.5 BW150}}\n"
+                    "  (MIX / HMC8193 / CG-7 NF10 LO+13)\n"
+                    "  [\\ADC / AD9213 / 10GSPS 12bit ENOB9.5\\]\n"
+                    "  [/Lim / RFLM-422 / IL0.4 P+30max\\]\n"
+                    "  [/SMA-F/]\n"
+                    "Connectors / antennas / PCB traces don't need spec triplets — "
+                    "their type IS the spec.\n"
+                    "\n"
+                    "CASCADE SUMMARY SUBGRAPH (mandatory): emit a SECOND subgraph "
+                    "AFTER the main signal chain, named exactly `subgraph CASCADE "
+                    "[System Cumulative Performance]`, with 4 rectangle nodes "
+                    "showing the totals computed from the BOM:\n"
+                    "  C1[Net Gain +xx dB]\n"
+                    "  C2[System NF y.y dB]\n"
+                    "  C3[Output P1dB +zz dBm]\n"
+                    "  C4[Output IIP3 +ww dBm]\n"
+                    "Use the Friis cascade values from `design_parameters` — do "
+                    "NOT recompute by hand. If a cumulative metric is unknown, "
+                    "OMIT that single node rather than guessing.\n"
+                    "\n"
+                    "CANONICAL RF CHAIN (topology — every receiver MUST include "
+                    "these stages in order): Antenna -> SMA -> Limiter -> "
+                    "Preselector (SAW / ceramic / cavity BPF) -> Bias-T -> LNA -> "
+                    "(splitter / mixer / ADC / etc.). The Preselector is MANDATORY "
+                    "and sits BETWEEN the limiter and the LNA — never omit it, "
+                    "never put it after the LNA.\n"
+                    "MULTI-ANTENNA (N>1): N separate `>AntK]` inputs, each with "
+                    "its own Limiter_i / Preselector_i / Bias-T_i / LNA_i chain. "
+                    "Do NOT combine antennas before the LNA — phase / AoA "
+                    "information must be preserved.\n"
+                    "CHANNELISED FILTER BANK (M channels): the M-way split is PER "
+                    "ANTENNA — each LNA feeds its own 1:M splitter -> M BPFs "
+                    "grouped in `subgraph Filter Bank k`. For N antennas + M "
+                    "channels there are N*M total RF outputs and N independent "
+                    "splitters (NEVER a single shared ChannelSplitter combining "
+                    "antennas).\n"
+                    "HIGH-GAIN STABILITY (> 60 dB cascaded): add a buffer amp OR "
+                    "fixed pad node between major blocks; show per-stage bias "
+                    "decoupling on the power path.\n"
+                    "\n"
+                    "FORBIDDEN: plain `[Rectangle]` boxes for amplifiers / mixers "
+                    "/ filters; multi-line labels using `<br/>` (the renderer "
+                    "strips them); unicode glyphs (Ohm, deg, mu — use ASCII "
+                    "'Ohm', 'deg', 'u'); pipe `|` inside labels (use `/`)."
                 ),
             },
             "architecture_mermaid": {
@@ -1337,6 +1390,40 @@ class RequirementsAgent(BaseAgent):
         # rf_audit so we can flag `component_recommendations` MPNs that
         # bypassed the shortlist.  Reset at the top of each execute().
         self._offered_candidate_mpns: set[str] = set()
+        # Full candidate records keyed by stage id ("lna", "mixer", ...).
+        # Populated alongside _offered_candidate_mpns from each
+        # find_candidate_parts call so the deterministic auto-fix layer
+        # can swap a blocker MPN for a known-good replacement of the same
+        # stage without paying for an LLM retry round-trip.
+        self._offered_candidates_by_stage: dict[str, list[dict]] = {}
+
+    # Fix-on-fail retry — when the post-generation audit detects a fixable
+    # blocker (fake MPN, part outside the candidate pool, bad datasheet,
+    # banned / obsolete / NRND part) we feed the findings back as a user
+    # turn and ask the LLM to re-emit `generate_requirements`. Each retry
+    # adds one extra LLM round-trip, so cap small.
+    _FIX_ON_FAIL_MAX_RETRIES = 2
+    _FIX_ON_FAIL_CATEGORIES = frozenset({
+        "hallucinated_part",
+        "not_from_candidate_pool",
+        "obsolete_part",
+        "nrnd_part",
+        "datasheet_url",
+        "banned_part",
+        "missing_part_number",
+        "part_number",
+        "hallucination",
+        "stale_part",
+        "non_active_lifecycle",
+        "part_validation_timeout",
+    })
+
+    # Layer-2 defence: pre-emit gate inside the generate_requirements tool
+    # handler. Rejects the tool call (instead of capturing the BOM) when any
+    # MPN bypasses the verified candidate pool. Capped per chat turn so the
+    # LLM tool loop cannot spin forever — once the cap is hit the BOM is
+    # captured and the deferred audit + fix-on-fail loop take over.
+    _PRE_EMIT_GATE_MAX_ATTEMPTS = 2
 
     def get_system_prompt(self, project_context: dict) -> str:
         base = SYSTEM_PROMPT.format(
@@ -1641,6 +1728,7 @@ class RequirementsAgent(BaseAgent):
         # shortlist is per-conversation-turn — previous turns' offered
         # MPNs must not bleed into this turn's audit gate.
         self._offered_candidate_mpns = set()
+        self._offered_candidates_by_stage = {}
 
         system = self.get_system_prompt(project_context)
 
@@ -1722,7 +1810,18 @@ class RequirementsAgent(BaseAgent):
                 "and `preselector_tech` to design_parameters. "
                 "(5) If cascaded gain > 60 dB, insert a buffer amp / pad node mid-chain "
                 "and note shielded-cavity + LC/ferrite rail decoupling requirements "
-                "in the requirements list.]"
+                "in the requirements list. "
+                "(6) DIAGRAM SHAPES + SPECS (see `block_diagram_mermaid` schema for "
+                "full vocabulary): use shape-coded nodes — `>Ant1]` for antennas, "
+                "`[/SMA/]` for connectors, `[/Lim\\]` for limiters / pads, `>LNA1]` "
+                "for amplifiers, `{{BPF}}` for filters / preselectors, `{BiasT}` "
+                "for bias-Ts, `{Split}` for splitters, `(MIX)` for mixers, "
+                "`[\\ADC\\]` for digitisers. EVERY active / passive node label "
+                "MUST be `Role / MPN / G+xx NFy.y P1+zz` (single line, ` / ` "
+                "separator) — never plain `[Rectangle]` boxes. After the main "
+                "chain emit `subgraph CASCADE [System Cumulative Performance]` "
+                "with rectangles for Net Gain / System NF / Output P1dB / Output "
+                "IIP3 (omit any single one if not computable).]"
             )
             if messages and messages[-1].get("role") == "user":
                 messages[-1]["content"] = _forced
@@ -1874,6 +1973,9 @@ class RequirementsAgent(BaseAgent):
         #  error to the model and the tool_calls list is empty on final return.)
         generate_req_input: dict = {}
         clarification_cards: dict = {}
+        # Mutable counter accessed by the closure below — the closure cannot
+        # rebind a captured immutable int, but it CAN mutate a list element.
+        _pre_emit_attempts: list = [0]
 
         # Decide whether the Round-1 forbidden-topic filter should run this
         # turn. It MUST only run on a true Round-1 emission (user's first raw
@@ -1956,6 +2058,100 @@ class RequirementsAgent(BaseAgent):
             for _k in ("block_diagram_mermaid", "architecture_mermaid", "project_summary"):
                 if _k in _safe:
                     _safe[_k] = _coerce_str(_safe[_k])
+
+            # ── Pre-emit hallucination gate ─────────────────────────────────
+            # Reject the tool call when MPNs bypass the verified candidate
+            # pool. The LLM gets a corrective response and is asked to either
+            # widen `find_candidate_parts` or pick from the existing pool.
+            # Capped per turn so the tool loop cannot spin forever; once the
+            # cap is hit, the BOM is captured and the deferred audit's
+            # fix-on-fail loop takes over.
+            _pool = {(m or "").strip().upper() for m in (self._offered_candidate_mpns or set()) if m}
+            _bom_entries: list = []
+            for _comp in (_safe.get("component_recommendations") or []):
+                if not isinstance(_comp, dict):
+                    continue
+                _mpn = (_comp.get("part_number") or "").strip()
+                _role = (
+                    _comp.get("role")
+                    or _comp.get("name")
+                    or _comp.get("description")
+                    or "?"
+                ).strip()
+                if _mpn:
+                    _bom_entries.append((_role, _mpn))
+
+            _no_pool_violation = (not _pool) and bool(_bom_entries)
+            _pool_violations = (
+                [(r, m) for r, m in _bom_entries if m.upper() not in _pool]
+                if _pool else []
+            )
+
+            if (
+                (_no_pool_violation or _pool_violations)
+                and _pre_emit_attempts[0] < self._PRE_EMIT_GATE_MAX_ATTEMPTS
+            ):
+                _pre_emit_attempts[0] += 1
+                if _no_pool_violation:
+                    self.log(
+                        f"[pre-emit-gate] BLOCKED attempt "
+                        f"{_pre_emit_attempts[0]}/{self._PRE_EMIT_GATE_MAX_ATTEMPTS} "
+                        f"— empty candidate pool, {len(_bom_entries)} BOM entries",
+                        "warning",
+                    )
+                    return {
+                        "status": "rejected",
+                        "message": (
+                            "BLOCKED: generate_requirements called without any "
+                            "`find_candidate_parts` results this turn. EVERY MPN "
+                            "in the BOM must trace back to a find_candidate_parts "
+                            "result. Call find_candidate_parts for each "
+                            "signal-chain stage (LNA, mixer, filter, limiter, "
+                            "ADC, PLL, regulator, ...) FIRST, then re-call "
+                            f"generate_requirements. (attempt "
+                            f"{_pre_emit_attempts[0]}/"
+                            f"{self._PRE_EMIT_GATE_MAX_ATTEMPTS})"
+                        ),
+                    }
+                self.log(
+                    f"[pre-emit-gate] BLOCKED attempt "
+                    f"{_pre_emit_attempts[0]}/{self._PRE_EMIT_GATE_MAX_ATTEMPTS} "
+                    f"— {len(_pool_violations)} BOM entry(ies) outside "
+                    f"verified pool ({len(_pool)} MPNs)",
+                    "warning",
+                )
+                _pool_sample = sorted(_pool)[:60]
+                _msg_lines = [
+                    f"BLOCKED: {len(_pool_violations)} BOM entry(ies) reference "
+                    f"MPNs that are NOT in the verified candidate pool from "
+                    f"`find_candidate_parts` this turn. Picking from outside "
+                    f"the pool is hallucination. You MUST either widen the "
+                    f"search (call find_candidate_parts again with a relaxed "
+                    f"`spec_hint`) or pick replacement MPNs from the existing "
+                    f"pool below.",
+                    "",
+                    "REJECTED ENTRIES:",
+                ]
+                for _role, _mpn in _pool_violations[:10]:
+                    _msg_lines.append(f"  - {_role}: {_mpn}")
+                if len(_pool_violations) > 10:
+                    _msg_lines.append(f"  ... and {len(_pool_violations) - 10} more")
+                _msg_lines.extend(["", f"VERIFIED POOL ({len(_pool)} MPNs):"])
+                for _m in _pool_sample:
+                    _msg_lines.append(f"  - {_m}")
+                if len(_pool) > 60:
+                    _msg_lines.append(f"  ... and {len(_pool) - 60} more")
+                _msg_lines.append("")
+                _msg_lines.append(
+                    f"(attempt {_pre_emit_attempts[0]}/"
+                    f"{self._PRE_EMIT_GATE_MAX_ATTEMPTS} — after that the BOM "
+                    f"is captured and surfaced as audit blockers via the "
+                    f"fix-on-fail loop)"
+                )
+                return {
+                    "status": "rejected",
+                    "message": "\n".join(_msg_lines),
+                }
 
             generate_req_input.update(_safe)
             self.log(
@@ -2205,33 +2401,180 @@ class RequirementsAgent(BaseAgent):
             # user has confirmed requirements in Round 4. Any blocker (critical
             # / high severity) is surfaced in the chat summary so the user can
             # iterate before clicking Approve & Start Pipeline.
+            #
+            # Fix-on-fail loop: when the audit returns retry-eligible blockers
+            # (hallucinated MPN, not_from_candidate_pool, bad datasheet, banned
+            # / obsolete / NRND part) we feed the findings + verified candidate
+            # pool back to the LLM as a corrective user turn and ask it to
+            # re-emit `generate_requirements`. Capped at
+            # `_FIX_ON_FAIL_MAX_RETRIES` retries to bound cost / latency.
             finalize_bundle: dict = {}
-            _fin_t0 = _time.monotonic()
-            try:
-                from services.p1_finalize import finalize_p1
-                finalize_bundle = finalize_p1(
-                    tool_input=generate_req_input,
-                    project_id=project_context.get("project_id", ""),
-                    design_type=project_context.get("design_type"),
-                    llm_model=getattr(self, "model", None),
-                    architecture=generate_req_input.get("architecture"),
-                    # Set of MPNs surfaced by find_candidate_parts this turn —
-                    # the audit flags any BOM entry that bypassed the shortlist.
-                    offered_candidate_mpns=set(self._offered_candidate_mpns),
+            # Auto-fix is allowed at most ONCE per finalize turn. Each
+            # finalize_p1 call is expensive (~60-90 s — distributor lookups
+            # dominate) so re-auditing after a mechanical swap would burn
+            # more time than the LLM retry we're trying to skip. Instead we
+            # patch in place, prune the resolved blockers from the existing
+            # audit report, and ship.
+            _auto_fix_attempted = False
+            for _retry_idx in range(self._FIX_ON_FAIL_MAX_RETRIES + 1):
+                _fin_t0 = _time.monotonic()
+                try:
+                    from services.p1_finalize import finalize_p1
+                    finalize_bundle = finalize_p1(
+                        tool_input=generate_req_input,
+                        project_id=project_context.get("project_id", ""),
+                        design_type=project_context.get("design_type"),
+                        llm_model=getattr(self, "model", None),
+                        architecture=generate_req_input.get("architecture"),
+                        # Set of MPNs surfaced by find_candidate_parts this turn —
+                        # the audit flags any BOM entry that bypassed the shortlist.
+                        offered_candidate_mpns=set(self._offered_candidate_mpns),
+                    )
+                    # Merge lock + audit artefacts so chat_service persists them.
+                    for fname, fcontent in finalize_bundle.get("outputs", {}).items():
+                        outputs[fname] = fcontent
+                    _blocker_count = len([
+                        i for i in (finalize_bundle.get("audit_report") or {}).get("issues", [])
+                        if i.get("severity") in ("critical", "high")
+                    ])
+                    self.log(
+                        f"[v15-timing] finalize_p1 (attempt {_retry_idx + 1}/"
+                        f"{self._FIX_ON_FAIL_MAX_RETRIES + 1}): "
+                        f"{_time.monotonic() - _fin_t0:.2f}s (blockers={_blocker_count})",
+                        "info",
+                    )
+                except Exception as exc:
+                    self.log(
+                        f"finalize_p1 skipped: {exc} "
+                        f"(after {_time.monotonic() - _fin_t0:.2f}s)",
+                        "warning",
+                    )
+                    break
+
+                if _retry_idx >= self._FIX_ON_FAIL_MAX_RETRIES:
+                    break
+
+                # ── Deterministic auto-fix layer ────────────────────────
+                # Try mechanical swap-from-candidate-pool BEFORE asking
+                # the LLM to re-emit the entire BOM. Each LLM retry costs
+                # ~5 min on glm-5.1 because generate_requirements emits
+                # ~10k tokens of structured JSON; a one-row swap takes
+                # microseconds. One shot only: if we re-ran finalize_p1
+                # to verify the swap, the ~60-90 s audit would eat most
+                # of the saving — so we patch, prune the resolved
+                # blockers from the existing audit report, and exit.
+                if not _auto_fix_attempted:
+                    _auto_fix_attempted = True
+                    _autofix_t0 = _time.monotonic()
+                    _patched_payload, _patched_log = self._auto_fix_blockers(
+                        generate_req_input,
+                        finalize_bundle.get("audit_report") or {},
+                    )
+                    if _patched_payload is not None:
+                        generate_req_input.clear()
+                        generate_req_input.update(_patched_payload)
+                        self.log(
+                            f"[auto-fix] patched in {_time.monotonic() - _autofix_t0:.2f}s "
+                            f"— {_patched_log}",
+                            "info",
+                        )
+                        # Re-render output files from the patched BOM so
+                        # the user sees the corrected MPNs.
+                        _files_t0 = _time.monotonic()
+                        outputs = self._generate_output_files(
+                            generate_req_input,
+                            project_context.get("output_dir", "output"),
+                            project_context.get("name", "project"),
+                        )
+                        self.log(
+                            f"[auto-fix] _generate_output_files: "
+                            f"{_time.monotonic() - _files_t0:.2f}s ({len(outputs)} files)",
+                            "info",
+                        )
+                        # Prune resolved blockers from the audit report
+                        # so downstream rendering doesn't warn about the
+                        # MPNs we just replaced. Kept other issues intact.
+                        _rep = finalize_bundle.get("audit_report") or {}
+                        _orig = _rep.get("issues") or []
+                        _kept = [
+                            i for i in _orig
+                            if not (
+                                i.get("category") in self._AUTO_FIX_CATEGORIES
+                                and i.get("severity") in ("critical", "high")
+                            )
+                        ]
+                        if len(_kept) != len(_orig):
+                            _rep["issues"] = _kept
+                            _rep["auto_fix_applied"] = _patched_log
+                            finalize_bundle["audit_report"] = _rep
+                        break  # skip re-audit + LLM retry — accept the swap
+
+                corrective = self._build_fix_on_fail_corrective(
+                    finalize_bundle.get("audit_report") or {}
                 )
-                # Merge lock + audit artefacts so chat_service persists them.
-                for fname, fcontent in finalize_bundle.get("outputs", {}).items():
-                    outputs[fname] = fcontent
+                if not corrective:
+                    break
+
                 self.log(
-                    f"[v15-timing] finalize_p1: {_time.monotonic() - _fin_t0:.2f}s "
-                    f"(blockers={len([i for i in (finalize_bundle.get('audit_report') or {}).get('issues', []) if i.get('severity') in ('critical', 'high')])})",
+                    f"[fix-on-fail] retry {_retry_idx + 1}/"
+                    f"{self._FIX_ON_FAIL_MAX_RETRIES} — re-prompting LLM with "
+                    f"{_blocker_count} blocker(s)",
                     "info",
                 )
-            except Exception as exc:
+
+                # Snapshot in case the retry fails to re-emit the tool call —
+                # we keep the previous BOM and surface its audit blockers.
+                _prev_input = dict(generate_req_input)
+
+                messages.append({"role": "user", "content": corrective})
+                generate_req_input.clear()
+
+                _retry_llm_t0 = _time.monotonic()
+                try:
+                    await self.call_llm_with_tools(
+                        messages=messages,
+                        system=system,
+                        tool_handlers=tool_handlers,
+                        terminal_tools={"generate_requirements", "show_clarification_cards"},
+                        tool_choice={"type": "any"},
+                    )
+                except Exception as exc:
+                    self.log(
+                        f"[fix-on-fail] retry LLM call failed: {exc} "
+                        f"(after {_time.monotonic() - _retry_llm_t0:.2f}s)",
+                        "warning",
+                    )
+                    generate_req_input.clear()
+                    generate_req_input.update(_prev_input)
+                    break
+
                 self.log(
-                    f"finalize_p1 skipped: {exc} "
-                    f"(after {_time.monotonic() - _fin_t0:.2f}s)",
-                    "warning",
+                    f"[fix-on-fail] LLM call: {_time.monotonic() - _retry_llm_t0:.2f}s "
+                    f"(gen_captured={bool(generate_req_input)})",
+                    "info",
+                )
+
+                if not generate_req_input:
+                    self.log(
+                        "[fix-on-fail] LLM did not re-emit generate_requirements "
+                        "— keeping previous BOM and surfacing audit blockers to user",
+                        "warning",
+                    )
+                    generate_req_input.update(_prev_input)
+                    break
+
+                # Re-render output files from the corrected BOM. The next loop
+                # iteration's finalize_p1 will then audit the new payload.
+                _files_t0 = _time.monotonic()
+                outputs = self._generate_output_files(
+                    generate_req_input,
+                    project_context.get("output_dir", "output"),
+                    project_context.get("name", "project"),
+                )
+                self.log(
+                    f"[fix-on-fail] _generate_output_files (retry {_retry_idx + 1}): "
+                    f"{_time.monotonic() - _files_t0:.2f}s ({len(outputs)} files)",
+                    "info",
                 )
 
             # Always build the rich requirements summary from the tool data.
@@ -2587,6 +2930,324 @@ class RequirementsAgent(BaseAgent):
                 "message": "Component search failed. Using LLM knowledge for recommendations."
             }
 
+    # Categories where the failed BOM row is still in the payload and we
+    # can deterministically swap it for a known-good candidate of the same
+    # stage — no LLM round-trip needed. `banned_part` is excluded because
+    # rf_audit.run_banned_parts_audit() already strips those rows from the
+    # payload, so there is nothing to mutate. `part_validation_timeout` is
+    # excluded because the part may be perfectly real — only a re-audit
+    # under network help would resolve it.
+    _AUTO_FIX_CATEGORIES = frozenset({
+        "hallucinated_part",
+        "not_from_candidate_pool",
+        "obsolete_part",
+        "nrnd_part",
+        "datasheet_url",
+        "non_active_lifecycle",
+        "stale_part",
+    })
+
+    # Stage inference — map keywords found in a BOM row's `function` field
+    # to the stage id used by find_candidate_parts. Order matters: the
+    # first hit wins, so put more specific labels above generic ones
+    # (e.g. "low-noise amplifier" before "amplifier").
+    _STAGE_KEYWORDS: tuple[tuple[str, str], ...] = (
+        ("low-noise amplifier", "lna"),
+        ("low noise amplifier", "lna"),
+        (" lna", "lna"),
+        ("preselector", "preselector"),
+        ("limiter", "limiter"),
+        ("driver amplifier", "amplifier"),
+        ("power amplifier", "pa"),
+        ("variable gain amplifier", "vga"),
+        ("gain block", "amplifier"),
+        ("gain-block", "amplifier"),
+        ("buffer amplifier", "amplifier"),
+        ("post-split", "amplifier"),
+        ("broadband amplifier", "amplifier"),
+        ("mmic amplifier", "amplifier"),
+        ("rf amplifier", "amplifier"),
+        ("gan driver", "amplifier"),
+        (" driver ", "amplifier"),
+        ("amplifier", "amplifier"),
+        ("mixer", "mixer"),
+        ("bandpass filter", "bpf"),
+        ("band-pass filter", "bpf"),
+        ("low-pass filter", "lpf"),
+        ("high-pass filter", "hpf"),
+        ("filter", "bpf"),
+        ("splitter", "splitter"),
+        ("combiner", "splitter"),
+        ("power divider", "splitter"),
+        ("attenuator", "attenuator"),
+        ("switch", "switch"),
+        ("circulator", "circulator"),
+        ("isolator", "isolator"),
+        ("digital-to-analog", "dac"),
+        ("digital to analog", "dac"),
+        (" dac", "dac"),
+        ("analog-to-digital", "adc"),
+        ("analog to digital", "adc"),
+        (" adc", "adc"),
+        ("synthesizer", "pll"),
+        ("synthesiser", "pll"),
+        (" pll", "pll"),
+        (" vco", "vco"),
+        ("local oscillator", "lo"),
+        ("oscillator", "tcxo"),
+        ("tcxo", "tcxo"),
+        ("ocxo", "ocxo"),
+        ("ldo", "ldo"),
+        ("buck", "buck"),
+        ("regulator", "ldo"),
+        ("microcontroller", "mcu"),
+        (" mcu", "mcu"),
+        (" fpga", "fpga"),
+        (" cpld", "fpga"),
+    )
+
+    def _infer_stage_from_function(self, function_text: str) -> Optional[str]:
+        """Best-effort mapping from a BOM row's `function` blurb to the
+        stage id used by find_candidate_parts. Returns None when nothing
+        recognisable is found."""
+        if not function_text:
+            return None
+        haystack = " " + str(function_text).lower() + " "
+        for keyword, stage in self._STAGE_KEYWORDS:
+            if keyword in haystack:
+                return stage
+        return None
+
+    def _auto_fix_blockers(
+        self,
+        tool_input: dict,
+        audit_report: dict,
+    ) -> tuple[Optional[dict], str]:
+        """Deterministic auto-fix layer — swap blocker MPNs for verified
+        candidates of the same stage WITHOUT calling the LLM again.
+
+        For each blocker in `_AUTO_FIX_CATEGORIES`, we:
+          1. Parse the failed MPN from the audit `location` field
+             (`component_recommendations/{pn}`).
+          2. Find the BOM row whose primary part matches.
+          3. Infer the stage from its `function` text.
+          4. Pick the first unused candidate from
+             `_offered_candidates_by_stage[stage]` that is not itself a
+             blocker MPN and not a duplicate of an already-replaced row.
+          5. Mutate `primary_part`, `primary_manufacturer`, and
+             `datasheet_url` in place.
+
+        Returns `(patched_tool_input, summary)` when at least one row
+        was patched, else `(None, "")`. The patched payload is a SHALLOW
+        copy of `tool_input` with a freshly-mutated
+        `component_recommendations` list — so the caller can swap it in
+        without risking aliasing the previous payload.
+        """
+        if not tool_input or not audit_report:
+            return None, ""
+        if not self._offered_candidates_by_stage:
+            return None, ""
+
+        issues = audit_report.get("issues") or []
+        fixable = [
+            i for i in issues
+            if i.get("severity") in ("critical", "high")
+            and i.get("category") in self._AUTO_FIX_CATEGORIES
+        ]
+        if not fixable:
+            return None, ""
+
+        # Build the set of MPNs we must NOT use as a replacement: every
+        # blocker MPN (regardless of whether we end up patching that row).
+        # This stops us from replacing a hallucinated MPN with another
+        # hallucinated MPN that the LLM happened to fabricate.
+        blocked_mpns: set[str] = set()
+        for i in fixable:
+            loc = (i.get("location") or "").strip()
+            if loc.startswith("component_recommendations/"):
+                pn = loc.split("/", 1)[1].strip().upper()
+                if pn:
+                    blocked_mpns.add(pn)
+
+        bom_key = "component_recommendations" if "component_recommendations" in tool_input else "bom"
+        comps = tool_input.get(bom_key) or []
+        if not comps:
+            return None, ""
+
+        # Index BOM rows by MPN (uppercase) so we can look up by audit
+        # location. Both `primary_part` and `part_number` schemas exist;
+        # accept either.
+        def _row_mpn(row: dict) -> str:
+            return (
+                row.get("primary_part")
+                or row.get("part_number")
+                or row.get("mpn")
+                or ""
+            ).strip().upper()
+
+        rows_by_mpn: dict[str, list[int]] = {}
+        for idx, row in enumerate(comps):
+            m = _row_mpn(row)
+            if m:
+                rows_by_mpn.setdefault(m, []).append(idx)
+
+        used_replacements: set[str] = set()
+        # Avoid swapping the same row twice in this pass.
+        patched_indices: set[int] = set()
+        patched_log: list[str] = []
+        # Work on a fresh list-of-rows so callers see an immutable change.
+        new_comps = [dict(r) for r in comps]
+
+        for issue in fixable:
+            loc = (issue.get("location") or "").strip()
+            if not loc.startswith("component_recommendations/"):
+                continue
+            failed_mpn = loc.split("/", 1)[1].strip()
+            if not failed_mpn:
+                continue
+            failed_upper = failed_mpn.upper()
+            row_idxs = rows_by_mpn.get(failed_upper) or []
+            row_idx = next((i for i in row_idxs if i not in patched_indices), None)
+            if row_idx is None:
+                continue
+
+            row = new_comps[row_idx]
+            stage = self._infer_stage_from_function(row.get("function") or "")
+            if not stage:
+                continue
+            bucket = self._offered_candidates_by_stage.get(stage) or []
+            if not bucket:
+                continue
+
+            replacement = None
+            for cand in bucket:
+                cand_mpn = (cand.get("part_number") or "").strip()
+                cand_upper = cand_mpn.upper()
+                if not cand_upper:
+                    continue
+                if cand_upper == failed_upper:
+                    continue
+                if cand_upper in blocked_mpns:
+                    continue
+                if cand_upper in used_replacements:
+                    continue
+                # Lifecycle gate — only swap to active parts.
+                lc = str(cand.get("lifecycle_status") or "").strip().lower()
+                if lc and lc not in ("active", "unknown", ""):
+                    continue
+                replacement = cand
+                break
+            if not replacement:
+                continue
+
+            new_mpn = replacement["part_number"]
+            new_mfg = replacement.get("manufacturer") or ""
+            new_url = replacement.get("datasheet_url") or ""
+            new_lc = (replacement.get("lifecycle_status") or "active").strip().lower() or "active"
+
+            # Mutate the row — preserve whichever key schema the row uses.
+            if "primary_part" in row or "primary_manufacturer" in row:
+                row["primary_part"] = new_mpn
+                if new_mfg:
+                    row["primary_manufacturer"] = new_mfg
+            else:
+                row["part_number"] = new_mpn
+                if new_mfg:
+                    row["manufacturer"] = new_mfg
+            if new_url:
+                row["datasheet_url"] = new_url
+                row.pop("datasheet", None)
+            if "lifecycle_status" in row or new_lc:
+                row["lifecycle_status"] = new_lc
+            # Clear any hallucination flag the audit added.
+            row.pop("_hallucinated", None)
+            row["_auto_fix_replaced"] = failed_mpn
+
+            used_replacements.add(new_mpn.strip().upper())
+            patched_indices.add(row_idx)
+            patched_log.append(
+                f"{issue.get('category', '?')}: {failed_mpn} -> {new_mpn} "
+                f"(stage={stage})"
+            )
+
+        if not patched_log:
+            return None, ""
+
+        patched_payload = {**tool_input, bom_key: new_comps}
+        summary = f"{len(patched_log)} blocker(s): " + "; ".join(patched_log[:8])
+        if len(patched_log) > 8:
+            summary += f" ... (+{len(patched_log) - 8} more)"
+        return patched_payload, summary
+
+    def _build_fix_on_fail_corrective(self, audit_report: dict) -> Optional[str]:
+        """Build a corrective user-message when the audit detects fixable
+        blockers (fake MPNs, parts outside the candidate pool, bad datasheets,
+        banned / obsolete / NRND parts).
+
+        Returns None when there is nothing actionable for the LLM to fix on a
+        re-prompt (e.g. only cascade / topology / citation issues remain) — the
+        caller should not retry in that case.
+        """
+        issues = (audit_report or {}).get("issues") or []
+        fixable = [
+            i for i in issues
+            if i.get("severity") in ("critical", "high")
+            and i.get("category") in self._FIX_ON_FAIL_CATEGORIES
+        ]
+        if not fixable:
+            return None
+
+        by_cat: dict = {}
+        for i in fixable:
+            by_cat.setdefault(i.get("category", "?"), []).append(i)
+
+        lines = [
+            "AUDIT FAILURE — your previous `generate_requirements` call did not "
+            "pass the post-generation audit. You MUST re-emit "
+            "`generate_requirements` with the BOM corrected. Do not ask the "
+            "user — fix the BOM yourself using the verified candidate pool below.",
+            "",
+        ]
+        for cat, rows in by_cat.items():
+            lines.append(f"**{cat}** ({len(rows)} item(s)):")
+            for r in rows[:8]:
+                loc = r.get("location") or ""
+                det = (r.get("detail") or "").strip()
+                fix = (r.get("suggested_fix") or "").strip()
+                lines.append(f"  - {loc} — {det}")
+                if fix:
+                    lines.append(f"    fix: {fix}")
+            lines.append("")
+
+        pool = sorted({m for m in (self._offered_candidate_mpns or set()) if m})
+        if pool:
+            lines.append(
+                f"VERIFIED CANDIDATE POOL ({len(pool)} MPNs surfaced by "
+                "`find_candidate_parts` this turn — pick replacements ONLY from "
+                "this list and copy the MPN + `datasheet_url` verbatim from the "
+                "candidate record):"
+            )
+            for mpn in pool[:80]:
+                lines.append(f"  - {mpn}")
+            if len(pool) > 80:
+                lines.append(f"  - ... (+{len(pool) - 80} more)")
+            lines.append("")
+        else:
+            lines.append(
+                "NO candidate pool was built this turn — call "
+                "`find_candidate_parts` for every signal-chain stage FIRST, "
+                "then re-call `generate_requirements`."
+            )
+            lines.append("")
+
+        lines.append(
+            "If a stage still has no acceptable candidate after a widened "
+            "`find_candidate_parts` retry, OMIT that stage from the BOM rather "
+            "than inventing a part. Then call `generate_requirements` as your "
+            "final tool call."
+        )
+        return "\n".join(lines)
+
     async def _handle_find_candidate_parts(self, input_data: dict) -> dict:
         """Handle find_candidate_parts — retrieval-augmented selection.
 
@@ -2623,14 +3284,35 @@ class RequirementsAgent(BaseAgent):
 
         # Remember every MPN we surfaced — this is the authoritative
         # shortlist the audit will gate against.
+        # ALSO cache the full candidate record (manufacturer + datasheet_url
+        # + lifecycle) keyed by stage so the deterministic auto-fix layer
+        # can swap a hallucinated / banned MPN for a real one of the same
+        # stage without an LLM round-trip.
+        _stage_key = stage.strip().lower()
+        _stage_bucket = self._offered_candidates_by_stage.setdefault(_stage_key, [])
+        _bucket_seen = {(r.get("part_number") or "").strip().upper() for r in _stage_bucket}
         for c in candidates:
             mpn = (c.part_number or "").strip().upper()
-            if mpn:
-                self._offered_candidate_mpns.add(mpn)
+            if not mpn:
+                continue
+            self._offered_candidate_mpns.add(mpn)
+            if mpn in _bucket_seen:
+                continue
+            _bucket_seen.add(mpn)
+            _stage_bucket.append({
+                "part_number": c.part_number,
+                "manufacturer": c.manufacturer,
+                "description": c.description,
+                "datasheet_url": c.datasheet_url,
+                "product_url": c.product_url,
+                "lifecycle_status": c.lifecycle_status,
+                "source": c.source,
+            })
 
         self.log(
             f"find_candidate_parts stage={stage!r} hint={hint!r} "
-            f"-> {len(candidates)} candidates (offered_total={len(self._offered_candidate_mpns)})",
+            f"-> {len(candidates)} candidates (offered_total={len(self._offered_candidate_mpns)}, "
+            f"stages_cached={len(self._offered_candidates_by_stage)})",
             "info",
         )
 
@@ -2681,6 +3363,7 @@ class RequirementsAgent(BaseAgent):
 
         # 2. block_diagram.md
         block_mermaid = tool_input.get("block_diagram_mermaid", "")
+        block_mermaid = self._reflow_long_mermaid(block_mermaid)
         block_content = _scrub(f"# System Block Diagram\n## {project_name}\n\n```mermaid\n{block_mermaid}\n```\n")
         block_file = output_path / "block_diagram.md"
         block_file.write_text(block_content, encoding="utf-8")
@@ -2688,6 +3371,7 @@ class RequirementsAgent(BaseAgent):
 
         # 3. architecture.md
         arch_mermaid = tool_input.get("architecture_mermaid", "")
+        arch_mermaid = self._reflow_long_mermaid(arch_mermaid)
         if arch_mermaid:
             arch_content = f"# System Architecture\n## {project_name}\n\n```mermaid\n{arch_mermaid}\n```\n"
         else:
@@ -6869,6 +7553,24 @@ typical passive/active bands).</p>
     POWER --> DIGITAL
     POWER --> ANALOG
     DIGITAL --> ANALOG'''
+
+    @staticmethod
+    def _reflow_long_mermaid(mermaid_src: str) -> str:
+        """Rewrite `flowchart LR` / `graph LR` to `TD` when the chain has
+        enough nodes that left-to-right layout turns into an unreadable
+        horizontal strip in the browser. Threshold is 8 arrows — below
+        that LR is fine; above that TD wraps cleanly on a 1920px viewport.
+
+        Leaves non-LR diagrams untouched. No-op on empty input."""
+        if not mermaid_src or not isinstance(mermaid_src, str):
+            return mermaid_src
+        arrow_count = mermaid_src.count("-->")
+        if arrow_count < 8:
+            return mermaid_src
+        out = re.sub(r"^(\s*)flowchart\s+LR\b", r"\1flowchart TD", mermaid_src, count=1, flags=re.MULTILINE)
+        if out == mermaid_src:
+            out = re.sub(r"^(\s*)graph\s+LR\b", r"\1graph TD", mermaid_src, count=1, flags=re.MULTILINE)
+        return out
 
     def _extract_components(self, response_content: str) -> list:
         """Extract component recommendations from response."""

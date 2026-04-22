@@ -104,6 +104,22 @@ _TRUSTED_VENDOR_DOMAINS = frozenset({
     "www.microsemi.com", "microsemi.com",
     "www.wavestream.com", "wavestream.com",
     "www.crystek.com", "crystek.com",
+    # Distributor-hosted datasheet mirrors. Mouser/DigiKey cache vendor PDFs
+    # at stable URLs (e.g. mouser.com/datasheet/3/xxx.pdf) and the LLM tends
+    # to return these when the vendor's own site has moved. Treat them as
+    # trusted for the offline probe — the URLs are still machine-verifiable
+    # at demo time if the proxy allows.
+    "www.mouser.com", "mouser.com",
+    "www.mouser.in", "mouser.in",
+    "www.mouser.co.uk", "mouser.co.uk",
+    "www.mouser.de", "mouser.de",
+    "www.digikey.com", "digikey.com",
+    "www.digikey.in", "digikey.in",
+    "www.digikey.co.uk", "digikey.co.uk",
+    "www.arrow.com", "arrow.com",
+    "www.avnet.com", "avnet.com",
+    "www.farnell.com", "farnell.com",
+    "www.newark.com", "newark.com",
 })
 
 

@@ -41,6 +41,10 @@ class Netlist(BaseModel):
     edges: list[NetlistEdge] = Field(default_factory=list)
     power_nets: list[str] = Field(default_factory=list)
     ground_nets: list[str] = Field(default_factory=list)
+    # Explicit per-IC power binding: {ref: {pin_name: rail_name}}.
+    # Lets downstream tools verify every VCC/VDD/AVDD pin is bound to a
+    # named rail without re-deriving it from the edge list.
+    power_map: dict[str, dict[str, str]] = Field(default_factory=dict)
     mermaid_diagram: str = ""
     validation_errors: list[str] = Field(default_factory=list)
     validation_warnings: list[str] = Field(default_factory=list)

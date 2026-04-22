@@ -513,15 +513,104 @@ async def get_clarification_questions(project_id: int, body: ClarifyRequest):
 # CHAT_DEADLINE_S in .env if the upstream LLM is unusually slow.
 _CHAT_DEADLINE_S = float(os.environ.get("CHAT_DEADLINE_S", "600"))
 
+# ── Async chat task store (in-memory) ─────────────────────────────────────────
+# Long-running P1 finalize requests can blow past any sane HTTP deadline
+# (5–15 min on dense RF with retry stacking). Instead of stretching the
+# wait_for ceiling — which still hangs the connection — we spawn the work
+# as an asyncio.Task and return a handle. Frontend polls until done.
+#
+# Storage is process-local: a uvicorn restart drops in-flight tasks. That
+# matches today's behaviour (restart already kills the request) and avoids
+# the operational weight of Redis or a DB-backed queue. Completed tasks
+# get GC'd `_TASK_TTL_S` after they finish so the dict doesn't grow.
+_chat_tasks: dict = {}
+_TASK_TTL_S = 3600  # keep finished tasks for 1h so slow polls still find them
+
+
+def _gc_chat_tasks() -> None:
+    """Drop finished tasks older than the TTL. Cheap; called on every poll."""
+    import time as _time
+    now = _time.time()
+    for tid in list(_chat_tasks.keys()):
+        t = _chat_tasks[tid]
+        finished_at = t.get("finished_at")
+        if finished_at and now - finished_at > _TASK_TTL_S:
+            _chat_tasks.pop(tid, None)
+
+
+async def _run_chat_task(task_id: str, project_id: int, message: str) -> None:
+    """Background runner — no HTTP deadline, persists state on completion."""
+    import time as _time
+    try:
+        result = await _chat_svc().send_message(project_id, message)
+        _chat_tasks[task_id].update({
+            "status": "complete",
+            "result": result,
+            "finished_at": _time.time(),
+        })
+        log.info(
+            "chat.async_task_complete task_id=%s project_id=%s phase_complete=%s",
+            task_id, project_id, result.get("phase_complete"),
+        )
+    except Exception as exc:
+        log.exception(
+            "chat.async_task_failed task_id=%s project_id=%s",
+            task_id, project_id,
+        )
+        _chat_tasks[task_id].update({
+            "status": "failed",
+            "error": str(exc),
+            "finished_at": _time.time(),
+        })
+
 
 @app.post("/api/v1/projects/{project_id}/chat", tags=["chat"])
 async def chat(project_id: int, body: dict):
-    """Send a message to the Phase 1 requirements agent."""
+    """Send a message to the Phase 1 requirements agent.
+
+    Two paths:
+      • Async (HTTP 202) — message starts with `__FINALIZE__` or body
+        sets `async: true`. Spawns a background task and returns
+        `{task_id, status: "running"}`. Client polls
+        `GET /chat/tasks/{task_id}` until status is "complete"/"failed".
+      • Sync (HTTP 200) — everything else. Wizard turns and short Q&A
+        complete in seconds, so the polling round-trip would be wasted
+        latency.
+    """
     import asyncio as _asyncio
+    import time as _time
+    import uuid as _uuid
+    from fastapi.responses import JSONResponse
+
     message = (body.get("message") or "").strip()
     if not message:
         raise HTTPException(400, "message is required")
 
+    # Async path — finalize is the only message type that routinely blows
+    # past the HTTP deadline. Routing it through the background runner
+    # frees the HTTP connection immediately and lets the LLM + audit
+    # loop run for as long as it needs.
+    if message.startswith("__FINALIZE__") or body.get("async"):
+        task_id = _uuid.uuid4().hex
+        _chat_tasks[task_id] = {
+            "project_id": project_id,
+            "status": "running",
+            "started_at": _time.time(),
+            "message_preview": message[:200],
+            "result": None,
+            "error": None,
+        }
+        _asyncio.create_task(_run_chat_task(task_id, project_id, message))
+        log.info(
+            "chat.async_task_spawned task_id=%s project_id=%s",
+            task_id, project_id,
+        )
+        return JSONResponse(
+            content={"task_id": task_id, "status": "running"},
+            status_code=202,
+        )
+
+    # Sync path — kept for short turns where polling would be wasteful.
     try:
         result = await _asyncio.wait_for(
             _chat_svc().send_message(project_id, message),
@@ -545,6 +634,37 @@ async def chat(project_id: int, body: dict):
     except Exception as exc:
         log.exception("api.chat_failed", extra={"project_id": project_id})
         raise HTTPException(500, str(exc))
+
+
+@app.get("/api/v1/projects/{project_id}/chat/tasks/{task_id}", tags=["chat"])
+async def get_chat_task(project_id: int, task_id: str):
+    """Poll a background chat task spawned via POST /chat with a long
+    message. Response shape:
+      {
+        task_id, status, elapsed_s,
+        result?, error?
+      }
+    `status` is one of running / complete / failed. `result` mirrors the
+    sync chat response when status == complete.
+    """
+    import time as _time
+    _gc_chat_tasks()
+
+    task = _chat_tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "task not found or expired")
+    if task["project_id"] != project_id:
+        raise HTTPException(403, "task does not belong to this project")
+
+    now = _time.time()
+    elapsed = (task.get("finished_at") or now) - task["started_at"]
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "elapsed_s": round(elapsed, 1),
+        "result": task.get("result"),
+        "error": task.get("error"),
+    }
 
 
 # ── Configuration Settings ────────────────────────────────────────────────────────

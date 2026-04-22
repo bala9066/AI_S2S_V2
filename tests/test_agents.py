@@ -93,13 +93,21 @@ def mock_llm_tool_response():
 
 @pytest.fixture
 def mock_llm_netlist_response():
-    """Create a mock LLM response for netlist generation."""
+    """Create a mock LLM response for netlist generation.
+
+    Includes a synthetic supply connector (J_PWR) and bulk decap (C1) so
+    the post-execute DRC pass clears overall_pass — the netlist agent
+    now gates `phase_complete` on DRC.
+    """
     tool_block = {
         "id": "tool-456",
         "name": "generate_netlist",
         "input": {
             "nodes": [
-                {"instance_id": "U1", "part_number": "STM32F103", "component_name": "MCU", "reference_designator": "U1"}
+                {"instance_id": "U1", "part_number": "STM32F103", "component_name": "MCU", "reference_designator": "U1"},
+                {"instance_id": "R1", "part_number": "RES_1K", "component_name": "Resistor", "reference_designator": "R1"},
+                {"instance_id": "J_PWR", "part_number": "PWR_HEADER", "component_name": "Supply Connector", "reference_designator": "J_PWR"},
+                {"instance_id": "C1", "part_number": "CAP_100N", "component_name": "Decoupling Cap", "reference_designator": "C1"},
             ],
             "edges": [
                 {
@@ -109,7 +117,15 @@ def mock_llm_netlist_response():
                     "to_instance": "R1",
                     "to_pin": "1",
                     "signal_type": "digital",
-                }
+                },
+                {
+                    "net_name": "VCC",
+                    "from_instance": "J_PWR",
+                    "from_pin": "1",
+                    "to_instance": "C1",
+                    "to_pin": "1",
+                    "signal_type": "power",
+                },
             ],
             "power_nets": ["VCC"],
             "ground_nets": ["GND"],
