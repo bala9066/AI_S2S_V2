@@ -234,14 +234,25 @@ async def test_agent_phase_complete_false_marks_phase_failed(pipe_env):
 
 
 # ---------------------------------------------------------------------------
-# Auto-phases table shape — guards the P5/P7 manual exclusion
+# Auto-phases table shape — guards the manual-vs-automated split
 # ---------------------------------------------------------------------------
 
-def test_auto_phases_excludes_manual_p5_and_p7_does_include_all_ai_phases():
+def test_auto_phases_excludes_manual_and_includes_all_ai_phases():
+    """P1 is driven by chat (not the pipeline), P5 is the only remaining
+    manual phase (PCB layout). Every other phase — including P7 (FPGA
+    RTL) and P7a (register map) — must be present so the pipeline runs
+    them end-to-end."""
     from services.pipeline_service import AUTO_PHASES
     phase_ids = [p[0] for p in AUTO_PHASES]
-    # P5 (PCB layout) and P1 (P1 is driven by chat, not pipeline) must NOT be here
     assert "P1" not in phase_ids
     assert "P5" not in phase_ids
-    # Every auto AI phase must be here
     assert set(phase_ids) == {"P2", "P3", "P4", "P6", "P7", "P7a", "P8a", "P8b", "P8c"}
+
+
+def test_auto_phases_matches_phase_catalog():
+    """Regression guard: `pipeline_service.AUTO_PHASES` must be the same
+    list as `phase_catalog.AUTO_PHASE_SPECS` — any drift means callers
+    like ProjectService reset the wrong set of downstream phases."""
+    from services.pipeline_service import AUTO_PHASES
+    from services.phase_catalog import AUTO_PHASE_SPECS
+    assert tuple(AUTO_PHASES) == AUTO_PHASE_SPECS

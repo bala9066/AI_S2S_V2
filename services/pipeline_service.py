@@ -17,23 +17,18 @@ import time
 from typing import Optional
 
 from config import settings
+from services.phase_catalog import AUTO_PHASE_SPECS
 from services.project_service import ProjectService
 from services.storage import StorageAdapter
 
 log = logging.getLogger(__name__)
 
-# Phase metadata: (phase_id, agent_module, agent_class, phase_name)
-AUTO_PHASES = [
-    ("P2",  "agents.document_agent",   "DocumentAgent",    "HRS Document"),
-    ("P3",  "agents.compliance_agent", "ComplianceAgent",  "Compliance"),
-    ("P4",  "agents.netlist_agent",    "NetlistAgent",     "Netlist"),
-    ("P6",  "agents.glr_agent",        "GLRAgent",         "GLR"),
-    ("P7",  "agents.fpga_agent",       "FpgaAgent",        "FPGA RTL Design"),
-    ("P7a", "agents.rdt_psq_agent",    "RdtPsqAgent",      "Register Map & Programming Sequence"),
-    ("P8a", "agents.srs_agent",        "SRSAgent",         "SRS"),
-    ("P8b", "agents.sdd_agent",        "SDDAgent",         "SDD"),
-    ("P8c", "agents.code_agent",       "CodeAgent",        "Code + Review"),
-]
+# Phase metadata is owned by `services.phase_catalog` so that
+# `project_service` and `stale_phases` can reset / audit the same set of
+# downstream phases without the three lists drifting apart. We keep the
+# `AUTO_PHASES` alias (as a list, so tests can `[p[0] for p in AUTO_PHASES]`)
+# for back-compat with call sites that import from here.
+AUTO_PHASES = list(AUTO_PHASE_SPECS)
 
 
 class PipelineService:

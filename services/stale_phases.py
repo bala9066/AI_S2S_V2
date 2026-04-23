@@ -6,9 +6,14 @@ Contract (see ADR-003 §5, §6):
 A phase's output is stale when the project's current `requirements_hash` does
 not equal the `requirements_hash_at_completion` stamped on that phase's most
 recent entry in `phase_statuses`. Phases that have never completed are NOT
-considered stale — they're just pending. Manual phases (P5, P7) are excluded
-from stale detection because the lock only pins RF/SW requirements; PCB and
-FPGA artefacts live outside the lock's scope.
+considered stale — they're just pending. The one remaining manual phase (P5,
+PCB layout) is excluded from stale detection because the lock only pins
+RF/SW/FPGA requirements — PCB artefacts live outside the lock's scope and
+are hand-owned.
+
+Historical note: P7 (FPGA RTL) used to be manual and was excluded here;
+once it became a scripted phase behind `FpgaAgent`, we moved it into
+`AI_PHASES` so P1 re-locks invalidate its output like any other AI phase.
 
 Used by:
   - `main.py` — "Re-run all stale phases" button surface.
@@ -23,20 +28,24 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Optional
 
-# Canonical ordered list of AI phases. P5 and P7 are manual and thus skipped.
-AI_PHASES: tuple[str, ...] = (
-    "P1", "P2", "P3", "P4", "P6", "P8a", "P8b", "P8c",
+from services.phase_catalog import (
+    AUTO_PHASE_IDS,
+    DOWNSTREAM_OF_P1 as _CATALOG_DOWNSTREAM_OF_P1,
+    MANUAL_PHASE_IDS,
 )
 
-MANUAL_PHASES: tuple[str, ...] = ("P5", "P7")
+# Canonical ordered list of AI phases — P1 (lock owner) + every automated
+# downstream phase. Sourced from `phase_catalog` so `pipeline_service`,
+# `project_service` and this module can never disagree about which phase
+# needs what.
+AI_PHASES: tuple[str, ...] = ("P1",) + AUTO_PHASE_IDS
 
-# Downstream dependencies: if phase X is re-run, which phases have to be
-# re-run afterwards (assuming their current output was built on the old lock)?
-# Kept minimal — the staleness check is the real authority. This map only
-# sequences the re-run order.
-DOWNSTREAM_OF_P1: tuple[str, ...] = (
-    "P2", "P3", "P4", "P6", "P8a", "P8b", "P8c",
-)
+MANUAL_PHASES: tuple[str, ...] = MANUAL_PHASE_IDS
+
+# Downstream dependencies: if P1 is re-run, which phases have to be re-run
+# afterwards (assuming their current output was built on the old lock)?
+# Kept as a module-level name for back-compat; re-exported from the catalog.
+DOWNSTREAM_OF_P1: tuple[str, ...] = tuple(_CATALOG_DOWNSTREAM_OF_P1)
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
@@ -95,12 +104,11 @@ def stale_phase_ids(
 
     order = list(phase_order) if phase_order is not None else list(AI_PHASES)
     if include_manual:
-        # Manual phases go in pipeline order: P5 after P4, P7 after P6.
-        order_with_manual: list[str] = []
-        for p in order:
-            order_with_manual.append(p)
-        # Insert manual phases at their natural points if not already there.
-        for manual, anchor in (("P5", "P4"), ("P7", "P6")):
+        # Manual phases go in pipeline order. Today only P5 is manual —
+        # it's inserted right after P4 (PCB follows netlist). If we ever
+        # reintroduce a manual phase with a different anchor, add it here.
+        order_with_manual: list[str] = list(order)
+        for manual, anchor in (("P5", "P4"),):
             if manual not in order_with_manual and anchor in order_with_manual:
                 order_with_manual.insert(order_with_manual.index(anchor) + 1, manual)
         order = order_with_manual
@@ -152,16 +160,16 @@ def rerun_plan(
     order = [p for p in AI_PHASES if p in stale]
     if include_manual:
         # Surface manual phases where the upstream AI phase they depend on is
-        # being re-run — PCB follows P4, FPGA follows P6.
+        # being re-run. Today only PCB (P5) follows P4 — FPGA (P7) used to
+        # be manual but is now an AI phase and flows through `AI_PHASES`
+        # above without special-casing.
         if "P4" in stale:
             order.append("P5")
-        if "P6" in stale:
-            order.append("P7")
 
     blocked_by_manual: list[str] = []
-    # If P4 is stale and P5 is marked completed but without a hash stamp,
-    # flag it — PCB artefact likely needs rework.
-    for upstream, manual in (("P4", "P5"), ("P6", "P7")):
+    # If the upstream AI phase is stale but the manual phase is marked
+    # completed, flag it — the manual artefact likely needs rework.
+    for upstream, manual in (("P4", "P5"),):
         if upstream in stale:
             m_entry = _phase_status_entry(project_row, manual)
             if _is_completed(m_entry):

@@ -63,10 +63,12 @@ def test_p1_is_not_tracked_as_stale():
 
 
 def test_all_downstream_phases_considered():
-    """Make sure every downstream AI phase is in the watchlist."""
+    """Make sure every downstream AI phase is in the watchlist. P7 is
+    included alongside P7a — FPGA RTL is automated now and resets with
+    the rest when the P1 lock is re-frozen."""
     statuses = {
         pid: {"status": "completed", "requirements_hash_at_completion": "old"}
-        for pid in ("P2", "P3", "P4", "P6", "P7a", "P8a", "P8b", "P8c")
+        for pid in ("P2", "P3", "P4", "P6", "P7", "P7a", "P8a", "P8b", "P8c")
     }
     stale = compute_stale_phase_ids(statuses, current_hash="new")
-    assert set(stale) == {"P2", "P3", "P4", "P6", "P7a", "P8a", "P8b", "P8c"}
+    assert set(stale) == {"P2", "P3", "P4", "P6", "P7", "P7a", "P8a", "P8b", "P8c"}

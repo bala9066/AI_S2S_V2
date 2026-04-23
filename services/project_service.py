@@ -31,6 +31,7 @@ from database.models import (
     ProjectDB,
     PhaseOutputDB,
 )
+from services.phase_catalog import DOWNSTREAM_OF_P1
 from services.project_reset import (
     RESETTABLE_COLUMNS as _RESETTABLE_COLUMNS,
     summarise_reset,
@@ -73,10 +74,12 @@ def _project_to_dict(p: ProjectDB) -> dict:
 # A2.1 — stale-phase detection
 # ---------------------------------------------------------------------------
 
-# All downstream AI phases that depend on P1 requirements
-_DOWNSTREAM_AI_PHASES: tuple[str, ...] = (
-    "P2", "P3", "P4", "P6", "P7a", "P8a", "P8b", "P8c",
-)
+# All downstream AI phases that depend on P1 requirements. Owned by
+# `services.phase_catalog` (single source of truth); re-exported here as a
+# tuple for the legacy `compute_stale_phase_ids` API below. Including P7
+# (FPGA RTL) is deliberate — P7 is now automated and must be reset when
+# the P1 lock changes.
+_DOWNSTREAM_AI_PHASES: tuple[str, ...] = tuple(DOWNSTREAM_OF_P1)
 
 
 def compute_stale_phase_ids(
@@ -222,8 +225,12 @@ class ProjectService:
 
     # ── Phase status ────────────────────────────────────────────────────────
 
-    # All AI phase IDs downstream of P1 — must be reset when P1 requirements change
-    _DOWNSTREAM_AI_PHASES = ["P2", "P3", "P4", "P6", "P7a", "P8a", "P8b", "P8c"]
+    # All AI phase IDs downstream of P1 — must be reset when P1 requirements
+    # change. Sourced from `phase_catalog.DOWNSTREAM_OF_P1` so there's one
+    # authoritative list for `pipeline_service`, `project_service` and
+    # `stale_phases` to share. Includes P7 (FPGA RTL) — promoted from manual
+    # to automated so it now resets alongside P7a.
+    _DOWNSTREAM_AI_PHASES = list(DOWNSTREAM_OF_P1)
 
     def set_phase_status(
         self,

@@ -14,6 +14,7 @@ import LoadProjectModal from './components/LoadProjectModal';
 import LLMSettingsModal from './components/LLMSettingsModal';
 import JudgeMode from './components/JudgeMode';
 import RerunPlanDrawer from './components/RerunPlanDrawer';
+import FlowPanel from './components/FlowPanel';
 import Toast from './components/Toast';
 import ErrorBoundary from './components/ErrorBoundary';
 import ChatView from './views/ChatView';
@@ -653,6 +654,26 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* Right-side Flow Panel — always-visible step-by-step execution flow
+          for the currently-selected phase. FlowPanel is self-sized (300px,
+          borderLeft on itself) so it slots into the flex row without needing
+          a wrapper. Without this mount the v5 layout regressed to a two-pane
+          view and the Run/Re-run surface on the right was lost. */}
+      <ErrorBoundary>
+        <FlowPanel
+          phase={selectedPhase}
+          status={selectedStatus}
+          onExecute={() => handleExecutePhase(selectedPhase.id)}
+          pipelineRunning={hasRunning}
+          scope={scope}
+          onNotApplicable={() =>
+            setToast(
+              `${selectedPhase.code} is not applicable to the '${scope ?? 'full'}' scope`,
+            )
+          }
+        />
+      </ErrorBoundary>
 
     </div>
       {/* Modals rendered OUTSIDE the overflow:hidden flex container so position:fixed works correctly */}

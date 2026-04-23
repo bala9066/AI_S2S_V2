@@ -32,7 +32,11 @@ interface Props {
   projectId: number | null;
 }
 
-const PHASE_ORDER = ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8a', 'P8b', 'P8c'];
+// Canonical phase ordering mirrors `services.phase_catalog.AUTO_PHASE_IDS`
+// plus P1 (lock owner) and P5 (manual PCB). P7 (FPGA RTL) and P7a (Register
+// Map) are both automated — omitting either under-reports stale FPGA work
+// in the rerun plan and the per-phase status badges.
+const PHASE_ORDER = ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P7a', 'P8a', 'P8b', 'P8c'];
 
 export default function RerunPlanDrawer({ projectId }: Props) {
   const [open, setOpen] = useState(false);

@@ -79,11 +79,25 @@ def test_pending_and_inprogress_phases_ignored():
 
 
 def test_manual_phases_excluded_by_default():
+    # P5 (PCB layout) is the only manual phase left — P7 was promoted to
+    # an automated AI phase and must now surface as stale under the lock.
     row = _project(phase_statuses={
         "P5": _completed("old-hash"),
-        "P7": _completed("old-hash"),
     })
     assert stale_phase_ids(row) == []
+
+
+def test_p7_is_now_an_ai_phase_not_manual():
+    # Regression guard: P7 was moved out of MANUAL_PHASES when FpgaAgent
+    # started running under PipelineService.AUTO_PHASES. A stale P7
+    # completion hash must surface in `stale_phase_ids`.
+    row = _project(phase_statuses={
+        "P7": _completed("old-hash"),
+        "P7a": _completed("old-hash"),
+    })
+    stale = stale_phase_ids(row)
+    assert "P7" in stale
+    assert "P7a" in stale
 
 
 def test_manual_phases_included_when_requested():
@@ -156,7 +170,10 @@ def test_phase_status_summary_labels():
     assert s["P4"] == "failed"
     assert s["P6"] == "pending"
     assert s["P5"] == "manual"
-    assert s["P7"] == "manual"
+    # P7 is an AI phase now — with no entry in phase_statuses it defaults
+    # to pending like any other uncompleted AI phase.
+    assert s["P7"] == "pending"
+    assert s["P7a"] == "pending"
 
 
 def test_ai_phases_list_excludes_manual():
