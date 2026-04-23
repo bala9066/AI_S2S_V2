@@ -503,6 +503,37 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                 schematic_data["auto_synthesized"] = True
             outputs["schematic.json"] = json.dumps(schematic_data, indent=2)
 
+            # P1 — post-synthesis schematic DRC. The pre-synthesis
+            # `run_drc` above only sees nodes + edges; everything that
+            # `_synthesize_schematic` adds afterwards (off-page
+            # connectors, decoupling caps, terminations, test points,
+            # cross-sheet wiring) used to skip validation entirely. This
+            # pass flattens the synthesised sheets back into the same
+            # nodes/edges shape and re-runs the DRC rule set, so any
+            # short / floating-net / pin_multiple_nets violation
+            # introduced by synthesis surfaces in `schematic_drc.json`.
+            try:
+                from tools.netlist_drc import run_schematic_drc
+                schematic_drc = run_schematic_drc(schematic_data)
+                outputs["schematic_drc.json"] = json.dumps(
+                    schematic_drc, indent=2
+                )
+                if not schematic_drc.get("overall_pass", True):
+                    drc_passed = False
+                    _sc = schematic_drc.get("counts", {})
+                    if drc_summary:
+                        drc_summary += (
+                            f" | Schematic DRC: {_sc.get('critical', 0)} "
+                            f"critical, {_sc.get('high', 0)} high"
+                        )
+                    else:
+                        drc_summary = (
+                            f"Schematic DRC: {_sc.get('critical', 0)} "
+                            f"critical, {_sc.get('high', 0)} high"
+                        )
+            except Exception as _sdrc_exc:
+                self.log(f"schematic_drc_failed: {_sdrc_exc}", "warning")
+
             self.log(f"Netlist: {len(netlist_data.get('nodes', []))} nodes, {len(netlist_data.get('edges', []))} edges")
 
         else:
@@ -585,6 +616,29 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             _fb_schematic["source"] = "auto_synthesized"
             _fb_schematic["auto_synthesized"] = True
             outputs["schematic.json"] = json.dumps(_fb_schematic, indent=2)
+            # Bug #1 — schematic post-synthesis DRC must also run on the
+            # BOM-fallback path (not just the LLM-emitted path). Flatten the
+            # multi-sheet schematic back into {nodes, edges} and run_drc over
+            # it so we catch shorts introduced by the auto-synthesis stage
+            # (cross-sheet OPC aliasing, etc.).
+            try:
+                from tools.netlist_drc import run_schematic_drc
+                schematic_drc = run_schematic_drc(_fb_schematic)
+                outputs["schematic_drc.json"] = json.dumps(
+                    schematic_drc, indent=2
+                )
+                if not schematic_drc.get("overall_pass", True):
+                    drc_passed = False
+                    _sc = schematic_drc.get("counts", {})
+                    _sfx = (
+                        f"Schematic DRC: {_sc.get('critical', 0)} critical, "
+                        f"{_sc.get('high', 0)} high"
+                    )
+                    drc_summary = (
+                        f"{drc_summary} | {_sfx}" if drc_summary else _sfx
+                    )
+            except Exception as _sdrc_exc:
+                self.log(f"schematic_drc_failed: {_sdrc_exc}", "warning")
 
         # Phase only flips to "complete" when structured DRC clears with
         # zero critical / high violations. Outputs are still written so
@@ -653,6 +707,34 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             if any(k in blob for k in ("connector", "jack", "sma",
                                        "header")):
                 return "connector"
+            # P6 — passives & RF blocks should not be force-fed VCC/GND
+            # edges when the LLM omits explicit pin metadata. Detect
+            # them by ref prefix (R*, C*, L*, FB*) and by part-name
+            # keywords (resistor, capacitor, inductor, ferrite). RF
+            # blocks (LNA / mixer / filter / coupler / attenuator /
+            # balun / switch) are picked up by their keywords and a
+            # broader set of passive RF parts that legitimately have no
+            # supply pin in the BOM model — feeding them synthetic VCC
+            # and GND edges fabricates connectivity that downstream
+            # tools then trust.
+            if any(ref.startswith(p) for p in ("R", "C", "L", "FB", "FER")) and \
+                    not ref.startswith(("REG", "LDO", "RFP", "CONN")):
+                # Heuristic: short ref like "R3", "C12", "L2" → passive
+                tail = ref[1:] if ref else ""
+                if tail and tail[0].isdigit():
+                    return "passive"
+            if any(k in blob for k in ("resistor", "capacitor", "inductor",
+                                       "ferrite bead", "ferrite",
+                                       "termination", " bead")):
+                return "passive"
+            if any(k in blob for k in ("lna", "low noise amp",
+                                       "mixer", "downconvert", "upconvert",
+                                       "balun", "coupler", "attenuator",
+                                       "rf switch", "rf filter", "saw",
+                                       "isolator", "circulator",
+                                       "splitter", "combiner",
+                                       "transformer", "matching network")):
+                return "rf_block"
             return "ic"
 
         def _power_pin(name: str) -> bool:
@@ -754,6 +836,22 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             gnd_pins = [p.get("pin_name") or p.get("name")
                         for p in node_pins if _gnd_pin(p.get("pin_name")
                         or p.get("name") or "")]
+
+            # P6 — passives (R/C/L/ferrite) and RF blocks (LNA, mixer,
+            # filter, coupler, etc.) don't get synthetic VCC/GND edges
+            # invented for them. The pre-fix code defaulted vcc_pins
+            # to ["VCC"] and gnd_pins to ["GND"] for any node lacking
+            # an explicit pin map, which fabricated supply edges on
+            # passive RF parts and let those edges propagate into the
+            # netlist DRC + schematic synthesis as if they were real.
+            #
+            # Exception: if the node DID declare power/ground pins in
+            # its `pins` list, honour those (rare but legitimate — an
+            # active mixer with VCC, a powered SAW filter, etc.).
+            if role in ("passive", "rf_block") and not (
+                vcc_pins or gnd_pins
+            ):
+                continue
 
             if not vcc_pins:
                 vcc_pins = ["VCC"]
@@ -1353,10 +1451,29 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
 
         # ── Build sheets ──────────────────────────────────────────────────
         sheets = []
-        g_cap = 0
-        g_gnd = 0
+        # Seed auto-ref counters past any LLM-provided refs so the new
+        # floating-pin closure doesn't collide with R1/C1/etc. already in
+        # the netlist. For each prefix we find the highest existing number
+        # and start counting above it. Missing prefix → counter stays at 0.
+        def _max_ref_index(prefix: str) -> int:
+            import re as _re
+            pat = _re.compile(rf"^{_re.escape(prefix)}(\d+)$")
+            hi = 0
+            for _r in ref_node.keys():
+                m = pat.match(_r)
+                if m:
+                    try:
+                        n = int(m.group(1))
+                        if n > hi:
+                            hi = n
+                    except ValueError:
+                        pass
+            return hi
+
+        g_cap = _max_ref_index("C")
+        g_gnd = _max_ref_index("GND")
         g_pwr = 0
-        g_res = 0
+        g_res = _max_ref_index("R")
 
         for sheet_key in SHEET_ORDER:
             refs = sheet_map.get(sheet_key, [])
@@ -1513,12 +1630,48 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                                           {"ref": tgt, "pin": tp["name"]}],
                         })
 
-            # ── Tie unconnected differential _2/N input pins to GND ─────
-            # Covers cases like single-ended source → differential input
+            # ── Floating-pin closure (P2 — broaden coverage) ─────────────
+            # Pre-fix code only AC-grounded differential _N / _2 input
+            # pins on the left side. Sync, lock-detect, SPI, EN, RST,
+            # spare FPGA pins and generic single-ended I/O all fell
+            # through, so the schematic shipped with floating pins even
+            # though the prompt promised zero. Strategy:
+            #
+            #   • Differential _N/_2 inputs (left)  → AC-cap to GND
+            #   • Active-low control (CS/SS/RST/RESET/EN_N) → 10k pull-up
+            #   • Active-high control + sync (EN/SYNC/RDY/IRQ/INT/...
+            #     when on left) → 10k pull-down
+            #   • SPI control pins on the LEFT with no driver → 10k
+            #     pull-down (SCLK/SDIN/CS) — assumes upstream FPGA wiring
+            #     is missing rather than that this pin is a bus host
+            #   • LOCK_DET / status outputs (right side) → test point
+            #   • Generic single-ended outputs (right) with no sink →
+            #     test point
+            #   • Generic single-ended inputs (left) with no driver →
+            #     10k pull-down
+            #
+            # All terminations route to the existing GND star (or VCC
+            # symbol) so the post-synthesis DRC sees a fully bound net.
             connected_pins: set = set()
             for net in nets:
                 for ep in net["endpoints"]:
                     connected_pins.add((ep["ref"], ep["pin"]))
+
+            def _is_pull_up_pin(name_up: str) -> bool:
+                # Active-low control pins idle high — pulled up.
+                if name_up in ("CS", "SS", "RST", "RESET", "OE", "WE"):
+                    return True
+                if name_up.endswith("_N") and name_up.startswith(
+                        ("CS", "SS", "RST", "RESET", "EN", "OE", "WE", "INT", "IRQ")):
+                    return True
+                return False
+
+            def _is_status_output(name_up: str) -> bool:
+                return name_up.startswith((
+                    "LOCK_DET", "LOCK", "PG", "POWERGOOD", "PWRGD",
+                    "RDY", "READY", "ALERT", "FAULT", "STATUS",
+                ))
+
             for c in comps:
                 if c["type"] != "ic" or "pins" not in c:
                     continue
@@ -1526,28 +1679,156 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                     if (c["ref"], p["name"]) in connected_pins:
                         continue
                     pn = p["name"].upper()
-                    # Skip power/gnd pins (handled above)
-                    if pn in ("GND", "AGND", "DGND") or pn.startswith("VCC") or pn.startswith("VDD") or pn.startswith("AVDD") or pn.startswith("DVDD"):
+                    side = p.get("side", "")
+                    # Skip power/ground rails — handled by the topology pass.
+                    if pn in ("GND", "AGND", "DGND") or pn.startswith(
+                            ("VCC", "VDD", "AVDD", "DVDD", "VBAT", "VIN")):
                         continue
-                    # Differential N/2 pin with no connection → AC-ground
-                    is_diff_n = (pn.endswith("_2") or pn.endswith("_N")) and p["side"] == "left"
+
+                    # 1. Differential _N / _2 inputs → AC-cap to GND
+                    is_diff_n = (
+                        (pn.endswith("_2") or pn.endswith("_N"))
+                        and side == "left"
+                    )
                     if is_diff_n:
                         g_cap += 1
                         ac_ref = f"C{g_cap}"
                         cx = max(c["x"] - 3, 1)
                         cy = c["y"] + 1
-                        comps.append({"ref": ac_ref, "type": "capacitor", "value": "100nF",
+                        comps.append({"ref": ac_ref, "type": "capacitor",
+                                      "value": "100nF",
                                       "x": cx, "y": cy, "rot": 0})
                         g_gnd += 1
                         gref_ac = f"GND_AC{g_gnd}"
-                        comps.append({"ref": gref_ac, "type": "ground", "value": "GND",
+                        comps.append({"ref": gref_ac, "type": "ground",
+                                      "value": "GND",
                                       "x": cx, "y": cy + 2, "rot": 0})
-                        nets.append({"name": f"AC_GND_{c['ref']}_{p['name']}", "type": "analog",
-                                     "endpoints": [{"ref": c["ref"], "pin": p["name"]},
-                                                   {"ref": ac_ref, "pin": "1"}]})
-                        nets.append({"name": "GND", "type": "ground",
-                                     "endpoints": [{"ref": ac_ref, "pin": "2"},
-                                                   {"ref": gref_ac, "pin": "1"}]})
+                        nets.append({
+                            "name": f"AC_GND_{c['ref']}_{p['name']}",
+                            "type": "analog",
+                            "endpoints": [
+                                {"ref": c["ref"], "pin": p["name"]},
+                                {"ref": ac_ref, "pin": "1"},
+                            ],
+                        })
+                        nets.append({
+                            "name": "GND", "type": "ground",
+                            "endpoints": [
+                                {"ref": ac_ref, "pin": "2"},
+                                {"ref": gref_ac, "pin": "1"},
+                            ],
+                        })
+                        connected_pins.add((c["ref"], p["name"]))
+                        continue
+
+                    # 2. LOCK_DET / status outputs → test point header.
+                    if side == "right" and _is_status_output(pn):
+                        g_pwr += 1
+                        tp_ref = f"TP_{g_pwr}"
+                        comps.append({
+                            "ref": tp_ref, "type": "connector",
+                            "value": f"TP_{pn}",
+                            "x": min(c["x"] + 5, 28),
+                            "y": min(c["y"] + 1, 18), "rot": 0,
+                            "pins": [{"name": "1", "num": "1",
+                                      "side": "left"}],
+                        })
+                        nets.append({
+                            "name": f"{pn}_{c['ref']}", "type": "signal",
+                            "endpoints": [
+                                {"ref": c["ref"], "pin": p["name"]},
+                                {"ref": tp_ref, "pin": "1"},
+                            ],
+                        })
+                        connected_pins.add((c["ref"], p["name"]))
+                        continue
+
+                    # 3. Active-low control on the left → 10k pull-up
+                    if side == "left" and _is_pull_up_pin(pn):
+                        g_res += 1
+                        rref = f"R{g_res}"
+                        rx = max(c["x"] - 3, 1)
+                        ry = max(c["y"] - 1, 1)
+                        comps.append({"ref": rref, "type": "resistor",
+                                      "value": "10k",
+                                      "x": rx, "y": ry, "rot": 90})
+                        g_pwr += 1
+                        vref_pu = f"VCC_PU_{g_pwr}"
+                        comps.append({"ref": vref_pu, "type": "vcc",
+                                      "value": "VCC",
+                                      "x": rx, "y": max(ry - 2, 1),
+                                      "rot": 0})
+                        nets.append({
+                            "name": f"PU_{c['ref']}_{p['name']}",
+                            "type": "signal",
+                            "endpoints": [
+                                {"ref": c["ref"], "pin": p["name"]},
+                                {"ref": rref, "pin": "1"},
+                            ],
+                        })
+                        nets.append({
+                            "name": "VCC", "type": "power",
+                            "endpoints": [
+                                {"ref": rref, "pin": "2"},
+                                {"ref": vref_pu, "pin": "1"},
+                            ],
+                        })
+                        connected_pins.add((c["ref"], p["name"]))
+                        continue
+
+                    # 4. Generic left-side input (control / sync / SPI /
+                    #    spare FPGA / generic single-ended) → 10k
+                    #    pull-down. Conservative default — never floats.
+                    if side == "left":
+                        g_res += 1
+                        rref = f"R{g_res}"
+                        rx = max(c["x"] - 3, 1)
+                        ry = c["y"] + 1
+                        comps.append({"ref": rref, "type": "resistor",
+                                      "value": "10k",
+                                      "x": rx, "y": ry, "rot": 90})
+                        g_gnd += 1
+                        gref_pd = f"GND_PD{g_gnd}"
+                        comps.append({"ref": gref_pd, "type": "ground",
+                                      "value": "GND",
+                                      "x": rx, "y": ry + 2, "rot": 0})
+                        nets.append({
+                            "name": f"PD_{c['ref']}_{p['name']}",
+                            "type": "signal",
+                            "endpoints": [
+                                {"ref": c["ref"], "pin": p["name"]},
+                                {"ref": rref, "pin": "1"},
+                            ],
+                        })
+                        nets.append({
+                            "name": "GND", "type": "ground",
+                            "endpoints": [
+                                {"ref": rref, "pin": "2"},
+                                {"ref": gref_pd, "pin": "1"},
+                            ],
+                        })
+                        connected_pins.add((c["ref"], p["name"]))
+                        continue
+
+                    # 5. Generic right-side output with no sink → test point
+                    if side == "right":
+                        g_pwr += 1
+                        tp_ref = f"TP_{g_pwr}"
+                        comps.append({
+                            "ref": tp_ref, "type": "connector",
+                            "value": f"TP_{pn}",
+                            "x": min(c["x"] + 5, 28),
+                            "y": min(c["y"] + 1, 18), "rot": 0,
+                            "pins": [{"name": "1", "num": "1",
+                                      "side": "left"}],
+                        })
+                        nets.append({
+                            "name": f"{pn}_{c['ref']}", "type": "signal",
+                            "endpoints": [
+                                {"ref": c["ref"], "pin": p["name"]},
+                                {"ref": tp_ref, "pin": "1"},
+                            ],
+                        })
                         connected_pins.add((c["ref"], p["name"]))
 
             # ── Power regulator wiring ────────────────────────────────────
@@ -1617,42 +1898,62 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                 ref_sheet[c["ref"]] = si
 
         # Mixer IF → ADC AIN (cross-sheet)
+        # P3 — every differential off-page connector gets ONE PIN PER
+        # POLARITY. The pre-fix code put both _P and _N onto pin "1" of
+        # a single-pin connector, which collapses the differential pair
+        # into a short. Schematic DRC's pin_multiple_nets rule flags
+        # this now, but the proper fix is to never emit it in the first
+        # place: differential off-page connectors are 2-pin parts with
+        # pin "1"=_P and pin "2"=_N, and the receiving connector mirrors
+        # that mapping.
         all_mixers = [r for r, rl in ref_role.items() if rl == "rf_mixer"]
         all_adcs = [r for r, rl in ref_role.items() if rl == "adc"]
+        diff_opc_pins = [
+            {"name": "P", "num": "1", "side": "left"},
+            {"name": "N", "num": "2", "side": "left"},
+        ]
+        diff_opc_pins_in = [
+            {"name": "P", "num": "1", "side": "right"},
+            {"name": "N", "num": "2", "side": "right"},
+        ]
         for mx in all_mixers:
             for adc in all_adcs:
                 mx_si = ref_sheet.get(mx)
                 adc_si = ref_sheet.get(adc)
                 if mx_si is not None and adc_si is not None:
-                    # Off-page connector on mixer sheet (IF output)
+                    # Off-page connector on mixer sheet (IF output) —
+                    # 2-pin: pin 1 = IF_OUT_P, pin 2 = IF_OUT_N.
                     g_pwr += 1
                     opc1 = f"OPC_{g_pwr}"
                     sheets[mx_si]["components"].append(
-                        {"ref": opc1, "type": "connector", "value": f"→ Sheet {adc_si + 1}",
+                        {"ref": opc1, "type": "connector",
+                         "value": f"→ Sheet {adc_si + 1} (IF diff)",
                          "x": 28, "y": 8, "rot": 0,
-                         "pins": [{"name": "1", "num": "1", "side": "left"}]})
+                         "pins": [dict(p) for p in diff_opc_pins]})
                     sheets[mx_si]["nets"].append(
-                        {"name": f"IF_OUT_{mx}", "type": "analog",
+                        {"name": f"IF_OUT_P_{mx}", "type": "analog",
                          "endpoints": [{"ref": mx, "pin": "IF_OUT_P"},
                                        {"ref": opc1, "pin": "1"}]})
                     sheets[mx_si]["nets"].append(
                         {"name": f"IF_OUT_N_{mx}", "type": "analog",
                          "endpoints": [{"ref": mx, "pin": "IF_OUT_N"},
-                                       {"ref": opc1, "pin": "1"}]})
-                    # Off-page connector on ADC sheet (AIN input)
+                                       {"ref": opc1, "pin": "2"}]})
+                    # Off-page connector on ADC sheet (AIN input) —
+                    # mirrors the mixer-side mapping.
                     g_pwr += 1
                     opc2 = f"OPC_{g_pwr}"
                     sheets[adc_si]["components"].append(
-                        {"ref": opc2, "type": "connector", "value": f"← Sheet {mx_si + 1}",
+                        {"ref": opc2, "type": "connector",
+                         "value": f"← Sheet {mx_si + 1} (IF diff)",
                          "x": 1, "y": 5, "rot": 0,
-                         "pins": [{"name": "1", "num": "1", "side": "right"}]})
+                         "pins": [dict(p) for p in diff_opc_pins_in]})
                     sheets[adc_si]["nets"].append(
-                        {"name": f"IF_OUT_{mx}", "type": "analog",
+                        {"name": f"IF_OUT_P_{mx}", "type": "analog",
                          "endpoints": [{"ref": opc2, "pin": "1"},
                                        {"ref": adc, "pin": "AIN_P"}]})
                     sheets[adc_si]["nets"].append(
                         {"name": f"IF_OUT_N_{mx}", "type": "analog",
-                         "endpoints": [{"ref": opc2, "pin": "1"},
+                         "endpoints": [{"ref": opc2, "pin": "2"},
                                        {"ref": adc, "pin": "AIN_N"}]})
 
         # LO synth → mixer LO (cross-sheet)
@@ -1673,14 +1974,17 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                              "endpoints": [{"ref": lo, "pin": "RF_OUT_N"},
                                            {"ref": mx, "pin": "LO_N"}]})
                     else:
-                        # Cross-sheet via off-page connectors
+                        # Cross-sheet via off-page connectors. Same
+                        # P4 fix as the IF mixer→ADC branch above:
+                        # one pin per polarity, never reuse pin "1"
+                        # for both LO_P and LO_N.
                         g_pwr += 1
                         opc_lo = f"OPC_{g_pwr}"
                         sheets[lo_si]["components"].append(
                             {"ref": opc_lo, "type": "connector",
-                             "value": f"LO → Sheet {mx_si + 1}",
+                             "value": f"LO → Sheet {mx_si + 1} (diff)",
                              "x": 28, "y": 10, "rot": 0,
-                             "pins": [{"name": "1", "num": "1", "side": "left"}]})
+                             "pins": [dict(p) for p in diff_opc_pins]})
                         sheets[lo_si]["nets"].append(
                             {"name": f"LO_P_{lo}", "type": "clock",
                              "endpoints": [{"ref": lo, "pin": "RF_OUT_P"},
@@ -1688,21 +1992,21 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                         sheets[lo_si]["nets"].append(
                             {"name": f"LO_N_{lo}", "type": "clock",
                              "endpoints": [{"ref": lo, "pin": "RF_OUT_N"},
-                                           {"ref": opc_lo, "pin": "1"}]})
+                                           {"ref": opc_lo, "pin": "2"}]})
                         g_pwr += 1
                         opc_mx = f"OPC_{g_pwr}"
                         sheets[mx_si]["components"].append(
                             {"ref": opc_mx, "type": "connector",
-                             "value": f"LO ← Sheet {lo_si + 1}",
+                             "value": f"LO ← Sheet {lo_si + 1} (diff)",
                              "x": 1, "y": 10, "rot": 0,
-                             "pins": [{"name": "1", "num": "1", "side": "right"}]})
+                             "pins": [dict(p) for p in diff_opc_pins_in]})
                         sheets[mx_si]["nets"].append(
                             {"name": f"LO_P_{lo}", "type": "clock",
                              "endpoints": [{"ref": opc_mx, "pin": "1"},
                                            {"ref": mx, "pin": "LO_P"}]})
                         sheets[mx_si]["nets"].append(
                             {"name": f"LO_N_{lo}", "type": "clock",
-                             "endpoints": [{"ref": opc_mx, "pin": "1"},
+                             "endpoints": [{"ref": opc_mx, "pin": "2"},
                                            {"ref": mx, "pin": "LO_N"}]})
 
         # ADC CLK from synth or FPGA

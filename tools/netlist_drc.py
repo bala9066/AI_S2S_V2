@@ -120,6 +120,9 @@ def run_drc(netlist: dict[str, Any]) -> dict[str, Any]:
             })
 
     # -- 2. Power-net collision on a single pin -----------------------------
+    # Track pins that already triggered a power_collision so the generic
+    # rule 2b doesn't double-flag them.
+    power_collided: set[tuple[str, str]] = set()
     for (ref, pin), names in pin_to_nets.items():
         power_hits = [n for n in names if _is_power(n) or n in power_nets]
         if len(set(power_hits)) >= 2:
@@ -131,6 +134,41 @@ def run_drc(netlist: dict[str, Any]) -> dict[str, Any]:
                     + ", ".join(sorted(set(power_hits)))
                 ),
             })
+            power_collided.add((ref, pin))
+
+    # -- 2b. ANY pin on multiple distinct nets (P5 — schematic short hunt) --
+    # A pin is one electrical node. If two distinct net names land on it,
+    # those nets are shorted together. Rule 2 only catches the case where
+    # both nets are power rails; this rule catches the harder-to-spot
+    # case of a signal/clock/analog short — exactly the failure mode of
+    # the off-page-connector aliasing bug (single connector pin reused
+    # for IF_OUT_P + IF_OUT_N, or LO_P + LO_N, collapsing the pair).
+    #
+    # We deliberately allow legitimate "split nets" — two nets carrying
+    # the same logical signal that happen to share a name suffix — by
+    # comparing distinct net *names*, not endpoint counts. Fan-out of
+    # one net to N endpoints is fine.
+    for (ref, pin), names in pin_to_nets.items():
+        if (ref, pin) in power_collided:
+            continue  # already flagged as a power_collision (rule 2)
+        unique_nets = sorted(set(names))
+        if len(unique_nets) < 2:
+            continue
+        # Categorise the colliding nets so the message is actionable.
+        types = sorted({nets_to_type.get(n, "") for n in unique_nets} - {""})
+        type_hint = f"types: {', '.join(types)}" if types else "(no signal_type set)"
+        violations.append({
+            "severity": "high", "rule": "pin_multiple_nets",
+            "location": f"pin/{ref}.{pin}",
+            "detail": (
+                f"Pin {ref}.{pin} is connected to {len(unique_nets)} "
+                f"distinct nets — {', '.join(unique_nets)} — {type_hint}. "
+                "A single pin is one electrical node, so these nets are "
+                "shorted together. If this is a differential pair "
+                "(_P/_N) tied to one off-page connector pin, give each "
+                "polarity its own connector pin."
+            ),
+        })
 
     # -- 3. Floating signal nets (fewer than 2 endpoints) -------------------
     # NOTE: power + ground nets are checked in rule 3b below, which applies
@@ -301,7 +339,7 @@ def run_drc(netlist: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "checks_run": [
-            "shorts", "power_collision", "floating_net",
+            "shorts", "power_collision", "pin_multiple_nets", "floating_net",
             "dangling_power_rail", "power_rail_no_driver",
             "power_naming", "missing_decap", "cdc_boundary_undeclared",
             "unknown_ref",
@@ -310,3 +348,111 @@ def run_drc(netlist: dict[str, Any]) -> dict[str, Any]:
         "counts": counts,
         "overall_pass": counts["critical"] == 0 and counts["high"] == 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Schematic-shape adapter (P1 — close the post-synthesis blind spot)
+# ---------------------------------------------------------------------------
+#
+# `_synthesize_schematic` in the netlist agent emits a different shape
+# than `run_drc` understands: a list of `sheets`, each with `components`
+# and `nets[].endpoints[]`. The schematic post-synthesis adds connectors,
+# off-page nets, decoupling caps, terminations and test points that the
+# pre-synthesis DRC never sees, so a bad schematic can still ship even
+# when `netlist_drc.json` reports `overall_pass: True`.
+#
+# `flatten_schematic_to_netlist` translates the schematic shape back into
+# the `nodes` + `edges` form that `run_drc` reads, so the same set of
+# rules (especially `pin_multiple_nets` for the off-page-connector
+# aliasing bug) applies to the post-synthesis output. `run_schematic_drc`
+# is the convenience wrapper used by callers that already have a
+# `schematic_data` dict in hand.
+
+def flatten_schematic_to_netlist(schematic_data: dict[str, Any]) -> dict[str, Any]:
+    """Convert a multi-sheet schematic dict into `{nodes, edges, ...}`.
+
+    Each sheet's components become nodes (with sheet-of-origin recorded
+    on `_sheet`); each net becomes an edge per consecutive endpoint
+    pair on that net (a star net with N>2 endpoints unfolds into N-1
+    edges sharing the same `net_name`). Power and ground rails are
+    derived from `net.type`.
+    """
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    power_nets: set[str] = set()
+    ground_nets: set[str] = set()
+
+    seen_refs: set[str] = set()
+    sheets = schematic_data.get("sheets") or []
+    for sheet in sheets:
+        sheet_id = sheet.get("id") or sheet.get("title") or ""
+        for c in sheet.get("components") or []:
+            ref = c.get("ref") or c.get("reference_designator") or ""
+            if not ref or ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            nodes.append({
+                "instance_id": ref,
+                "reference_designator": ref,
+                "part_number": c.get("part_number") or c.get("value") or "",
+                "component_name": c.get("value") or c.get("part_number") or "",
+                "pins": c.get("pins") or [],
+                "_sheet": sheet_id,
+                "_type": c.get("type") or "",
+            })
+        for net in sheet.get("nets") or []:
+            name = net.get("name") or ""
+            ntype = (net.get("type") or "").lower()
+            endpoints = net.get("endpoints") or []
+            if not name or len(endpoints) < 2:
+                # A net with one endpoint becomes a half-edge so the
+                # floating-net rule still fires on it.
+                if name and len(endpoints) == 1:
+                    ep = endpoints[0]
+                    edges.append({
+                        "net_name": name,
+                        "from_instance": ep.get("ref"),
+                        "from_pin": ep.get("pin"),
+                        "to_instance": None,
+                        "to_pin": None,
+                        "signal_type": ntype,
+                    })
+                continue
+            # Convert the star net into N-1 edges. Sharing the same
+            # `net_name` is what `pin_to_nets` keys on, so all endpoints
+            # land in the same equivalence class regardless of how the
+            # star is decomposed.
+            anchor = endpoints[0]
+            for ep in endpoints[1:]:
+                edges.append({
+                    "net_name": name,
+                    "from_instance": anchor.get("ref"),
+                    "from_pin": anchor.get("pin"),
+                    "to_instance": ep.get("ref"),
+                    "to_pin": ep.get("pin"),
+                    "signal_type": ntype,
+                })
+            if ntype == "power":
+                power_nets.add(name)
+            elif ntype == "ground":
+                ground_nets.add(name)
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "power_nets": sorted(power_nets),
+        "ground_nets": sorted(ground_nets),
+    }
+
+
+def run_schematic_drc(schematic_data: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a multi-sheet schematic and run the same DRC rule set
+    over it. Used as the post-synthesis check to catch additions made
+    during `_synthesize_schematic` (off-page connectors, terminations,
+    test points, decoupling caps) that never appear in the pre-synthesis
+    netlist."""
+    flat = flatten_schematic_to_netlist(schematic_data)
+    drc = run_drc(flat)
+    drc["source"] = "schematic_post_synthesis"
+    drc["sheet_count"] = len(schematic_data.get("sheets") or [])
+    return drc
