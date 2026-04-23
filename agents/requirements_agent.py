@@ -999,13 +999,69 @@ GENERATE_REQUIREMENTS_TOOL = {
                     "LEGACY FALLBACK — prefer the structured `block_diagram` "
                     "field below. Only populate this if you truly cannot express "
                     "the topology as structured JSON (e.g. the diagram needs a "
-                    "Mermaid feature not exposed by the structured schema). When "
-                    "you do use it:\n"
-                    "  • Start with `flowchart LR` on line 1.\n"
-                    "  • Node label format: `Role / MPN / G+xx NFy.y P1+zz`.\n"
-                    "  • No %%{{init}}%% frontmatter, no %% comments, no `<br/>`.\n"
-                    "  • ASCII only (`Ohm` not Ω, `deg` not °, `u` not µ).\n"
-                    "  • No `|` inside labels — use `/`. No `<>\"'#@` in labels.\n"
+                    "Mermaid feature not exposed by the structured schema).\n"
+                    "\n"
+                    "RULES:\n"
+                    "  - Start with `flowchart LR` on line 1.\n"
+                    "  - Node label format: `Role / MPN / G+xx NFy.y P1+zz` on a "
+                    "single line.\n"
+                    "  - No %%{{init}}%% frontmatter, no %% comments, no `<br/>` "
+                    "(the renderer strips it — multi-line labels silently break).\n"
+                    "  - ASCII only (`Ohm` not Ω, `deg` not °, `u` not µ).\n"
+                    "  - No `|` inside labels — use `/`. The sanitiser converts "
+                    "`|` to `/` because `|` is reserved in Mermaid link labels. "
+                    "Write spec blocks as `G+22 / NF1.6 / P1+22`, not "
+                    "`G+22 | NF1.6 | P1+22`.\n"
+                    "  - No `<>\"'#@` in labels.\n"
+                    "\n"
+                    "SHAPE VOCABULARY — use the correct Mermaid shape per role so "
+                    "the diagram reads as an RF block diagram, not a generic "
+                    "flowchart:\n"
+                    "  - Antenna / output           -> flag    e.g. `ANT1>Ant1]`, `OUT>Out]`\n"
+                    "  - Amplifier / LNA / PA       -> flag    e.g. `LNA1>LNA1]`\n"
+                    "  - Filter / BPF / SAW         -> hexagon e.g. `BPF1{{BPF}}`\n"
+                    "  - Bias-T / splitter / combiner -> rhombus e.g. `BT1{BiasT}`, `SP1{Split}`\n"
+                    "  - Connector / SMA / BNC      -> parallelogram e.g. `SMA1[/SMA/]`\n"
+                    "  - Limiter / attenuator pad   -> trapezoid e.g. `LIM1[/Lim\\]`\n"
+                    "  - Mixer / downconverter      -> rounded e.g. `MIX1(MIX)`\n"
+                    "  - ADC / DAC / digitiser      -> parallelogram-alt e.g. `ADC1[\\ADC\\]`\n"
+                    "  - Oscillator / LO / PLL      -> rounded e.g. `LO1(LO)`\n"
+                    "  - Cumulative-performance cell -> rectangle (ONLY inside the "
+                    "CASCADE subgraph)\n"
+                    "\n"
+                    "FORBIDDEN: plain rectangles (`NODE[Rectangle]`) for ANY active "
+                    "or passive RF block. A rectangle means 'cumulative perf cell' "
+                    "and must live inside the CASCADE subgraph only. Using "
+                    "[Rectangle] for LNA/MIX/BPF/etc. makes the diagram regress to "
+                    "a generic flowchart — the auditor will reject.\n"
+                    "\n"
+                    "CASCADE SUBGRAPH (mandatory, one per diagram):\n"
+                    "  subgraph CASCADE [System Cumulative Performance]\n"
+                    "      CG[Net Gain +37 dB]\n"
+                    "      CNF[System NF 2.1 dB]\n"
+                    "      CP1[Output P1dB +22 dBm]\n"
+                    "      CIP3[Output IIP3 -5 dBm]\n"
+                    "  end\n"
+                    "Use the Friis-formula values from `design_parameters` "
+                    "(`cascaded_nf_db`, `cascaded_gain_db`, `cascaded_p1db_dbm`, "
+                    "`cascaded_iip3_dbm`) — do NOT recompute.\n"
+                    "\n"
+                    "TOPOLOGY MANDATE (senior-architect rules):\n"
+                    "  - Canonical chain: Antenna -> SMA -> Limiter -> Preselector "
+                    "(SAW/BPF) -> Bias-T -> LNA -> Mixer -> IF BPF -> ADC. The "
+                    "Limiter and Preselector are MANDATORY on every receiver "
+                    "front-end.\n"
+                    "  - MULTI-ANTENNA designs (N>1 antennas): one `>AntN]` flag "
+                    "node per antenna, full analog chain replicated per antenna "
+                    "until the combine / beamform stage. Never collapse antennas.\n"
+                    "  - CHANNELISED FILTER BANK designs: one BPF hexagon per "
+                    "channel, parallel arrangement after the LNA. Each channel "
+                    "gets its own cascade row in the CASCADE subgraph.\n"
+                    "  - HIGH-GAIN STABILITY (>60 dB net gain): insert a second "
+                    "BPF between the first and second gain stages to break the "
+                    "feedback loop, and annotate each inter-stage with expected "
+                    "isolation.\n"
+                    "\n"
                     "The backend runs a salvager on any raw Mermaid you emit, but "
                     "salvaged output is lower-quality than rendered structured "
                     "output — use `block_diagram` whenever possible."
@@ -1566,7 +1622,15 @@ class RequirementsAgent(BaseAgent):
     # banned / obsolete / NRND part) we feed the findings back as a user
     # turn and ask the LLM to re-emit `generate_requirements`. Each retry
     # adds one extra LLM round-trip, so cap small.
-    _FIX_ON_FAIL_MAX_RETRIES = 2
+    #
+    # Perf guardrail (2026-04-22): keep this at 1. The deterministic
+    # `_auto_fix_blockers` pass handles the common case for free, and one
+    # LLM retry is enough to catch the residual. A second retry was
+    # observed to never converge when retry 1 didn't — it just added
+    # 3-5 min of latency and pushed worst-case P1 wall-clock past 12 min.
+    # If you bump this, update this comment AND
+    # `tests/agents/test_fix_on_fail_corrective.py::TestRetryCap`.
+    _FIX_ON_FAIL_MAX_RETRIES = 1
     _FIX_ON_FAIL_CATEGORIES = frozenset({
         "hallucinated_part",
         "not_from_candidate_pool",

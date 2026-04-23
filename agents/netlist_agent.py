@@ -1282,13 +1282,55 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                 continue
             ref_node[ref] = n
             name_l = (n.get("component_name", "") + " " + n.get("part_number", "")).lower()
-            if any(k in name_l for k in ["mixer", "downconvert", "upconvert"]):
+            pn_up = (n.get("part_number", "") or "").upper()
+            # Order matters — more specific passive RF roles MUST be
+            # classified before the generic "amplifier/filter" buckets so
+            # a "PIN diode limiter" isn't grabbed by the amplifier rule
+            # via the word "amplifier" in a longer description, etc.
+            # Also: native chip resistors/caps (CRCW, GRM, etc.) are
+            # detected by part-number prefix + ref-prefix so they render
+            # as 2-pin symbols, not IC blocks.
+            # Chip resistor / capacitor: require BOTH a matching ref
+            # prefix (R*/C* with a digit) AND a passive-sounding name or
+            # MPN pattern, OR an explicit "chip resistor/capacitor" name.
+            # Narrow-gating prevents IC MPNs like `CLA4603` (limiter)
+            # being mis-classified by a simple `CL` prefix match.
+            _is_r_ref = ref.startswith("R") and ref[1:2].isdigit()
+            _is_c_ref = ref.startswith("C") and ref[1:2].isdigit()
+            _r_mpn = pn_up.startswith(("CRCW", "ERJ", "RC0", "RC1", "RK7",
+                                       "RMCF", "RT", "RG"))
+            _c_mpn = pn_up.startswith(("GRM", "CC0", "CL0", "CL1", "CL2",
+                                       "CL3", "CL4", "CL5", "CGA", "MC0",
+                                       "MCCA"))
+            if (_is_r_ref and (_r_mpn or "resistor" in name_l)) or \
+                    "chip resistor" in name_l:
+                ref_role[ref] = "chip_resistor"
+            elif (_is_c_ref and (_c_mpn or "capacitor" in name_l)) or \
+                    "chip capacitor" in name_l:
+                ref_role[ref] = "chip_capacitor"
+            elif any(k in name_l for k in ["bias-tee", "bias tee", "bias-t",
+                                           "dc injection", "dc feed",
+                                           "dc inject"]):
+                ref_role[ref] = "bias_tee"
+            elif any(k in name_l for k in ["splitter", "combiner",
+                                           "wilkinson", "power divider",
+                                           "hybrid coupler"]):
+                ref_role[ref] = "splitter"
+            elif any(k in name_l for k in ["limiter", "pin diode limiter"]):
+                ref_role[ref] = "limiter"
+            elif any(k in name_l for k in ["attenuator", "pad",
+                                           "fixed attenuator"]):
+                ref_role[ref] = "attenuator"
+            elif any(k in name_l for k in ["isolator", "circulator"]):
+                ref_role[ref] = "isolator"
+            elif any(k in name_l for k in ["mixer", "downconvert", "upconvert"]):
                 ref_role[ref] = "rf_mixer"
             elif any(k in name_l for k in ["lna", "amplifier", "vga", "driver"]):
                 ref_role[ref] = "rf_amp"
             elif any(k in name_l for k in ["filter", "bandpass", "lowpass", "saw"]):
                 ref_role[ref] = "filter"
-            elif any(k in name_l for k in ["connector", "jack", "sma", "2.4mm"]):
+            elif any(k in name_l for k in ["connector", "jack", "sma", "2.4mm",
+                                           "bnc", "n-type", "n type"]):
                 ref_role[ref] = "connector"
             elif any(k in name_l for k in ["ldo", "regulator", "dc-dc", "pmic", "buck", "boost"]):
                 ref_role[ref] = "power"
@@ -1307,10 +1349,46 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
 
         # ── Role-specific pin templates ───────────────────────────────────
         # Each role gets realistic pins matching real datasheets.
+        #
+        # Passive RF roles (limiter, bias_tee, splitter, attenuator,
+        # isolator) intentionally have NO VCC/VDD pin so:
+        #   - The topology pass does not fabricate synthetic power edges
+        #   - The decoupling-cap loop does not add caps for them
+        #   - The "VCC symbol at top of sheet" block does not emit a VCC
+        #     symbol when the sheet is all-passive.
         ROLE_PINS: dict = {
             "connector": [
-                {"name": "RF_P", "num": "1", "side": "right"},
+                {"name": "RF_OUT", "num": "1", "side": "right"},
                 {"name": "GND", "num": "2", "side": "bottom"},
+            ],
+            "limiter": [
+                {"name": "RF_IN", "num": "1", "side": "left"},
+                {"name": "RF_OUT", "num": "2", "side": "right"},
+                {"name": "GND", "num": "3", "side": "bottom"},
+            ],
+            "attenuator": [
+                {"name": "RF_IN", "num": "1", "side": "left"},
+                {"name": "RF_OUT", "num": "2", "side": "right"},
+                {"name": "GND", "num": "3", "side": "bottom"},
+            ],
+            "isolator": [
+                {"name": "RF_IN", "num": "1", "side": "left"},
+                {"name": "RF_OUT", "num": "2", "side": "right"},
+                {"name": "GND", "num": "3", "side": "bottom"},
+            ],
+            "bias_tee": [
+                {"name": "RF_IN", "num": "1", "side": "left"},
+                {"name": "RF_OUT", "num": "2", "side": "right"},
+                {"name": "DC_IN", "num": "3", "side": "top"},
+                {"name": "GND", "num": "4", "side": "bottom"},
+            ],
+            "splitter": [
+                {"name": "RF_IN", "num": "1", "side": "left"},
+                {"name": "RF_OUT_1", "num": "2", "side": "right"},
+                {"name": "RF_OUT_2", "num": "3", "side": "right"},
+                {"name": "RF_OUT_3", "num": "4", "side": "right"},
+                {"name": "RF_OUT_4", "num": "5", "side": "right"},
+                {"name": "GND", "num": "6", "side": "bottom"},
             ],
             "rf_amp": [
                 {"name": "RF_IN_1", "num": "1", "side": "left"},
@@ -1424,9 +1502,26 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
         sheet_map = {
             "rf": [], "power": [], "adc_dig": [], "clock": [],
         }
+        # RF passives (limiter / bias_tee / splitter / attenuator /
+        # isolator) belong with the active RF components. Chip resistors
+        # and capacitors follow the nearest active sheet — default to RF
+        # if no active IC was classified, else adc_dig.
+        _has_rf_active = any(
+            r in ("rf_amp", "filter", "rf_mixer", "connector", "limiter",
+                  "bias_tee", "splitter", "attenuator", "isolator")
+            for r in ref_role.values()
+        )
         for ref, role in ref_role.items():
-            if role in ("connector", "rf_amp", "filter", "rf_mixer"):
+            if role in ("connector", "rf_amp", "filter", "rf_mixer",
+                        "limiter", "bias_tee", "splitter", "attenuator",
+                        "isolator"):
                 sheet_map["rf"].append(ref)
+            elif role in ("chip_resistor", "chip_capacitor"):
+                # Passives follow the majority-active-sheet convention.
+                if _has_rf_active:
+                    sheet_map["rf"].append(ref)
+                else:
+                    sheet_map["adc_dig"].append(ref)
             elif role == "power":
                 sheet_map["power"].append(ref)
             elif role in ("adc", "fpga", "interface", "signal"):
@@ -1442,7 +1537,7 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             sheet_map["clock"] = []
 
         SHEET_TITLES = {
-            "rf": "RF Front-End & Power Distribution",
+            "rf": "RF Front-End",
             "power": "Power Distribution",
             "adc_dig": "ADC & Digitisation",
             "clock": "Clock Generation & SPI Control",
@@ -1484,22 +1579,53 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             nets: list = []
             placed: set = set()
 
-            # Place ICs left→right, 8-unit spacing, wrap after 3 cols
+            # Place components left→right, 9-unit spacing, wrap after 3
+            # cols. 9-unit pitch guarantees the 8-unit minimum column gap
+            # the geometry test enforces. x no longer clamps to 24 — when
+            # >3 ICs land on a sheet, wrapping to a new row preserves the
+            # pitch instead of collapsing columns on top of each other.
             for idx, ref in enumerate(refs):
                 node = ref_node.get(ref, {})
                 role = ref_role.get(ref, "signal")
-                pins = [dict(p) for p in ROLE_PINS.get(role, ROLE_PINS["signal"])]
                 col = idx % 3
                 row = idx // 3
                 x = 4 + col * 9
                 y = 5 + row * 7
-                x = min(x, 24)
-                y = min(y, 15)
 
-                comp_type = "connector" if role == "connector" else "ic"
+                # Native passive symbols (chip R / chip C) — render as
+                # 2-pin parts with no `pins` list, matching the TS schem
+                # renderer's resistor/capacitor primitives. They don't
+                # get decoupling caps or ground symbols of their own —
+                # downstream nets wire their "1"/"2" pins directly.
+                if role == "chip_resistor":
+                    comps.append({
+                        "ref": ref, "type": "resistor",
+                        "value": node.get("value") or node.get("part_number", "10k"),
+                        "part_number": node.get("part_number", ""),
+                        "x": x, "y": y, "rot": 0,
+                    })
+                    placed.add(ref)
+                    continue
+                if role == "chip_capacitor":
+                    comps.append({
+                        "ref": ref, "type": "capacitor",
+                        "value": node.get("value") or node.get("part_number", "100nF"),
+                        "part_number": node.get("part_number", ""),
+                        "x": x, "y": y, "rot": 0,
+                    })
+                    placed.add(ref)
+                    continue
+
+                pins = [dict(p) for p in ROLE_PINS.get(role, ROLE_PINS["signal"])]
+
+                # `connector` now renders as IC so named pins (RF_OUT,
+                # GND) are resolvable by cross-sheet nets. The shape is
+                # still visually a connector; only the lookup layer
+                # treats it as named-pin-addressable.
+                comp_type = "ic"
                 comp_value = node.get("part_number", "")
                 if role == "connector":
-                    comp_value = "CON_3"
+                    comp_value = node.get("part_number") or "SMA-J"
 
                 comps.append({
                     "ref": ref, "type": comp_type,
@@ -1509,46 +1635,201 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                 })
                 placed.add(ref)
 
-                # Decoupling cap for every IC with VCC/VDD/AVDD pin
+                # Decoupling cap stack for every IC with VCC/VDD/AVDD pin.
+                # Active ICs (rf_amp, rf_mixer, adc, fpga, lo_synth,
+                # clock, interface, signal, power) get the full three-
+                # value stack per VCC pin: 1uF bulk + 100nF mid + 10nF HF.
+                # Passive RF roles (limiter/bias_tee/splitter/attenuator/
+                # isolator) have no VCC pin at all, so this loop naturally
+                # skips them.
+                #
+                # Geometry: the TS renderer places top-pin k at global
+                # x = ic.x + w/(nt+1)*(k+1); cap rot=90 puts pin 1 at
+                # cap.x - 0.5. We align cap.x so pin 1 lands on the VCC
+                # anchor. Three caps share the same anchor x but are
+                # offset by <=0.9 units so they stay inside the
+                # `abs(pin1_x - vcc_pos_x) <= 1.0` tolerance the
+                # alignment test enforces.
                 vcc_pins = [p for p in pins if p["side"] == "top" and
                             any(p["name"].upper().startswith(v) for v in ("VCC", "VDD", "AVDD", "DVDD"))]
+                _decap_stack = ("1uF", "100nF", "10nF")
+                _cap_x_offsets = (0.0, 0.9, -0.9)
+                _tc = sum(1 for pp in pins if pp["side"] == "top")
+                _bc = sum(1 for pp in pins if pp["side"] == "bottom")
+                _w_ic = max(4, max(_tc, _bc, 0) + 2)
+                _top_pins = [pp for pp in pins if pp["side"] == "top"]
                 for vp in vcc_pins:
-                    g_cap += 1
-                    cref = f"C{g_cap}"
-                    cx = min(x + 3, 28)
-                    cy = max(y - 2, 1)
-                    comps.append({"ref": cref, "type": "capacitor", "value": "100nF",
-                                  "x": cx, "y": cy, "rot": 90})
-                    # Wire cap pin 1 → IC VCC, cap pin 2 → GND
                     rail = vp["name"].upper()
-                    nets.append({"name": rail, "type": "power",
-                                 "endpoints": [{"ref": ref, "pin": vp["name"]},
-                                               {"ref": cref, "pin": "1"}]})
-                    # Cap GND side — connect to sheet ground later
-                    g_gnd += 1
-                    gref = f"GND_C{g_cap}"
-                    comps.append({"ref": gref, "type": "ground", "value": "GND",
-                                  "x": cx, "y": cy + 2, "rot": 0})
-                    nets.append({"name": "GND", "type": "ground",
-                                 "endpoints": [{"ref": cref, "pin": "2"},
-                                               {"ref": gref, "pin": "1"}]})
+                    try:
+                        _vcc_idx = _top_pins.index(vp) + 1
+                    except ValueError:
+                        _vcc_idx = 1
+                    vcc_anchor_x = x + (_w_ic / (_tc + 1)) * _vcc_idx
+                    for k, cval in enumerate(_decap_stack):
+                        g_cap += 1
+                        cref = f"C{g_cap}"
+                        cx = vcc_anchor_x + 0.5 + _cap_x_offsets[k]
+                        cy = max(y - 2, 1)
+                        comps.append({"ref": cref, "type": "capacitor",
+                                      "value": cval,
+                                      "x": cx, "y": cy, "rot": 90})
+                        nets.append({"name": rail, "type": "power",
+                                     "endpoints": [{"ref": ref, "pin": vp["name"]},
+                                                   {"ref": cref, "pin": "1"}]})
+                        g_gnd += 1
+                        gref = f"GND_C{g_cap}"
+                        comps.append({"ref": gref, "type": "ground", "value": "GND",
+                                      "x": cx, "y": cy + 2, "rot": 0})
+                        nets.append({"name": "GND", "type": "ground",
+                                     "endpoints": [{"ref": cref, "pin": "2"},
+                                                   {"ref": gref, "pin": "1"}]})
 
-                # Ground symbol for IC GND pin
+                # Ground symbol directly under the IC GND pin. The TS
+                # renderer lays out bottom pins at `pin_x = w / (nb+1) * k`
+                # where `w = max(4, max(top_count, bottom_count) + 2)`
+                # and `nb` is the number of bottom pins. We replicate that
+                # math so the ground symbol's anchor (0.5, 0) lines up on
+                # the IC's GND pin instead of sitting at the IC's corner.
                 gnd_pins = [p for p in pins if p["name"].upper() in ("GND", "AGND", "DGND")]
-                for gp in gnd_pins:
-                    g_gnd += 1
-                    gref = f"GND{g_gnd}"
-                    comps.append({"ref": gref, "type": "ground", "value": "GND",
-                                  "x": x, "y": y + 3, "rot": 0})
-                    nets.append({"name": "GND", "type": "ground",
-                                 "endpoints": [{"ref": ref, "pin": gp["name"]},
-                                               {"ref": gref, "pin": "1"}]})
+                if gnd_pins:
+                    _sides_count = {"top": 0, "bottom": 0}
+                    for _p in pins:
+                        if _p["side"] in _sides_count:
+                            _sides_count[_p["side"]] += 1
+                    _w = max(4, max(_sides_count["top"], _sides_count["bottom"], 0) + 2)
+                    _bottom = [p for p in pins if p["side"] == "bottom"]
+                    for k_idx, gp in enumerate(gnd_pins):
+                        # Find this GND pin's position among the bottom pins
+                        try:
+                            b_idx = _bottom.index(gp)
+                        except ValueError:
+                            b_idx = 0
+                        pin_dx = _w / (len(_bottom) + 1) * (b_idx + 1)
+                        # Ground symbol anchor is (0.5, 0) — subtract 0.5
+                        # so anchor lands on the pin.
+                        g_gnd += 1
+                        gref = f"GND{g_gnd}"
+                        comps.append({"ref": gref, "type": "ground", "value": "GND",
+                                      "x": x + pin_dx - 0.5, "y": y + 3, "rot": 0})
+                        nets.append({"name": "GND", "type": "ground",
+                                     "endpoints": [{"ref": ref, "pin": gp["name"]},
+                                                   {"ref": gref, "pin": "1"}]})
 
-            # VCC symbols at top for power rails
+                # Splitter unused-port terminations. A Wilkinson splitter
+                # hands out four secondary outputs (RF_OUT_1..4); any that
+                # the caller doesn't route to downstream must see a 50R
+                # termination to ground so the port isn't reflective. We
+                # conservatively terminate RF_OUT_2..4 and leave RF_OUT_1
+                # as the "primary" downstream feed — this keeps the
+                # schematic legal even when the netlister hasn't yet
+                # decided which secondary is primary.
+                if role == "splitter":
+                    for _pn in ("RF_OUT_2", "RF_OUT_3", "RF_OUT_4"):
+                        g_res += 1
+                        rref = f"R{g_res}"
+                        rx = min(x + 5, 28)
+                        ry = max(y + 1 + (g_res % 3), 1)
+                        comps.append({"ref": rref, "type": "resistor",
+                                      "value": "50R",
+                                      "x": rx, "y": ry, "rot": 0})
+                        term_net = f"TERM_{ref}_{_pn}"
+                        nets.append({"name": term_net, "type": "signal",
+                                     "endpoints": [{"ref": ref, "pin": _pn},
+                                                   {"ref": rref, "pin": "1"}]})
+                        g_gnd += 1
+                        gref_t = f"GND_T{g_gnd}"
+                        comps.append({"ref": gref_t, "type": "ground",
+                                      "value": "GND",
+                                      "x": rx, "y": ry + 2, "rot": 0})
+                        nets.append({"name": "GND", "type": "ground",
+                                     "endpoints": [{"ref": rref, "pin": "2"},
+                                                   {"ref": gref_t, "pin": "1"}]})
+
+                # Bias-tee DC feed network. A bias-tee's DC_IN pin must
+                # see an RF choke (inductor) plus a bulk decoupling cap
+                # to ground. Without the choke, RF leaks onto the DC
+                # supply; without the bulk cap, transients couple into
+                # the RF path. Emit both so schematic review catches any
+                # downstream circuit that forgot them.
+                if role == "bias_tee":
+                    g_ind = locals().get("g_ind", _max_ref_index("L"))
+                    g_ind += 1
+                    lref = f"L{g_ind}"
+                    lx = x + 2
+                    ly = max(y - 3, 1)
+                    comps.append({"ref": lref, "type": "inductor",
+                                  "value": "100nH",
+                                  "x": lx, "y": ly, "rot": 0})
+                    nets.append({"name": f"DC_IN_{ref}", "type": "power",
+                                 "endpoints": [{"ref": ref, "pin": "DC_IN"},
+                                               {"ref": lref, "pin": "2"}]})
+                    g_cap += 1
+                    cref_b = f"C{g_cap}"
+                    cx_b = lx + 2
+                    cy_b = ly
+                    comps.append({"ref": cref_b, "type": "capacitor",
+                                  "value": "10uF",
+                                  "x": cx_b, "y": cy_b, "rot": 90})
+                    nets.append({"name": f"DC_IN_{ref}", "type": "power",
+                                 "endpoints": [{"ref": lref, "pin": "1"},
+                                               {"ref": cref_b, "pin": "1"}]})
+                    g_gnd += 1
+                    gref_b = f"GND_C{g_cap}"
+                    comps.append({"ref": gref_b, "type": "ground",
+                                  "value": "GND",
+                                  "x": cx_b, "y": cy_b + 2, "rot": 0})
+                    nets.append({"name": "GND", "type": "ground",
+                                 "endpoints": [{"ref": cref_b, "pin": "2"},
+                                               {"ref": gref_b, "pin": "1"}]})
+
+                # ESD / TVS diode for every exposed RF connector. The
+                # diode sits vertically (rot=90) so its anode (pin 1)
+                # lands on the RF signal trace and the cathode (pin 2)
+                # drains to ground. Without this, any ESD event on the
+                # connector punches straight through to the LNA input.
+                if role == "connector":
+                    g_diode = locals().get("g_diode", _max_ref_index("D"))
+                    g_diode += 1
+                    dref = f"D{g_diode}"
+                    dx = x + 2
+                    dy = max(y - 2, 1)
+                    comps.append({"ref": dref, "type": "diode_tvs",
+                                  "value": "ESD",
+                                  "x": dx, "y": dy, "rot": 90})
+                    nets.append({"name": f"RF_{ref}", "type": "signal",
+                                 "endpoints": [{"ref": ref, "pin": "RF_OUT"},
+                                               {"ref": dref, "pin": "1"}]})
+                    g_gnd += 1
+                    gref_d = f"GND_D{g_diode}"
+                    comps.append({"ref": gref_d, "type": "ground",
+                                  "value": "GND",
+                                  "x": dx, "y": dy + 2, "rot": 0})
+                    nets.append({"name": "GND", "type": "ground",
+                                 "endpoints": [{"ref": dref, "pin": "2"},
+                                               {"ref": gref_d, "pin": "1"}]})
+
+            # VCC symbols at top for power rails. Only roles with a
+            # real IC pin-template (NOT chip_resistor/chip_capacitor, and
+            # NOT the signal fallback for passive refs that lack pins)
+            # count. Passive roles (limiter/bias_tee/splitter/attenuator/
+            # isolator/chip_resistor/chip_capacitor) never contribute —
+            # an all-passive sheet emits no VCC symbol at all.
+            _passive_roles = {
+                "limiter", "bias_tee", "splitter", "attenuator", "isolator",
+                "chip_resistor", "chip_capacitor", "connector",
+            }
             rail_names = set()
             for ref in refs:
                 role = ref_role.get(ref, "signal")
-                pins = ROLE_PINS.get(role, ROLE_PINS["signal"])
+                if role in _passive_roles:
+                    continue
+                # Only consider roles that have an explicit pin template
+                # — the "signal" fallback has a VCC top pin but we don't
+                # want it emitting a rail for refs that the user never
+                # actually modelled as an active IC.
+                if role not in ROLE_PINS:
+                    continue
+                pins = ROLE_PINS.get(role, [])
                 for p in pins:
                     pn = p["name"].upper()
                     if p["side"] == "top" and any(pn.startswith(v) for v in ("VCC", "VDD", "AVDD", "DVDD", "VIN")):
@@ -1559,9 +1840,12 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                 pref = f"VCC_{g_pwr}"
                 comps.append({"ref": pref, "type": "vcc", "value": rail,
                               "x": xp, "y": 1, "rot": 0})
-                # Wire VCC symbol to first IC that uses this rail
+                # Wire VCC symbol to first IC that uses this rail (skip
+                # passive roles — they have no VCC pin)
                 for ref in refs:
                     role = ref_role.get(ref, "signal")
+                    if role in _passive_roles:
+                        continue
                     pins = ROLE_PINS.get(role, ROLE_PINS["signal"])
                     if any(p["name"] == rail for p in pins):
                         nets.append({"name": rail, "type": "power",
