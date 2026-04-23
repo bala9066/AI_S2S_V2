@@ -1122,6 +1122,22 @@ def _sanitize_mermaid_code(code: str) -> str:
         s = _re.sub(r'\s{2,}', ' ', s)
         return s.strip()
 
+    # Round-bracket nodes with quoted labels containing nested parens break
+    # the paren-label regex below — `r'\(([^)]*)\)'` captures up to the FIRST
+    # inner `)`, so `S11("VGA (AGC)<br/>HMC624LP4E")` is parsed as a node
+    # whose label ends at `(AGC)`, leaving the rest as syntactically-garbage
+    # tokens. All 3 render backends (mermaid.ink / mmdc / node) then fail and
+    # the DOCX falls back to the "(rendered in browser — source below)"
+    # placeholder with NO embedded image. Mirror the frontend fix:
+    # normalise `ID("…(…)…")` → `ID["…(…)…"]` so the bracket regex (which
+    # uses `[^\]]*` and can span inner `()`) finds the right boundary.
+    # Matches the frontend sanitiser in mermaidSanitize.ts.
+    code = _re.sub(
+        r'([\w\-]+)\("([^"]*[()][^"]*)"\)',
+        r'\1["\2"]',
+        code,
+    )
+
     # Apply to square brackets, round parens, braces (node labels)
     code = _re.sub(r'\[([^\]]*)\]', lambda m: f'[{sanitize_label(m.group(1))}]', code)
     code = _re.sub(r'\(([^)]*)\)', lambda m: f'({sanitize_label(m.group(1))})', code)

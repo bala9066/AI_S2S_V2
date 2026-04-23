@@ -839,7 +839,12 @@ export default function DocumentsView({ project, phase, status, pipelineRunning 
 
   // Pipeline-internal JSON files are kept on disk for agent use but hidden from the UI.
   // Human-readable equivalents (netlist_visual.md, sbom_summary.md) cover them.
-  const HIDDEN_FILES = new Set(['netlist.json', 'netlist_validation.json', 'sbom.json']);
+  // cascade_analysis.json is hidden because the CascadeChart component renders
+  // it visually in-page — exposing the raw JSON in the file list was noise.
+  const HIDDEN_FILES = new Set([
+    'netlist.json', 'netlist_validation.json', 'sbom.json',
+    'cascade_analysis.json',
+  ]);
   const filteredFiles = useMemo(() => {
     const unique = new Set<string>();
     // Collect all visible filenames first so we can suppress redundant .docx rows
