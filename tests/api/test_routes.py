@@ -317,8 +317,11 @@ class TestExportProjectZip:
         p = client.post("/api/v1/projects", json={"name": "ExportTest"}).json()
         output_dir = Path(p["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / "requirements.md").write_text("# Requirements\nhello", encoding="utf-8")
-        (output_dir / "bom.json").write_text('{"parts": []}', encoding="utf-8")
+        # write_bytes to preserve "\n" exactly — on Windows, write_text() in
+        # text mode translates "\n" to "\r\n" which breaks the byte-level
+        # assertion below.
+        (output_dir / "requirements.md").write_bytes(b"# Requirements\nhello")
+        (output_dir / "bom.json").write_bytes(b'{"parts": []}')
         return p
 
     def test_export_returns_zip_when_outputs_exist(self, client, tmp_path):
