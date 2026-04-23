@@ -20,10 +20,18 @@ def _fresh_cache():
 
 @pytest.fixture(autouse=True)
 def _ensure_both_apis_configured(monkeypatch):
-    """Default: both APIs configured so the fallback path is exercised."""
+    """Default: both APIs configured so the fallback path is exercised.
+
+    Also disables the persistent on-disk RAG cache (`services.component_cache`)
+    so write-throughs from one test don't leak into the next via the
+    shared SQLite file. These tests target the in-process fallback chain
+    + RAM cache only; the persistent cache has its own dedicated suite
+    (tests/services/test_component_cache.py) that exercises it directly.
+    """
     monkeypatch.setenv("DIGIKEY_CLIENT_ID", "x")
     monkeypatch.setenv("DIGIKEY_CLIENT_SECRET", "y")
     monkeypatch.setenv("MOUSER_API_KEY", "z")
+    monkeypatch.setenv("COMPONENT_CACHE_DISABLED", "1")
     monkeypatch.delenv("SKIP_DISTRIBUTOR_LOOKUP", raising=False)
     monkeypatch.delenv("SKIP_DIGIKEY", raising=False)
     monkeypatch.delenv("SKIP_MOUSER", raising=False)

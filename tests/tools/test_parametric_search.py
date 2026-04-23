@@ -27,7 +27,13 @@ from tools.parametric_search import (
 # exact-MPN cache, so resetting both keeps the two in lock-step across
 # test runs.
 @pytest.fixture(autouse=True)
-def _clear_parametric_cache():
+def _clear_parametric_cache(monkeypatch):
+    # Disable the persistent on-disk RAG cache so write-throughs from
+    # find_candidates / lookup don't leak into the next test via the
+    # shared SQLite file. Persistent cache has its own dedicated suite
+    # (tests/services/test_component_cache.py) — we only exercise the
+    # in-process behaviour here.
+    monkeypatch.setenv("COMPONENT_CACHE_DISABLED", "1")
     reset_cache()
     distributor_search.reset_cache()
     yield

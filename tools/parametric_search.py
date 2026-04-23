@@ -29,6 +29,7 @@ Performance:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -245,6 +246,27 @@ def find_candidates(
             max_total = 2 * max_per_source
         return cached[:max_total]
 
+    # Persistent on-disk cache (RAG layer). Survives restarts and lets a
+    # warm cache short-circuit a 4-8 s parallel DigiKey+Mouser fan-out.
+    # Hash the same canonical key tuple we use in-process so the two
+    # cache layers never disagree.
+    persistent_hash = _persistent_query_hash(cache_key)
+    if persistent_hash and not _persistent_disabled():
+        try:
+            from services.component_cache import get_default
+            persistent = get_default().get_parametric(persistent_hash)
+        except Exception as exc:  # noqa: BLE001 — cache must never break the live path
+            log.debug("parametric_search.persistent_read_err q=%r: %s", query, exc)
+            persistent = None
+        if persistent:
+            # Promote into the in-memory cache so subsequent calls within
+            # this process don't pay another SQLite read.
+            _cache_put(cache_key, persistent)
+            _cross_populate_distributor_cache(persistent)
+            if max_total is None:
+                max_total = 2 * max_per_source
+            return persistent[:max_total]
+
     # Parallel fetch — total latency drops to max(DigiKey, Mouser). Two
     # workers is enough; we never call more than two APIs here.
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="parametric-search") as pool:
@@ -264,18 +286,72 @@ def find_candidates(
 
     # Cross-populate the exact-MPN lookup cache used by `finalize_p1`'s
     # audit (services/rf_audit.py -> tools.distributor_search.lookup).
-    # Every PartInfo we just pulled via keyword_search IS a verified
-    # distributor record — feeding it into the exact-lookup cache keyed
-    # by upper-cased MPN means the audit phase skips a redundant round-
-    # trip to DigiKey/Mouser per component. A typical P1 run has 10-15
-    # BOM rows whose MPNs are a subset of the shortlists; this collapses
-    # the 60-90 s audit down to ~10 s.
-    #
-    # Safety: we only INSERT — never overwrite an existing entry — so a
-    # prior `distributor_search.lookup` result (which already ran the
-    # datasheet URL verification pass) keeps priority. If the entry is
-    # net-new, the downstream render-time URL probe in requirements_agent
-    # still catches any dead datasheet link.
+    _cross_populate_distributor_cache(merged)
+
+    # Write through to the persistent on-disk parametric cache. Survives
+    # restart, so the next demo run (even after a server bounce) hits
+    # the cache instead of the live API. Best-effort: failure to write
+    # the cache must never break the live response.
+    if persistent_hash and not _persistent_disabled():
+        try:
+            from services.component_cache import get_default
+            get_default().put_parametric(persistent_hash, query, merged)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("parametric_search.persistent_write_err q=%r: %s", query, exc)
+        # Also write each PartInfo into the persistent MPN cache so the
+        # subsequent finalize_p1 audit (which calls `distributor_search.
+        # lookup` per BOM row) hits warm rows instead of round-tripping.
+        try:
+            from services.component_cache import get_default
+            get_default().bulk_put_mpns(merged)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("parametric_search.bulk_mpn_err q=%r: %s", query, exc)
+
+    if max_total is None:
+        max_total = 2 * max_per_source
+    return merged[:max_total]
+
+
+# ---------------------------------------------------------------------------
+# Persistent-cache helpers
+# ---------------------------------------------------------------------------
+
+def _persistent_disabled() -> bool:
+    """Lazy import of the cache opt-out so this module can be imported
+    in environments where `services.component_cache` isn't available
+    yet (e.g. partial test runs)."""
+    try:
+        from services.component_cache import cache_disabled
+        return cache_disabled()
+    except Exception:
+        return False
+
+
+def _persistent_query_hash(cache_key: tuple) -> str:
+    """Stable string hash of the canonical in-process cache key. Using
+    SHA-1 truncated to 16 hex chars keeps the on-disk PRIMARY KEY short
+    while still being collision-free in practice (we never expect more
+    than ~1k distinct queries)."""
+    try:
+        payload = repr(cache_key).encode("utf-8")
+        return "param:" + hashlib.sha1(payload).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _cross_populate_distributor_cache(merged: list[PartInfo]) -> None:
+    """Inject every freshly-retrieved PartInfo into `distributor_search`'s
+    in-memory exact-MPN cache so the subsequent finalize_p1 audit serves
+    its per-row `lookup()` calls from RAM.
+
+    Safety: we only INSERT — never overwrite an existing entry — so a
+    prior `distributor_search.lookup` result (which already ran the
+    datasheet URL verification pass) keeps priority. If the entry is
+    net-new, the downstream render-time URL probe in requirements_agent
+    still catches any dead datasheet link.
+    """
+    if not merged:
+        return
     try:
         from tools import distributor_search as _ds
         with _ds._cache_lock:  # type: ignore[attr-defined]
@@ -285,10 +361,6 @@ def find_candidates(
                     _ds._cache[_key] = _info  # type: ignore[attr-defined]
     except Exception as _exc:  # pragma: no cover — best-effort warm
         log.debug("parametric_search.cross_cache_skip: %s", _exc)
-
-    if max_total is None:
-        max_total = 2 * max_per_source
-    return merged[:max_total]
 
 
 # Disable cache entirely when the caller sets this env var — useful for

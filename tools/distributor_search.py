@@ -186,28 +186,48 @@ def _seed_lookup(part_number: str) -> Optional[PartInfo]:
 # ---------------------------------------------------------------------------
 
 def _verify_datasheet(info: PartInfo) -> PartInfo:
-    """HEAD-probe the datasheet URL returned by the distributor. Strip
-    the URL when the probe fails AND the domain isn't on the trusted-
-    vendor allowlist. Controlled by SKIP_DATASHEET_VERIFY=1."""
-    if not info.datasheet_url or _skip_datasheet_verify():
+    """Resolve the best-available datasheet URL for `info` and rewrite it
+    on the returned PartInfo.
+
+    Replaces the old "strip on probe failure" behaviour, which was
+    leaving BOM rows with empty Datasheet cells when the distributor's
+    primary PDF URL had 404'd. The new resolver walks a fallback chain
+    (distributor PDF → distributor product page → manufacturer guess →
+    Google search), returns the first link that probes OK, and never
+    returns empty. URL probes are cache-aside via
+    `services.component_cache` so warm-cache runs do zero HTTP.
+
+    Controlled by SKIP_DATASHEET_VERIFY=1 (skips probe + cache; trusts
+    whatever URL the distributor handed back)."""
+    if _skip_datasheet_verify():
         return info
+    if not info.datasheet_url and not info.product_url:
+        # Nothing to resolve from — fall through to the chain's Google
+        # fallback so the BOM row at least has a search link.
+        try:
+            from tools.datasheet_resolver import resolve_url
+        except Exception:
+            return info
+        try:
+            return replace(info, datasheet_url=resolve_url(info, timeout=3.0))
+        except Exception as exc:  # noqa: BLE001 — never break the live path
+            log.debug("distributor_search.resolver_err pn=%s: %s",
+                      info.part_number, exc)
+            return info
     try:
-        from tools.datasheet_verify import is_trusted_vendor_url, verify_url
+        from tools.datasheet_resolver import resolve_url
     except Exception:
         return info
-    if is_trusted_vendor_url(info.datasheet_url):
-        return info
     try:
-        ok = verify_url(info.datasheet_url, timeout=3.0)
-    except Exception as exc:
-        log.debug("distributor_search.datasheet_probe_err url=%s: %s",
-                  info.datasheet_url, exc)
-        ok = False
-    if ok:
+        best = resolve_url(info, timeout=3.0)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("distributor_search.resolver_err pn=%s: %s",
+                  info.part_number, exc)
         return info
-    log.info("distributor_search.datasheet_stripped url=%s pn=%s",
-             info.datasheet_url, info.part_number)
-    return replace(info, datasheet_url=None)
+    if best and best != info.datasheet_url:
+        log.info("distributor_search.datasheet_repaired pn=%s old=%s new=%s",
+                 info.part_number, info.datasheet_url, best)
+    return replace(info, datasheet_url=best)
 
 
 # ---------------------------------------------------------------------------
@@ -225,25 +245,61 @@ def reset_cache() -> None:
 
 def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
     """Return a `PartInfo` for `part_number`, consulting in order:
-    DigiKey, Mouser, local seed. None when every tier misses.
+    persistent disk cache, in-memory cache, DigiKey, Mouser, local seed.
+    None when every tier misses.
 
-    Two resilience features layered on top of the raw tiered lookup:
+    Three resilience features layered on top of the raw tiered lookup:
 
-      1. Fuzzy MPN match — if the original MPN misses everywhere, strip
+      1. **Persistent cache** — `services.component_cache` stores past
+         hits across server restarts. A hot MPN is served from a single
+         SQLite read (~ms) instead of a 200-2000 ms DigiKey round-trip.
+         A negative cache (per-MPN "doesn't exist anywhere" with a
+         shorter 24 h TTL) prevents thrashing on hallucinated MPNs that
+         the LLM keeps re-emitting. Disabled by COMPONENT_CACHE_DISABLED=1.
+      2. Fuzzy MPN match — if the original MPN misses everywhere, strip
          packaging/revision suffixes (-R7, -TR1000, -REEL, -01WTG, /S,
          etc.) and retry. The resulting PartInfo carries the distributor's
          canonical part_number, not the stripped variant.
-      2. Datasheet URL HEAD-verify — if the distributor hit returned a
-         datasheet URL that doesn't resolve (and isn't on the trusted-
-         vendor allowlist), the URL is stripped so downstream docs
-         don't embed dead links.
+      3. Datasheet URL resolver — `tools.datasheet_resolver` walks a
+         fallback chain (distributor PDF → product page → mfr guess →
+         Google search) so every component ends up with a working link.
+         Replaces the old "strip on HEAD failure" behaviour that left
+         the BOM with empty Datasheet cells.
     """
     if not part_number:
         return None
     key = part_number.strip().upper()
+
+    # In-memory cache (per-process, fastest path — typical hit during a
+    # single P1 finalize where the same MPN appears on multiple edges).
     with _cache_lock:
         if key in _cache:
             return _cache[key]
+
+    # Persistent on-disk cache (RAG layer). Survives server restart and
+    # is shared across projects, so common RF parts (HMC8410, ADL8107,
+    # etc.) are served from disk even on a cold process.
+    if not _cache_disabled():
+        try:
+            from services.component_cache import get_default
+            hit = get_default().get_mpn(part_number)
+        except Exception as exc:  # noqa: BLE001 — cache must never break live path
+            log.debug("distributor_search.persistent_cache_err pn=%s: %s",
+                      part_number, exc)
+            hit = None
+        if hit is not None:
+            if hit.is_negative:
+                # Negatively cached miss within NEGATIVE_TTL. Don't burn
+                # an API call; the LLM will see a hallucinated_part flag
+                # the same as on a live miss.
+                with _cache_lock:
+                    _cache[key] = None
+                return None
+            if hit.part_info is not None:
+                # Promote to in-memory cache for the rest of this run.
+                with _cache_lock:
+                    _cache[key] = hit.part_info
+                return hit.part_info
 
     info: Optional[PartInfo] = None
     skip_net = _skip_all_network()
@@ -265,7 +321,41 @@ def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
 
     with _cache_lock:
         _cache[key] = info
+
+    # Write through to the persistent cache. Negative result gets a
+    # separate row with the shorter 24 h TTL — we want to re-query
+    # eventually in case the part was added to a distributor between
+    # runs, but not on every re-finalize within the same demo.
+    if not _cache_disabled():
+        try:
+            from services.component_cache import get_default
+            cache = get_default()
+            if info is None:
+                # Only cache misses when at least one live tier was
+                # actually consulted; a SKIP_DISTRIBUTOR_LOOKUP=1 miss
+                # is a "we didn't ask", not a "doesn't exist".
+                if not skip_net:
+                    cache.put_mpn_negative(part_number)
+            else:
+                cache.put_mpn(part_number, info)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("distributor_search.persistent_cache_write_err pn=%s: %s",
+                      part_number, exc)
+
     return info
+
+
+def _cache_disabled() -> bool:
+    """Honour the persistent-cache opt-out flag. Local helper so the
+    import of `services.component_cache.cache_disabled` is lazy and
+    avoids a hard dependency at module-import time (test order in
+    pytest can otherwise import this module before the cache table
+    exists)."""
+    try:
+        from services.component_cache import cache_disabled
+        return cache_disabled()
+    except Exception:
+        return False
 
 
 def batch_lookup(
