@@ -181,3 +181,51 @@ describe('idempotence', () => {
     expect(twice).toEqual(once);
   });
 });
+
+describe('round-bracket nodes with nested parens in quoted labels', () => {
+  it('S11("VGA (AGC)<br/>HMC624LP4E") renders as a single node', () => {
+    // Regression for the 12 GHz receiver diagram that fell back to the
+    // "BLOCK DIAGRAM (source)" view because the round-bracket label
+    // sanitiser captured only up to the first inner `)`.
+    const input = 'flowchart LR\n    S11("VGA (AGC)<br/>HMC624LP4E")';
+    const out = san(input);
+    // Must produce a single well-formed square-bracket node.
+    expect(out).toMatch(/S11\[[^\]]*VGA[^\]]*AGC[^\]]*HMC624LP4E[^\]]*\]/);
+    // No leftover floating text after the node (the failure mode was
+    // `S11( VGA  AGC) HMC624LP4E")`).
+    expect(out).not.toMatch(/S11[^[]*HMC624LP4E"/);
+    expect(out).not.toContain('")');
+  });
+
+  it('preserves rounded shape when the label has no inner parens', () => {
+    // S4("LNA Stage 1<br/>HMC618ALP3E") has no `()` in the label, so we
+    // keep the round-edge visual.
+    const input = 'flowchart LR\n    S4("LNA Stage 1<br/>HMC618ALP3E")';
+    const out = san(input);
+    expect(out).toMatch(/S4\([^)]*LNA Stage 1[^)]*HMC618ALP3E[^)]*\)/);
+  });
+
+  it('handles the full receiver front-end block diagram', () => {
+    // End-to-end: the exact shape the pipeline emits for a 12 GHz Rx.
+    const input = [
+      'flowchart LR',
+      '    %% 12.00 GHz +- 50 MHz',
+      '    ANT((Antenna)) --> S1',
+      '    S1["N-type Input Connector<br/>N-type IP67 50 ohm"]',
+      '    S2["PCB Trace<br/>50Ohm Microstrip (RO4350B)"]',
+      '    S11("VGA (AGC)<br/>HMC624LP4E")',
+      '    S1 --> S2',
+      '    S2 --> S11',
+    ].join('\n');
+    const out = san(input);
+    // Must still start with a valid diagram type.
+    expect(out.split('\n')[0].trim()).toBe('flowchart LR');
+    // S2 (square brackets) keeps its RO4350B content.
+    expect(out).toMatch(/S2\[[^\]]*RO4350B[^\]]*\]/);
+    // S11 converts to square brackets and keeps HMC624LP4E.
+    expect(out).toMatch(/S11\[[^\]]*HMC624LP4E[^\]]*\]/);
+    // Edges preserved.
+    expect(out).toMatch(/S1\s*-->\s*S2/);
+    expect(out).toMatch(/S2\s*-->\s*S11/);
+  });
+});

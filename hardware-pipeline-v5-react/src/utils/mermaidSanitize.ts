@@ -30,6 +30,16 @@ export function sanitizeMermaid(raw: string): string {
   code = code.replace(/[^\x00-\x7F]/g, ch => uMap[ch] || '');
   // Fix double-paren nodes ((label)) → (label)
   code = code.replace(/\(\(([^)]*)\)\)/g, '($1)');
+  // Round-bracket nodes with quoted labels containing nested parens break
+  // the paren-label sanitiser below — its regex `/\(([^)]*)\)/g` captures up
+  // to the *first* `)`, so `S11("VGA (AGC)…")` is parsed as a node whose
+  // label ends at `(AGC)`, leaving the rest of the original label as
+  // syntactically-garbage tokens on the line and failing the whole diagram.
+  // Normalise `ID("…(…)…")` → `ID["…(…)…"]` so the bracket regex (which
+  // uses `[^\]]*` and can span any inner `()`) finds the right boundary.
+  // The rounded-edge visual is lost for these nodes, but the diagram
+  // actually renders — strictly better than dumping the raw source.
+  code = code.replace(/([\w-]+)\("([^"]*[()][^"]*)"\)/g, '$1["$2"]');
   // Arrow normalisations
   code = code.replace(/\u2014\u2014>/g, '-->').replace(/\u2014>/g, '-->');
   code = code.replace(/——>/g, '-->').replace(/—>/g, '-->');
