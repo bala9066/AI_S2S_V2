@@ -25,6 +25,22 @@ def _fresh(monkeypatch):
     # Disable the persistent on-disk RAG cache so write-throughs don't
     # leak across tests via the shared SQLite file.
     monkeypatch.setenv("COMPONENT_CACHE_DISABLED", "1")
+    # `config.py` calls `load_dotenv()` at import time so real DigiKey /
+    # Mouser credentials from .env leak into every test process. That
+    # poisons mock-based tests in two ways:
+    #   1. `is_configured()` returns True even when the test only mocked
+    #      the *other* distributor — so the unintended distributor fires
+    #      a real network call (or, with patched urlopen, consumes the
+    #      mock iterator before the test's distributor gets to it).
+    #   2. The shared `urllib.request.urlopen` symbol means a single
+    #      `patch("tools.X.urllib.request.urlopen", ...)` intercepts
+    #      DigiKey's token endpoint first, exhausting the mock and
+    #      surfacing as `StopIteration` from the *other* distributor.
+    # Strip both upfront; per-test fixtures (`dk_configured` /
+    # `mouser_configured`) re-add what each test actually needs.
+    for key in ("DIGIKEY_CLIENT_ID", "DIGIKEY_CLIENT_SECRET",
+                "DIGIKEY_API_URL", "MOUSER_API_KEY", "MOUSER_API_URL"):
+        monkeypatch.delenv(key, raising=False)
     distributor_search.reset_cache()
     digikey_api.reset_cache()
     yield

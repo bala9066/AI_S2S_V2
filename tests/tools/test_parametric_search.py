@@ -257,15 +257,40 @@ def test_cache_key_is_case_insensitive(both_configured):
     assert dk_mock.call_count == 1
 
 
-def test_cache_respects_max_per_source(both_configured):
-    """Different max_per_source must use separate cache buckets — otherwise
-    a later call asking for 10 candidates could get a cached 5-result list."""
-    dk = [_pi(f"D{i}") for i in range(5)]
+def test_smaller_max_per_source_hits_after_larger_seed(both_configured):
+    """A larger fetch superseeds smaller requests — slicing is fine.
+
+    Real-world driver: the seed script populates the cache with
+    max_per_source=50; agents at runtime call with max_per_source=5 and
+    must hit that cached superset. Before this fix, max_per_source was
+    in the cache key and the agent always missed."""
+    # Larger fetch first — 10 from each source (up to 20 merged).
+    dk_large = [_pi(f"D{i}") for i in range(10)]
+    ms_large = [_pi(f"M{i}") for i in range(10)]
     with patch("tools.parametric_search.digikey_api.keyword_search",
-               return_value=dk) as dk_mock, \
+               return_value=dk_large) as dk_mock, \
+         patch("tools.parametric_search.mouser_api.keyword_search",
+               return_value=ms_large) as ms_mock:
+        out_big = find_candidates("lna", "", max_per_source=10)
+        # Subsequent smaller request must hit the cached superset.
+        out_small = find_candidates("lna", "", max_per_source=5)
+    assert len(out_big) == 20            # full merge
+    assert len(out_small) == 10          # 2 * 5 = 10
+    assert dk_mock.call_count == 1       # second call was a cache hit
+    assert ms_mock.call_count == 1
+
+
+def test_larger_max_per_source_misses_after_smaller_seed(both_configured):
+    """When the cached list is too small to satisfy the new request, we
+    must re-fetch instead of returning a short list — preserves the
+    `len(result) <= 2*max_per_source` contract."""
+    dk_small = [_pi(f"D{i}") for i in range(5)]
+    with patch("tools.parametric_search.digikey_api.keyword_search",
+               return_value=dk_small) as dk_mock, \
          patch("tools.parametric_search.mouser_api.keyword_search", return_value=[]):
         find_candidates("lna", "", max_per_source=5)
         find_candidates("lna", "", max_per_source=10)
+    # Cached 5 < needed 20, so the second call refetched.
     assert dk_mock.call_count == 2
 
 

@@ -461,14 +461,17 @@ def seed(queries: list[tuple[str, str]], *, full_mode: bool, max_workers: int,
             # Also write the parametric shortlist under the same canonical
             # key parametric_search uses, so a wizard query during the
             # actual P1 chat goes straight to the disk cache instead of
-            # re-running the live API.
+            # re-running the live API. Cache key MUST match the 3-tuple
+            # shape `find_candidates` builds — `(stage_norm, hint, drop_obsolete)`
+            # — so hashes line up. `max_per_source` is intentionally NOT
+            # in the key (a 50-result fetch supersedes 5-result requests
+            # via slicing on read).
             if _persistent_query_hash is not None:
                 stage, hint = qpair
                 cache_key = (
                     _normalise_stage(stage),
                     (hint or "").strip().lower(),
-                    50,
-                    True,
+                    True,                       # drop_obsolete
                 )
                 qhash = _persistent_query_hash(cache_key)
                 if qhash:

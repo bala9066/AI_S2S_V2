@@ -102,25 +102,31 @@ def reset_cache() -> None:
         _cache.clear()
 
 
-def _cache_get(key: tuple) -> Optional[list[PartInfo]]:
+def _cache_get(key: tuple) -> Optional[tuple[int, list[PartInfo]]]:
+    """Return ``(fetched_max_per_source, parts)`` or None on miss/stale.
+
+    The stored ``max_per_source`` lets callers decide whether the cached
+    list is large enough to satisfy a new request — see ``find_candidates``
+    for the gating rule.
+    """
     now = time.monotonic()
     with _cache_lock:
         entry = _cache.get(key)
         if entry is None:
             return None
-        ts, value = entry
+        ts, fetched_mps, value = entry
         if now - ts > _CACHE_TTL_S:
             # Stale — evict so repeated misses don't grow the dict.
             _cache.pop(key, None)
             return None
         # Return a shallow copy so callers can mutate without affecting
         # future cache hits. PartInfo is frozen, so list() is enough.
-        return list(value)
+        return fetched_mps, list(value)
 
 
-def _cache_put(key: tuple, value: list[PartInfo]) -> None:
+def _cache_put(key: tuple, max_per_source: int, value: list[PartInfo]) -> None:
     with _cache_lock:
-        _cache[key] = (time.monotonic(), list(value))
+        _cache[key] = (time.monotonic(), int(max_per_source), list(value))
 
 
 # ---------------------------------------------------------------------------
@@ -231,25 +237,41 @@ def find_candidates(
         return []
 
     # Cache key normalises the inputs so "LNA" + "2-18 GHz" hits the same
-    # bucket as "  lna " + "2-18 GHz ". We include max_per_source /
-    # drop_obsolete because they materially affect the cached list.
+    # bucket as "  lna " + "2-18 GHz ". `max_per_source` is intentionally
+    # **not** in the key — a stored 50-result fetch can satisfy a 5-result
+    # request via slicing. The stored entry remembers the budget it was
+    # fetched with; we accept the hit when that budget is at least as
+    # large as the new request. This is what lets the seed
+    # (max_per_source=50) warm the cache for agent calls (defaults to 5).
     cache_key = (
         _normalise_stage(stage),
         (hint or "").strip().lower(),
-        int(max_per_source),
         bool(drop_obsolete),
     )
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        log.debug("parametric_search.cache_hit q=%r", query)
-        if max_total is None:
-            max_total = 2 * max_per_source
-        return cached[:max_total]
+    requested_mps = int(max_per_source)
+    cached_entry = _cache_get(cache_key)
+    if cached_entry is not None:
+        fetched_mps, cached = cached_entry
+        if fetched_mps >= requested_mps:
+            log.debug("parametric_search.cache_hit q=%r stored_mps=%d req_mps=%d",
+                      query, fetched_mps, requested_mps)
+            if max_total is None:
+                max_total = 2 * requested_mps
+            return cached[:max_total]
 
     # Persistent on-disk cache (RAG layer). Survives restarts and lets a
     # warm cache short-circuit a 4-8 s parallel DigiKey+Mouser fan-out.
     # Hash the same canonical key tuple we use in-process so the two
-    # cache layers never disagree.
+    # cache layers never disagree. The persistent layer doesn't track
+    # `max_per_source`, so we fall back to a size heuristic: the stored
+    # list must hold at least `requested_mps` parts to be considered a
+    # hit. The seed always fetches with mps=50 (much larger than any
+    # agent call, default 5), so a stored entry shorter than the agent's
+    # request usually means the universe is genuinely that small —
+    # refetching won't add more parts. The small-pool case (e.g. PLL
+    # returning 5 unique parts) therefore stays a cache hit; only when
+    # the cached pool is smaller than what the caller asked for do we
+    # bother going live again.
     persistent_hash = _persistent_query_hash(cache_key)
     if persistent_hash and not _persistent_disabled():
         try:
@@ -258,13 +280,16 @@ def find_candidates(
         except Exception as exc:  # noqa: BLE001 — cache must never break the live path
             log.debug("parametric_search.persistent_read_err q=%r: %s", query, exc)
             persistent = None
-        if persistent:
+        if persistent and len(persistent) >= requested_mps:
             # Promote into the in-memory cache so subsequent calls within
-            # this process don't pay another SQLite read.
-            _cache_put(cache_key, persistent)
+            # this process don't pay another SQLite read. We don't know
+            # the original fetch budget, but the size meets the request,
+            # so tag it with `requested_mps` (the smallest budget it
+            # could have served — conservative).
+            _cache_put(cache_key, requested_mps, persistent)
             _cross_populate_distributor_cache(persistent)
             if max_total is None:
-                max_total = 2 * max_per_source
+                max_total = 2 * requested_mps
             return persistent[:max_total]
 
     # Parallel fetch — total latency drops to max(DigiKey, Mouser). Two
@@ -281,8 +306,10 @@ def find_candidates(
 
     # Cache the merged+filtered list *before* applying max_total — that
     # lets a subsequent call with a different max_total still reuse the
-    # same underlying shortlist.
-    _cache_put(cache_key, merged)
+    # same underlying shortlist. We tag the entry with the budget used
+    # for this fetch so a future larger-budget request can tell this
+    # cache is too small and refetch.
+    _cache_put(cache_key, requested_mps, merged)
 
     # Cross-populate the exact-MPN lookup cache used by `finalize_p1`'s
     # audit (services/rf_audit.py -> tools.distributor_search.lookup).
