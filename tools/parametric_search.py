@@ -29,6 +29,7 @@ Performance:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -79,11 +80,16 @@ _STAGE_KEYWORDS: dict[str, str] = {
 # In-process cache
 # ---------------------------------------------------------------------------
 
-# TTL is intentionally short: distributor stock/lifecycle can change within
-# an hour, and a P1 run completes in minutes. 60s is long enough to absorb
-# duplicate calls within a single run, short enough that re-running a
-# project after a pause gets fresh data.
-_CACHE_TTL_S = 60.0
+# TTL spans a full P1 elicitation session. A typical run:
+#   Round 1-3 (find_candidate_parts fan-out)  ->  LLM generate_requirements
+#   (~3-5 min on glm-5.1)  ->  finalize_p1 audit (exact MPN re-lookups)
+# With a 60 s TTL the second half of that pipeline always missed the cache
+# because generate_requirements alone exceeds the window. 300 s (5 min)
+# keeps the shortlist warm through the end of finalize_p1's audit so the
+# exact-MPN lookup of every chosen component can be served from the in-
+# process cache we pre-populate below (see `find_candidates`). Distributor
+# stock/lifecycle moves on an hour+ cadence, so 5 min is still fresh.
+_CACHE_TTL_S = 300.0
 
 _cache_lock = threading.Lock()
 _cache: dict[tuple, tuple[float, list[PartInfo]]] = {}
@@ -96,25 +102,31 @@ def reset_cache() -> None:
         _cache.clear()
 
 
-def _cache_get(key: tuple) -> Optional[list[PartInfo]]:
+def _cache_get(key: tuple) -> Optional[tuple[int, list[PartInfo]]]:
+    """Return ``(fetched_max_per_source, parts)`` or None on miss/stale.
+
+    The stored ``max_per_source`` lets callers decide whether the cached
+    list is large enough to satisfy a new request — see ``find_candidates``
+    for the gating rule.
+    """
     now = time.monotonic()
     with _cache_lock:
         entry = _cache.get(key)
         if entry is None:
             return None
-        ts, value = entry
+        ts, fetched_mps, value = entry
         if now - ts > _CACHE_TTL_S:
             # Stale — evict so repeated misses don't grow the dict.
             _cache.pop(key, None)
             return None
         # Return a shallow copy so callers can mutate without affecting
         # future cache hits. PartInfo is frozen, so list() is enough.
-        return list(value)
+        return fetched_mps, list(value)
 
 
-def _cache_put(key: tuple, value: list[PartInfo]) -> None:
+def _cache_put(key: tuple, max_per_source: int, value: list[PartInfo]) -> None:
     with _cache_lock:
-        _cache[key] = (time.monotonic(), list(value))
+        _cache[key] = (time.monotonic(), int(max_per_source), list(value))
 
 
 # ---------------------------------------------------------------------------
@@ -225,20 +237,60 @@ def find_candidates(
         return []
 
     # Cache key normalises the inputs so "LNA" + "2-18 GHz" hits the same
-    # bucket as "  lna " + "2-18 GHz ". We include max_per_source /
-    # drop_obsolete because they materially affect the cached list.
+    # bucket as "  lna " + "2-18 GHz ". `max_per_source` is intentionally
+    # **not** in the key — a stored 50-result fetch can satisfy a 5-result
+    # request via slicing. The stored entry remembers the budget it was
+    # fetched with; we accept the hit when that budget is at least as
+    # large as the new request. This is what lets the seed
+    # (max_per_source=50) warm the cache for agent calls (defaults to 5).
     cache_key = (
         _normalise_stage(stage),
         (hint or "").strip().lower(),
-        int(max_per_source),
         bool(drop_obsolete),
     )
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        log.debug("parametric_search.cache_hit q=%r", query)
-        if max_total is None:
-            max_total = 2 * max_per_source
-        return cached[:max_total]
+    requested_mps = int(max_per_source)
+    cached_entry = _cache_get(cache_key)
+    if cached_entry is not None:
+        fetched_mps, cached = cached_entry
+        if fetched_mps >= requested_mps:
+            log.debug("parametric_search.cache_hit q=%r stored_mps=%d req_mps=%d",
+                      query, fetched_mps, requested_mps)
+            if max_total is None:
+                max_total = 2 * requested_mps
+            return cached[:max_total]
+
+    # Persistent on-disk cache (RAG layer). Survives restarts and lets a
+    # warm cache short-circuit a 4-8 s parallel DigiKey+Mouser fan-out.
+    # Hash the same canonical key tuple we use in-process so the two
+    # cache layers never disagree. The persistent layer doesn't track
+    # `max_per_source`, so we fall back to a size heuristic: the stored
+    # list must hold at least `requested_mps` parts to be considered a
+    # hit. The seed always fetches with mps=50 (much larger than any
+    # agent call, default 5), so a stored entry shorter than the agent's
+    # request usually means the universe is genuinely that small —
+    # refetching won't add more parts. The small-pool case (e.g. PLL
+    # returning 5 unique parts) therefore stays a cache hit; only when
+    # the cached pool is smaller than what the caller asked for do we
+    # bother going live again.
+    persistent_hash = _persistent_query_hash(cache_key)
+    if persistent_hash and not _persistent_disabled():
+        try:
+            from services.component_cache import get_default
+            persistent = get_default().get_parametric(persistent_hash)
+        except Exception as exc:  # noqa: BLE001 — cache must never break the live path
+            log.debug("parametric_search.persistent_read_err q=%r: %s", query, exc)
+            persistent = None
+        if persistent and len(persistent) >= requested_mps:
+            # Promote into the in-memory cache so subsequent calls within
+            # this process don't pay another SQLite read. We don't know
+            # the original fetch budget, but the size meets the request,
+            # so tag it with `requested_mps` (the smallest budget it
+            # could have served — conservative).
+            _cache_put(cache_key, requested_mps, persistent)
+            _cross_populate_distributor_cache(persistent)
+            if max_total is None:
+                max_total = 2 * requested_mps
+            return persistent[:max_total]
 
     # Parallel fetch — total latency drops to max(DigiKey, Mouser). Two
     # workers is enough; we never call more than two APIs here.
@@ -254,12 +306,88 @@ def find_candidates(
 
     # Cache the merged+filtered list *before* applying max_total — that
     # lets a subsequent call with a different max_total still reuse the
-    # same underlying shortlist.
-    _cache_put(cache_key, merged)
+    # same underlying shortlist. We tag the entry with the budget used
+    # for this fetch so a future larger-budget request can tell this
+    # cache is too small and refetch.
+    _cache_put(cache_key, requested_mps, merged)
+
+    # Cross-populate the exact-MPN lookup cache used by `finalize_p1`'s
+    # audit (services/rf_audit.py -> tools.distributor_search.lookup).
+    _cross_populate_distributor_cache(merged)
+
+    # Write through to the persistent on-disk parametric cache. Survives
+    # restart, so the next demo run (even after a server bounce) hits
+    # the cache instead of the live API. Best-effort: failure to write
+    # the cache must never break the live response.
+    if persistent_hash and not _persistent_disabled():
+        try:
+            from services.component_cache import get_default
+            get_default().put_parametric(persistent_hash, query, merged)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("parametric_search.persistent_write_err q=%r: %s", query, exc)
+        # Also write each PartInfo into the persistent MPN cache so the
+        # subsequent finalize_p1 audit (which calls `distributor_search.
+        # lookup` per BOM row) hits warm rows instead of round-tripping.
+        try:
+            from services.component_cache import get_default
+            get_default().bulk_put_mpns(merged)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("parametric_search.bulk_mpn_err q=%r: %s", query, exc)
 
     if max_total is None:
         max_total = 2 * max_per_source
     return merged[:max_total]
+
+
+# ---------------------------------------------------------------------------
+# Persistent-cache helpers
+# ---------------------------------------------------------------------------
+
+def _persistent_disabled() -> bool:
+    """Lazy import of the cache opt-out so this module can be imported
+    in environments where `services.component_cache` isn't available
+    yet (e.g. partial test runs)."""
+    try:
+        from services.component_cache import cache_disabled
+        return cache_disabled()
+    except Exception:
+        return False
+
+
+def _persistent_query_hash(cache_key: tuple) -> str:
+    """Stable string hash of the canonical in-process cache key. Using
+    SHA-1 truncated to 16 hex chars keeps the on-disk PRIMARY KEY short
+    while still being collision-free in practice (we never expect more
+    than ~1k distinct queries)."""
+    try:
+        payload = repr(cache_key).encode("utf-8")
+        return "param:" + hashlib.sha1(payload).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _cross_populate_distributor_cache(merged: list[PartInfo]) -> None:
+    """Inject every freshly-retrieved PartInfo into `distributor_search`'s
+    in-memory exact-MPN cache so the subsequent finalize_p1 audit serves
+    its per-row `lookup()` calls from RAM.
+
+    Safety: we only INSERT — never overwrite an existing entry — so a
+    prior `distributor_search.lookup` result (which already ran the
+    datasheet URL verification pass) keeps priority. If the entry is
+    net-new, the downstream render-time URL probe in requirements_agent
+    still catches any dead datasheet link.
+    """
+    if not merged:
+        return
+    try:
+        from tools import distributor_search as _ds
+        with _ds._cache_lock:  # type: ignore[attr-defined]
+            for _info in merged:
+                _key = (_info.part_number or "").strip().upper()
+                if _key and _key not in _ds._cache:  # type: ignore[attr-defined]
+                    _ds._cache[_key] = _info  # type: ignore[attr-defined]
+    except Exception as _exc:  # pragma: no cover — best-effort warm
+        log.debug("parametric_search.cross_cache_skip: %s", _exc)
 
 
 # Disable cache entirely when the caller sets this env var — useful for

@@ -21,7 +21,26 @@ from tools.distributor_search import (
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _fresh():
+def _fresh(monkeypatch):
+    # Disable the persistent on-disk RAG cache so write-throughs don't
+    # leak across tests via the shared SQLite file.
+    monkeypatch.setenv("COMPONENT_CACHE_DISABLED", "1")
+    # `config.py` calls `load_dotenv()` at import time so real DigiKey /
+    # Mouser credentials from .env leak into every test process. That
+    # poisons mock-based tests in two ways:
+    #   1. `is_configured()` returns True even when the test only mocked
+    #      the *other* distributor — so the unintended distributor fires
+    #      a real network call (or, with patched urlopen, consumes the
+    #      mock iterator before the test's distributor gets to it).
+    #   2. The shared `urllib.request.urlopen` symbol means a single
+    #      `patch("tools.X.urllib.request.urlopen", ...)` intercepts
+    #      DigiKey's token endpoint first, exhausting the mock and
+    #      surfacing as `StopIteration` from the *other* distributor.
+    # Strip both upfront; per-test fixtures (`dk_configured` /
+    # `mouser_configured`) re-add what each test actually needs.
+    for key in ("DIGIKEY_CLIENT_ID", "DIGIKEY_CLIENT_SECRET",
+                "DIGIKEY_API_URL", "MOUSER_API_KEY", "MOUSER_API_URL"):
+        monkeypatch.delenv(key, raising=False)
     distributor_search.reset_cache()
     digikey_api.reset_cache()
     yield
@@ -316,18 +335,26 @@ class TestMpnNormalisation:
 
 class TestDatasheetVerificationOnAccept:
 
-    def test_bad_datasheet_url_stripped_when_not_trusted(self, mouser_configured):
+    def test_bad_datasheet_url_replaced_with_fallback_when_not_trusted(self, mouser_configured):
+        """When the distributor's PDF fails its probe, the resolver swaps in
+        a fallback URL (manufacturer guess or Google search). Old behaviour
+        stripped the URL entirely, leaving an empty BOM cell — see
+        tools/datasheet_resolver.py docstring for the rationale."""
         body = json.dumps({"SearchResults": {"NumberOfResult": 1, "Parts": [{
             "ManufacturerPartNumber": "X", "Manufacturer": "V",
             "DataSheetUrl": "https://stale.example/bad.pdf",
             "LifecycleStatus": "Active",
         }]}})
         with _mock_mouser_urlopen(body), \
-             patch("tools.datasheet_verify.is_trusted_vendor_url", return_value=False), \
-             patch("tools.datasheet_verify.verify_url", return_value=False):
+             patch("tools.datasheet_resolver.is_trusted_vendor_url", return_value=False), \
+             patch("tools.datasheet_resolver.verify_url", return_value=False):
             info = distributor_search.lookup("X")
         assert info is not None
-        assert info.datasheet_url is None  # stripped
+        # URL is no longer None — it falls through to the always-good
+        # Google "MPN datasheet" search link as the last chain rung.
+        assert info.datasheet_url is not None
+        assert info.datasheet_url != "https://stale.example/bad.pdf"
+        assert info.datasheet_url.startswith("https://www.google.com/search?q=")
 
     def test_trusted_vendor_url_preserved_without_head_call(self, mouser_configured):
         body = json.dumps({"SearchResults": {"NumberOfResult": 1, "Parts": [{

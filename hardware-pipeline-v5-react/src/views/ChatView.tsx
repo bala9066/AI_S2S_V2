@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback, memo } from 'react';
 import type { Project, PhaseMeta, DesignScope } from '../types';
 import { SCOPE_LABELS } from '../types';
-import { api } from '../api';
+import { api, type ChatResult } from '../api';
 import { ensureMermaid, purgeMermaidScratch, nextMermaidId } from '../utils/mermaid';
 import { sanitizeMermaid } from '../utils/mermaidSanitize';
 import MermaidErrorBoundary from '../components/MermaidErrorBoundary';
@@ -2820,15 +2820,92 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
     bottomRef.current?.scrollIntoView({ behavior: 'auto' });
   }, [messages, showApproveCard, phaseCompleted, streaming]);
 
-  /** Silently finalize Phase 1 — no user bubble, no input echo */
+  /** Silently finalize Phase 1 — no user bubble, no input echo.
+   *  Routes through the backend's async chat path (HTTP 202 + polling)
+   *  so dense-RF finalize runs that can take 5–15 min don't time out
+   *  on the HTTP connection. The progress label re-words itself based
+   *  on elapsed seconds so the user knows it's still working. */
   const finalizePhase = async () => {
     if (!project || loading) return;
     setLoading(true);
     setStreaming('');
+
+    const formatElapsed = (s: number) => {
+      const m = Math.floor(s / 60);
+      const r = Math.floor(s % 60);
+      return m > 0 ? `${m}m ${r}s` : `${r}s`;
+    };
+    // Phase labels keyed on elapsed seconds. The last few entries cover
+    // the long-tail of dense radar/EW BOMs so the message keeps changing
+    // past the 8-min mark instead of freezing on "almost there".
+    const progressLabel = (s: number) => {
+      const phases = [
+        { at: 0,   label: 'Generating BOM + verifying components' },
+        { at: 60,  label: 'Computing RF cascade + checking distributors' },
+        { at: 180, label: 'Pre-emit gate — re-verifying MPN candidates' },
+        { at: 300, label: 'Running RF audit + fixing any blockers' },
+        { at: 480, label: 'Finalizing — almost there for dense RF' },
+        { at: 720, label: 'Dense BOM — still finalizing on glm-5.1 (this is normal)' },
+        { at: 900, label: 'Long run — verifying every part on the BOM' },
+      ];
+      let label = phases[0].label;
+      for (const p of phases) if (s >= p.at) label = p.label;
+      return `${label}… (${formatElapsed(s)} elapsed)`;
+    };
+
     try {
-      const result = await api.chat(project.id, '__FINALIZE__');
-      const rawText = result.text || 'Requirements finalized. Reviewing documents…';
-      const cleanText = cleanAiText(rawText);
+      const { taskId } = await api.chatAsync(project.id, '__FINALIZE__');
+      // Local 1-second tick so the displayed elapsed time advances every
+      // second — the 5-sec backend poll only refreshes task *status*,
+      // never the elapsed counter (which would jump in 5-sec steps and
+      // make the UI look frozen between polls). startedAt is captured
+      // here so the local clock and the backend clock can drift
+      // independently without affecting display continuity.
+      const startedAt = Date.now();
+      setStreaming(progressLabel(0));
+      const tickHandle = window.setInterval(() => {
+        const s = (Date.now() - startedAt) / 1000;
+        setStreaming(progressLabel(s));
+      }, 1000);
+
+      // Poll every 5 s. No client-side hard cap — the backend has its
+      // own retry budget; if the LLM truly hangs, the user can refresh
+      // and the next finalize click starts a fresh task.
+      const POLL_MS = 5000;
+      const taskResult = await new Promise<{
+        text: string;
+        phaseComplete: boolean;
+        draftPending: boolean;
+      }>((resolve, reject) => {
+        const handle = window.setInterval(async () => {
+          try {
+            const t = await api.getChatTask(project.id, taskId);
+            // Note: do NOT call setStreaming(progressLabel(t.elapsedS))
+            // here — the local 1-sec tick above owns the displayed
+            // elapsed counter. Mixing the two causes 5-sec jolts.
+            if (t.status === 'complete' && t.result) {
+              clearInterval(handle);
+              clearInterval(tickHandle);
+              resolve({
+                text: (t.result.response as string)
+                  || 'Requirements finalized. Reviewing documents…',
+                phaseComplete: !!t.result.phase_complete,
+                draftPending: !!t.result.draft_pending,
+              });
+            } else if (t.status === 'failed') {
+              clearInterval(handle);
+              clearInterval(tickHandle);
+              reject(new Error(t.error || 'Finalize task failed on the server'));
+            }
+          } catch (pollErr) {
+            // Network blip — keep polling. Only abort if the task
+            // itself reports failed (handled above).
+            console.warn('[finalize] poll error (will retry):', pollErr);
+          }
+        }, POLL_MS);
+      });
+
+      const cleanText = cleanAiText(taskResult.text);
       let idx = 0;
       const interval = setInterval(() => {
         idx = Math.min(idx + 16, cleanText.length);
@@ -2843,11 +2920,83 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
           setShowApproveCard(true);
         }
       }, 16);
-    } catch {
-      onMessages([...messages, { role: 'ai', text: '⚠️ Cannot reach the backend server.\n\n**To fix:** Double-click `run.bat` (or `INSTALL.bat` on first use) in the project folder, wait for the "Backend is healthy" message, then try again.\n\nIf already running, check that nothing else is using port 8000.', id: newMsgId() }]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Background task may still be running on the server even though
+      // we couldn't poll it — flag that so the user knows to check.
+      onMessages([...messages, {
+        role: 'ai',
+        text: `⚠️ Finalize couldn't be reached: ${msg}\n\nThe backend may still be working in the background. Wait a minute, then check the **Documents** tab — if files appear, the run succeeded. If not, click **Generate** again.`,
+        id: newMsgId(),
+      }]);
       setStreaming('');
       setLoading(false);
     }
+  };
+
+  /** Spawn + poll a long async chat turn. Mirrors finalizePhase's polling
+   *  pattern but returns a ChatResult so callers can re-use the existing
+   *  typewriter / card-handling code path. The progress label is fed into
+   *  setStreaming so the UI keeps showing what stage the backend is in. */
+  const runAsyncChat = async (asyncText: string): Promise<ChatResult> => {
+    if (!project) throw new Error('no project');
+    const formatElapsed = (s: number) => {
+      const m = Math.floor(s / 60);
+      const r = Math.floor(s % 60);
+      return m > 0 ? `${m}m ${r}s` : `${r}s`;
+    };
+    // Phase labels keyed on elapsed seconds. Long-tail entries past
+    // 8 min so the message keeps changing on dense BOMs (matches the
+    // finalizePhase progressLabel above — keep them in sync).
+    const progressLabel = (s: number) => {
+      const phases = [
+        { at: 0,   label: 'Generating BOM + verifying components' },
+        { at: 60,  label: 'Computing RF cascade + checking distributors' },
+        { at: 180, label: 'Pre-emit gate — re-verifying MPN candidates' },
+        { at: 300, label: 'Running RF audit + fixing any blockers' },
+        { at: 480, label: 'Finalizing — almost there for dense RF' },
+        { at: 720, label: 'Dense BOM — still finalizing on glm-5.1 (this is normal)' },
+        { at: 900, label: 'Long run — verifying every part on the BOM' },
+      ];
+      let label = phases[0].label;
+      for (const p of phases) if (s >= p.at) label = p.label;
+      return `${label}… (${formatElapsed(s)} elapsed)`;
+    };
+    const { taskId } = await api.chatAsync(project.id, asyncText);
+    // Local 1-sec tick for the displayed elapsed counter; backend poll
+    // (every 5 s) only checks task status. Keeps the UI ticking
+    // smoothly between polls instead of jumping in 5-sec steps.
+    const startedAt = Date.now();
+    setStreaming(progressLabel(0));
+    const tickHandle = window.setInterval(() => {
+      const s = (Date.now() - startedAt) / 1000;
+      setStreaming(progressLabel(s));
+    }, 1000);
+    const POLL_MS = 5000;
+    return new Promise<ChatResult>((resolve, reject) => {
+      const handle = window.setInterval(async () => {
+        try {
+          const t = await api.getChatTask(project.id, taskId);
+          // Local tick owns the elapsed display — see finalizePhase comment.
+          if (t.status === 'complete' && t.result) {
+            clearInterval(handle);
+            clearInterval(tickHandle);
+            resolve({
+              text: (t.result.response as string) || 'Done.',
+              phaseComplete: !!t.result.phase_complete,
+              draftPending: !!t.result.draft_pending,
+              clarificationCards: t.result.clarification_cards ?? null,
+            });
+          } else if (t.status === 'failed') {
+            clearInterval(handle);
+            clearInterval(tickHandle);
+            reject(new Error(t.error || 'Async chat task failed'));
+          }
+        } catch (pollErr) {
+          console.warn('[runAsyncChat] poll error (will retry):', pollErr);
+        }
+      }, POLL_MS);
+    });
   };
 
   const sendMessage = async (text: string) => {
@@ -2876,7 +3025,18 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
       ) {
         apiText = `[Design scope: ${SCOPE_LABELS[scope]}]\n\n${text}`;
       }
-      const result = await api.chat(project.id, apiText);
+      // Long messages (wizard generate-spec payload, big follow-up bundles)
+      // hit the dense RF audit loop and routinely exceed the 600s sync
+      // deadline. Route them through the backend's async runner + poll
+      // loop. 400 chars catches wizard payloads (typically 1-3 KB) while
+      // keeping short Q&A on the fast sync path.
+      const isLongTurn =
+        apiText.length > 400
+        || apiText.includes('Please generate the Round-1 requirements')
+        || apiText.startsWith('__FINALIZE__');
+      const result = isLongTurn
+        ? await runAsyncChat(apiText)
+        : await api.chat(project.id, apiText);
       // Strip backend boilerplate referencing non-existent UI buttons
       // If the backend returned an empty response, show a helpful fallback
       const rawText = result.text || 'I processed your request. Check the Documents tab to see updated outputs, or try rephrasing your request.';

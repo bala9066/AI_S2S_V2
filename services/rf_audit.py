@@ -89,12 +89,19 @@ def run_datasheet_audit(
     allow_network = _should_verify_network()
 
     # Build (index, url, component) triples so we can correlate
-    # results with the original component row.
+    # results with the original component row. Components that
+    # `run_part_validation_audit` already enriched with a
+    # distributor-verified URL (`_distributor_url_verified == True`) are
+    # skipped here — re-probing the same URL seconds later only adds
+    # latency. See the comment in `run_part_validation_audit` for the
+    # safety argument.
     targets: list[tuple[int, str, dict[str, Any]]] = []
     for idx, c in enumerate(component_recommendations):
         url = (c.get("datasheet_url") or c.get("datasheet") or "").strip()
         if not url:
             issues.append(_missing_url_issue(idx, c))
+            continue
+        if c.get("_distributor_url_verified"):
             continue
         targets.append((idx, url, c))
 
@@ -349,6 +356,22 @@ def run_part_validation_audit(
             merged["manufacturer"] = info.manufacturer
         if info.datasheet_url:
             merged["datasheet_url"] = info.datasheet_url
+            # Mark this URL as having been verified by the distributor's
+            # `lookup` chain — `tools.distributor_search._verify_datasheet`
+            # HEAD-probes every non-trusted-vendor URL with a 3 s timeout
+            # before returning a `PartInfo`, so the URL we just wrote is
+            # at most the few seconds of fan-out latency stale.
+            # `run_datasheet_audit` honours this marker and skips its own
+            # HEAD probe, which on dense BOMs (12-15 components) was the
+            # second-largest contributor to finalize_p1 wall-clock after
+            # the distributor lookups themselves. Safe because:
+            #   * `_verify_datasheet` already stripped the URL when the
+            #     probe failed, so a `None`/empty URL never gets here.
+            #   * The trusted-vendor fast-path in both `_verify_datasheet`
+            #     and `run_datasheet_audit` short-circuits identically,
+            #     so trusted URLs never paid for a probe in the first
+            #     place — marking them is a no-op but harmless.
+            merged["_distributor_url_verified"] = True
         if info.lifecycle_status != "unknown":
             merged["lifecycle_status"] = info.lifecycle_status
         merged.setdefault("distributor_source", info.source)

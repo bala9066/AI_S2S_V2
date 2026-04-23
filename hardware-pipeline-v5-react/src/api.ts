@@ -164,6 +164,61 @@ export const api = {
   // Export all project documents as a ZIP — returns a download URL
   exportZipUrl: (id: number) => `${BASE}/api/v1/projects/${id}/export`,
 
+  /**
+   * Spawn a chat message as a backend background task. Returns immediately
+   * with `{ taskId, status: 'running' }` (HTTP 202). Use for long
+   * operations like P1 finalize that can take 5–15 min on dense RF.
+   * Poll `getChatTask` until `status === 'complete'` or `'failed'`.
+   */
+  chatAsync: async (id: number, message: string): Promise<{ taskId: string; status: string }> => {
+    const res = await fetch(`${BASE}/api/v1/projects/${id}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, async: true }),
+    });
+    if (!res.ok && res.status !== 202) {
+      let detail = '';
+      try { const j = await res.json(); detail = j.detail || ''; } catch { /* ignore */ }
+      throw new Error(`HTTP ${res.status}: ${res.statusText}${detail ? ' — ' + detail : ''}`);
+    }
+    const j = await res.json();
+    return { taskId: j.task_id, status: j.status };
+  },
+
+  /** Poll a backend chat task spawned via `chatAsync`. */
+  getChatTask: async (id: number, taskId: string): Promise<{
+    taskId: string;
+    status: 'running' | 'complete' | 'failed';
+    elapsedS: number;
+    result: {
+      response?: string;
+      phase_complete?: boolean;
+      draft_pending?: boolean;
+      clarification_cards?: ChatResult['clarificationCards'];
+    } | null;
+    error: string | null;
+  }> => {
+    const r = await req<{
+      task_id: string;
+      status: 'running' | 'complete' | 'failed';
+      elapsed_s: number;
+      result: Record<string, unknown> | null;
+      error: string | null;
+    }>(`/api/v1/projects/${id}/chat/tasks/${taskId}`);
+    return {
+      taskId: r.task_id,
+      status: r.status,
+      elapsedS: r.elapsed_s,
+      result: r.result as {
+        response?: string;
+        phase_complete?: boolean;
+        draft_pending?: boolean;
+        clarification_cards?: ChatResult['clarificationCards'];
+      } | null,
+      error: r.error,
+    };
+  },
+
   chat: async (id: number, message: string): Promise<ChatResult> => {
     const result = await req<{
       response?: string; message?: string; content?: string;

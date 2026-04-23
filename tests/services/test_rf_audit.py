@@ -110,6 +110,50 @@ def test_datasheet_audit_network_disabled_flags_untrusted(monkeypatch):
     assert "network disabled" in issues[0].detail
 
 
+def test_datasheet_audit_skips_distributor_verified_urls(monkeypatch):
+    """Perf guardrail: when `run_part_validation_audit` already enriched a
+    component with a distributor-verified URL (the `_distributor_url_verified`
+    marker), `run_datasheet_audit` MUST skip its own HEAD probe.
+
+    Re-probing the same URL seconds after `tools.distributor_search.
+    _verify_datasheet` already cleared it adds no safety — the URL is
+    either still good (no value) or transiently flapping (false positive
+    — would strip a real datasheet). On dense BOMs (12-15 components)
+    this redundancy was the second-largest contributor to finalize_p1
+    wall-clock after the distributor lookups themselves, ~30-60 s.
+    """
+    monkeypatch.setenv("SKIP_DATASHEET_VERIFY", "")  # network allowed
+    with patch("services.rf_audit.verify_url") as mock_verify, \
+         patch("services.rf_audit.is_trusted_vendor_url", return_value=False):
+        issues = run_datasheet_audit([
+            {"part_number": "X",
+             "datasheet_url": "https://untrusted.example/x.pdf",
+             "_distributor_url_verified": True},
+        ])
+    # No HEAD probe issued, no issue raised — the URL is trusted by virtue
+    # of the distributor marker.
+    mock_verify.assert_not_called()
+    assert issues == []
+
+
+def test_datasheet_audit_still_probes_unverified_urls(monkeypatch):
+    """Regression guard: components WITHOUT the `_distributor_url_verified`
+    marker (e.g., the LLM's original URL passed through because the
+    distributor returned no replacement) must still be HEAD-probed.
+
+    Without this guard, a future refactor that accidentally treats every
+    component as verified would let hallucinated URLs ship to the BOM.
+    """
+    monkeypatch.setenv("SKIP_DATASHEET_VERIFY", "")  # network allowed
+    with patch("services.rf_audit.verify_url", return_value=True) as mock_verify, \
+         patch("services.rf_audit.is_trusted_vendor_url", return_value=False):
+        issues = run_datasheet_audit([
+            {"part_number": "X", "datasheet_url": "https://untrusted.example/x.pdf"},
+        ])
+    mock_verify.assert_called_once()
+    assert issues == []
+
+
 # ---------------------------------------------------------------------------
 # Banned parts
 # ---------------------------------------------------------------------------
@@ -276,6 +320,69 @@ def test_part_validation_skips_when_no_distributor_configured(monkeypatch):
         _, issues = run_part_validation_audit([{"part_number": "Invented-9"}])
     # Without live configuration we refuse to accuse the LLM of fabrication.
     assert not any(i.category == "hallucinated_part" for i in issues)
+
+
+def test_part_validation_marks_distributor_verified_url(monkeypatch):
+    """Contract: when the distributor cascade returns a `datasheet_url`,
+    the enriched component MUST be tagged `_distributor_url_verified=True`.
+
+    This is the upstream half of the audit-redundancy-elimination fix.
+    Without this marker, `run_datasheet_audit` will re-probe URLs that
+    `tools.distributor_search._verify_datasheet` already cleared seconds
+    earlier — wasting 30-60 s on dense BOMs.
+    """
+    monkeypatch.setenv("DIGIKEY_CLIENT_ID", "x")
+    monkeypatch.setenv("DIGIKEY_CLIENT_SECRET", "y")
+    monkeypatch.setenv("SKIP_DISTRIBUTOR_LOOKUP", "")
+    from services.rf_audit import run_part_validation_audit
+    from tools.digikey_api import PartInfo
+    from unittest.mock import patch
+    real = PartInfo(
+        part_number="ADL8107", manufacturer="Analog Devices Inc.",
+        description="Wideband LNA 2-18 GHz",
+        datasheet_url="https://www.analog.com/en/products/adl8107.html",
+        product_url=None, lifecycle_status="active",
+        unit_price_usd=None, stock_quantity=None, source="digikey",
+    )
+    with patch("services.rf_audit._distributor_lookup", return_value=real):
+        enriched, _ = run_part_validation_audit([
+            {"part_number": "ADL8107",
+             "datasheet_url": "https://llm-invented.example/adl8107.pdf"},
+        ])
+    assert enriched[0]["_distributor_url_verified"] is True
+    assert enriched[0]["datasheet_url"] == \
+        "https://www.analog.com/en/products/adl8107.html"
+
+
+def test_part_validation_does_not_mark_when_distributor_returns_no_url(monkeypatch):
+    """Negative contract: when the distributor record carries no
+    `datasheet_url` (a real case for older parts where the distributor
+    record exists but the PDF link is missing), the LLM's original URL
+    passes through UNMARKED so `run_datasheet_audit` still probes it.
+
+    Marking it would let an unverified LLM URL skip the safety net.
+    """
+    monkeypatch.setenv("DIGIKEY_CLIENT_ID", "x")
+    monkeypatch.setenv("DIGIKEY_CLIENT_SECRET", "y")
+    monkeypatch.setenv("SKIP_DISTRIBUTOR_LOOKUP", "")
+    from services.rf_audit import run_part_validation_audit
+    from tools.digikey_api import PartInfo
+    from unittest.mock import patch
+    no_url = PartInfo(
+        part_number="OLD-PART", manufacturer="Vendor",
+        description="", datasheet_url=None,  # ← distributor has no URL
+        product_url=None, lifecycle_status="active",
+        unit_price_usd=None, stock_quantity=None, source="digikey",
+    )
+    with patch("services.rf_audit._distributor_lookup", return_value=no_url):
+        enriched, _ = run_part_validation_audit([
+            {"part_number": "OLD-PART",
+             "datasheet_url": "https://llm-guess.example/old.pdf"},
+        ])
+    # LLM URL preserved (distributor didn't override) and NOT marked verified
+    # — the datasheet audit must still probe it.
+    assert enriched[0]["datasheet_url"] == "https://llm-guess.example/old.pdf"
+    assert "_distributor_url_verified" not in enriched[0]
 
 
 def test_run_all_integrates_part_validation(monkeypatch):
