@@ -382,7 +382,8 @@ def _resolve_output_dir(proj: dict) -> Optional[str]:
     # Fallback: derive from project name using StorageAdapter.project_dir logic
     name = (proj.get("name") or "").strip()
     if name:
-        safe = name.replace(" ", "_").lower()
+        from services.storage import safe_project_dirname
+        safe = safe_project_dirname(name)
         # Try relative (server started from project root) and absolute via settings
         candidates = [
             os.path.join("output", safe),

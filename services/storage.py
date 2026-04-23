@@ -14,10 +14,30 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+# Characters illegal in Windows filenames (NTFS). Also drops ASCII control
+# chars (0x00–0x1F). Linux/macOS allow most of these but `/` is a separator
+# everywhere, so sanitising on all platforms keeps paths consistent.
+_ILLEGAL_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def safe_project_dirname(project_name: str) -> str:
+    """Slugify a project name into a single directory segment that is valid
+    on Windows, macOS, and Linux.
+
+    Replaces NTFS-illegal chars (< > : " / \\ | ? *) and ASCII control chars
+    with `_`, normalises spaces to `_`, lowercases, and strips trailing
+    dots/spaces (also illegal on Windows). Falls back to "project" if the
+    result is empty.
+    """
+    safe = _ILLEGAL_PATH_CHARS.sub("_", project_name).replace(" ", "_").lower()
+    safe = safe.rstrip(". ")
+    return safe or "project"
 
 
 class StorageAdapter:
@@ -35,8 +55,7 @@ class StorageAdapter:
 
     def project_dir(self, project_name: str) -> Path:
         """Return (and create) the output directory for a project."""
-        safe = project_name.replace(" ", "_").lower()
-        p = self._base / safe
+        p = self._base / safe_project_dirname(project_name)
         p.mkdir(parents=True, exist_ok=True)
         return p
 
