@@ -43,9 +43,11 @@ def _fresh(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     distributor_search.reset_cache()
     digikey_api.reset_cache()
+    digikey_api.reset_rate_limit()
     yield
     distributor_search.reset_cache()
     digikey_api.reset_cache()
+    digikey_api.reset_rate_limit()
 
 
 @pytest.fixture

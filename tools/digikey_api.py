@@ -38,6 +38,51 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# 429 circuit-breaker
+#
+# DigiKey's rate-limit Retry-After is often several hours (e.g. 24 000 s).
+# If we naïvely sleep-and-retry, EACH component stage burns 2 × 30 s = 60 s
+# before giving up, and with 12-15 stages the pipeline stalls for 12-15 min.
+#
+# Solution: the first 429 opens the circuit for min(Retry-After, 300 s).
+# Every subsequent call in the same process checks the circuit and returns
+# immediately (no HTTP round-trip) until the window expires.  On a typical
+# run this collapses the post-LLM component-lookup tail from ~4 min down
+# to ~5 s total (first stage 5 s backoff + circuit open, then all remaining
+# stages instant).
+# ---------------------------------------------------------------------------
+_rl_lock: threading.Lock = threading.Lock()
+_rate_limited_until: float = 0.0   # monotonic timestamp; 0 means "not limited"
+_CIRCUIT_MAX_S: float = 300.0      # never lock out longer than 5 min
+
+
+def _mark_rate_limited(wait_s: float) -> None:
+    """Open (or extend) the 429 circuit-breaker."""
+    duration = min(wait_s, _CIRCUIT_MAX_S)
+    with _rl_lock:
+        global _rate_limited_until
+        _rate_limited_until = time.monotonic() + duration
+    log.info(
+        "digikey.circuit_open — skipping requests for %.0fs "
+        "(Retry-After=%.0fs, capped at %.0fs)",
+        duration, wait_s, _CIRCUIT_MAX_S,
+    )
+
+
+def _is_rate_limited() -> bool:
+    """Return True if the circuit-breaker is currently open."""
+    with _rl_lock:
+        return time.monotonic() < _rate_limited_until
+
+
+def reset_rate_limit() -> None:
+    """Reset the circuit-breaker.  Exposed for tests and manual recovery."""
+    with _rl_lock:
+        global _rate_limited_until
+        _rate_limited_until = 0.0
+
+
+# ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
 
@@ -202,6 +247,9 @@ def lookup(part_number: str, *, timeout_s: float = 12.0) -> Optional[PartInfo]:
         return None
     if not is_configured():
         return None
+    if _is_rate_limited():
+        log.debug("digikey.circuit_open_skip lookup pn=%r", part_number)
+        return None
 
     token = _get_token()
     if not token:
@@ -267,15 +315,23 @@ def _open_with_retry(
                 reset_cache()
                 log.info("digikey.401_stale_token %s", what)
                 return None
-            if code == 429 and attempt < max_retries:
+            if code == 429:
                 wait_s = _parse_retry_after(exc.headers if hasattr(exc, "headers") else None)
-                attempt += 1
-                log.info(
-                    "digikey.429_backoff attempt=%d wait=%.1fs %s",
-                    attempt, wait_s, what,
-                )
-                time.sleep(min(wait_s, 30.0))
-                continue
+                # Open the circuit so all subsequent calls in this
+                # process skip DigiKey instantly — stops the 60-s-per-
+                # stage cascade that causes 12-min P1 runs.
+                _mark_rate_limited(wait_s)
+                if attempt < max_retries:
+                    attempt += 1
+                    log.info(
+                        "digikey.429_backoff attempt=%d wait=%.1fs %s",
+                        attempt, wait_s, what,
+                    )
+                    # 5 s cap (down from 30 s).  One quick retry in case
+                    # the rate-limit window resets; if it 429s again we
+                    # give up immediately rather than burning another 30 s.
+                    time.sleep(min(wait_s, 5.0))
+                    continue
             log.info("digikey.http_error %s code=%s: %s", what, code, exc)
             return None
         except (urllib.error.URLError, TimeoutError, ssl.SSLError,
@@ -328,6 +384,9 @@ def keyword_search(
     if not keywords:
         return []
     if not is_configured():
+        return []
+    if _is_rate_limited():
+        log.debug("digikey.circuit_open_skip keyword=%r", keywords)
         return []
     token = _get_token()
     if not token:

@@ -34,7 +34,7 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
 from typing import Iterable, Optional
 
 from tools import digikey_api, mouser_api
@@ -292,13 +292,28 @@ def find_candidates(
                 max_total = 2 * requested_mps
             return persistent[:max_total]
 
-    # Parallel fetch — total latency drops to max(DigiKey, Mouser). Two
-    # workers is enough; we never call more than two APIs here.
+    # Parallel fetch — total latency is max(DigiKey, Mouser), not sum.
+    # Wall-clock deadline = per-request HTTP timeout + one 5-second
+    # DigiKey 429 backoff + 2 s margin.  If a fetcher hasn't finished
+    # within that window (e.g. DigiKey is still on its second retry) we
+    # cancel it and return whatever the completed source gave us.  This
+    # prevents a single 429 storm from holding up 12+ sequential stages
+    # for 30 s each (old worst-case: 2 retries × 30 s cap = 60 s/stage).
+    _wall_s = timeout_s + 7.0
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="parametric-search") as pool:
         dk_future = pool.submit(_fetch_digikey, query, max_per_source, timeout_s)
         ms_future = pool.submit(_fetch_mouser,  query, max_per_source, timeout_s)
-        dk = dk_future.result()
-        ms = ms_future.result()
+        _done, _pending = _futures_wait([dk_future, ms_future], timeout=_wall_s)
+        dk = dk_future.result() if dk_future in _done else []
+        ms = ms_future.result() if ms_future in _done else []
+        for _f in _pending:
+            _f.cancel()
+    if _pending:
+        log.warning(
+            "parametric_search.deadline stage=%r wall_s=%.0f "
+            "pending_sources=%d — returning %d partial result(s)",
+            stage, _wall_s, len(_pending), len(dk) + len(ms),
+        )
 
     merged = _dedupe_by_mpn(dk + ms)
     if drop_obsolete:

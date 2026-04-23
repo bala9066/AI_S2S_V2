@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tools import digikey_api
-from tools.digikey_api import PartInfo, is_configured, lookup, reset_cache
+from tools.digikey_api import PartInfo, is_configured, lookup, reset_cache, reset_rate_limit
 
 
 # ---------------------------------------------------------------------------
@@ -23,8 +23,10 @@ from tools.digikey_api import PartInfo, is_configured, lookup, reset_cache
 @pytest.fixture(autouse=True)
 def _fresh_cache():
     reset_cache()
+    reset_rate_limit()
     yield
     reset_cache()
+    reset_rate_limit()
 
 
 @pytest.fixture
@@ -336,3 +338,97 @@ def test_mpn_is_url_encoded(monkeypatch):
         lookup("ZFSC-2-1+")
     # '+' must be encoded as %2B — otherwise DigiKey sees it as a space.
     assert "%2B" in urls[1], f"'+' must be percent-encoded — got {urls[1]!r}"
+
+
+# ---------------------------------------------------------------------------
+# 429 circuit-breaker
+# ---------------------------------------------------------------------------
+
+def _http_429(retry_after: str = "24000") -> urllib.error.HTTPError:
+    """Build a minimal HTTP 429 error with a Retry-After header."""
+    headers = MagicMock()
+    headers.get = lambda k, d="": retry_after if k == "Retry-After" else d
+    err = urllib.error.HTTPError(
+        url="https://api.digikey.com/token", code=429,
+        msg="Too Many Requests", hdrs=headers, fp=None,
+    )
+    return err
+
+
+def test_circuit_opens_after_first_429(configured, monkeypatch):
+    """First 429 from DigiKey opens the circuit; subsequent keyword_search
+    calls return [] without hitting the network again."""
+    token_resp = json.dumps({"access_token": "tok", "expires_in": 3600})
+    call_count = 0
+
+    def _open(*_a, **_k):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:  # token fetch
+            class _Ctx:
+                def read(self): return token_resp.encode()
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            return _Ctx()
+        raise _http_429()
+
+    with patch("tools.digikey_api.urllib.request.urlopen", side_effect=_open):
+        from tools.digikey_api import keyword_search
+        r1 = keyword_search("LNA 2-18 GHz")
+
+    assert r1 == [], "first 429 should return empty list"
+    assert digikey_api._is_rate_limited(), "circuit must be open after 429"
+
+    # Second call must short-circuit without touching urlopen
+    calls_before = call_count
+    with patch("tools.digikey_api.urllib.request.urlopen") as mock_open:
+        keyword_search("mixer 6 GHz")
+        assert not mock_open.called, "circuit-open call must not hit urlopen"
+    assert call_count == calls_before, "no extra urlopen calls while circuit is open"
+
+
+def test_circuit_resets_after_window(configured, monkeypatch):
+    """After `reset_rate_limit()` the circuit closes and the next call
+    is allowed through."""
+    digikey_api._mark_rate_limited(0.001)   # open with near-zero window
+    import time; time.sleep(0.01)           # let the tiny window expire
+
+    # Circuit should have expired — _is_rate_limited returns False
+    assert not digikey_api._is_rate_limited()
+
+
+def test_backoff_cap_is_5_seconds(configured, monkeypatch):
+    """Per-attempt sleep must be capped at 5 s (not 30 s).  A 7-hour
+    Retry-After must not make the test (or pipeline) sleep more than 5 s."""
+    slept: list[float] = []
+    monkeypatch.setattr("tools.digikey_api.time.sleep", lambda s: slept.append(s))
+
+    token_resp = json.dumps({"access_token": "tok", "expires_in": 3600})
+    call_count = 0
+
+    def _open(*_a, **_k):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            class _Ctx:
+                def read(self): return token_resp.encode()
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            return _Ctx()
+        raise _http_429("24000")  # DigiKey says wait 24000 s
+
+    with patch("tools.digikey_api.urllib.request.urlopen", side_effect=_open):
+        from tools.digikey_api import keyword_search
+        keyword_search("LNA 2-18 GHz")
+
+    assert slept, "should have slept at least once (one retry)"
+    assert max(slept) <= 5.0, f"largest sleep must be <=5 s; got {max(slept)}"
+
+
+def test_lookup_skips_when_circuit_open(configured):
+    """lookup() returns None immediately when the circuit-breaker is open."""
+    digikey_api._mark_rate_limited(300)   # open for 5 min
+    with patch("tools.digikey_api.urllib.request.urlopen") as mock_open:
+        result = lookup("ADL8107")
+    assert result is None
+    assert not mock_open.called, "lookup must not hit urlopen while circuit is open"

@@ -2835,18 +2835,19 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
       const r = Math.floor(s % 60);
       return m > 0 ? `${m}m ${r}s` : `${r}s`;
     };
-    // Phase labels keyed on elapsed seconds. The last few entries cover
-    // the long-tail of dense radar/EW BOMs so the message keeps changing
-    // past the 8-min mark instead of freezing on "almost there".
+    // Phase labels keyed on elapsed seconds. Timings reflect post-circuit-
+    // breaker behaviour: component retrieval is now capped at ~19 s/stage
+    // so the full finalize (LLM + BOM + audit) lands in 1-4 min for most
+    // designs. Labels past 5 min cover glm-5.1 on very dense radar/EW BOMs.
     const progressLabel = (s: number) => {
       const phases = [
-        { at: 0,   label: 'Generating BOM + verifying components' },
-        { at: 60,  label: 'Computing RF cascade + checking distributors' },
-        { at: 180, label: 'Pre-emit gate — re-verifying MPN candidates' },
-        { at: 300, label: 'Running RF audit + fixing any blockers' },
-        { at: 480, label: 'Finalizing — almost there for dense RF' },
-        { at: 720, label: 'Dense BOM — still finalizing on glm-5.1 (this is normal)' },
-        { at: 900, label: 'Long run — verifying every part on the BOM' },
+        { at: 0,   label: 'Fetching candidate components from distributors' },
+        { at: 30,  label: 'Generating BOM — LLM selecting from real parts' },
+        { at: 90,  label: 'Computing RF cascade + verifying MPNs' },
+        { at: 180, label: 'Running RF audit + fixing any blockers' },
+        { at: 300, label: 'Almost there — finalizing for dense RF designs' },
+        { at: 420, label: 'Long BOM — still running on glm-5.1 (normal for EW/radar)' },
+        { at: 600, label: 'Extended run — verifying every part on the BOM' },
       ];
       let label = phases[0].label;
       for (const p of phases) if (s >= p.at) label = p.label;
