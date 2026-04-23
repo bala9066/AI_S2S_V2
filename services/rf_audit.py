@@ -89,19 +89,12 @@ def run_datasheet_audit(
     allow_network = _should_verify_network()
 
     # Build (index, url, component) triples so we can correlate
-    # results with the original component row. Components that
-    # `run_part_validation_audit` already enriched with a
-    # distributor-verified URL (`_distributor_url_verified == True`) are
-    # skipped here — re-probing the same URL seconds later only adds
-    # latency. See the comment in `run_part_validation_audit` for the
-    # safety argument.
+    # results with the original component row.
     targets: list[tuple[int, str, dict[str, Any]]] = []
     for idx, c in enumerate(component_recommendations):
         url = (c.get("datasheet_url") or c.get("datasheet") or "").strip()
         if not url:
             issues.append(_missing_url_issue(idx, c))
-            continue
-        if c.get("_distributor_url_verified"):
             continue
         targets.append((idx, url, c))
 
@@ -110,9 +103,15 @@ def run_datasheet_audit(
 
     # Short-circuit on the trusted-vendor allowlist first so air-gapped
     # environments (SKIP_DATASHEET_VERIFY=1) still mark known-good URLs
-    # as verified without hitting the network.
+    # as verified without hitting the network. Also honour the
+    # `_distributor_url_verified` perf marker written by `_merge_part_info`
+    # — `tools.distributor_search._verify_datasheet` has already HEAD-probed
+    # the URL seconds ago, re-probing adds no safety (either still good →
+    # wasted RTT, or transiently flapping → false positive that strips a
+    # real datasheet).
     trusted: dict[int, bool] = {
-        idx: is_trusted_vendor_url(url) for idx, url, _ in targets
+        idx: (is_trusted_vendor_url(url) or bool(c.get("_distributor_url_verified")))
+        for idx, url, c in targets
     }
 
     live_results: dict[int, bool] = {}
@@ -174,6 +173,76 @@ def _missing_url_issue(idx: int, c: dict[str, Any]) -> AuditIssue:
 # ---------------------------------------------------------------------------
 # Live part-number validation (DigiKey → Mouser → local seed)
 # ---------------------------------------------------------------------------
+
+def _source_url_key(source: str) -> Optional[str]:
+    src = (source or "").strip().lower()
+    if src == "digikey":
+        return "digikey_url"
+    if src == "mouser":
+        return "mouser_url"
+    return None
+
+
+def _merge_part_info(row: dict[str, Any], info) -> dict[str, Any]:
+    """Overlay distributor-authoritative fields onto a BOM row.
+
+    P1 has two BOM shapes in circulation: rich rows use
+    primary_part/primary_manufacturer/primary_description, while older
+    rows use part_number/manufacturer/description. Keep both shapes
+    coherent so docs, audits, and downstream netlist generation all see
+    the same distributor-backed values.
+    """
+    merged = {**row}
+
+    if info.manufacturer:
+        if "primary_part" in merged or "primary_manufacturer" in merged:
+            merged["primary_manufacturer"] = info.manufacturer
+        merged["manufacturer"] = info.manufacturer
+
+    if info.description:
+        if "primary_part" in merged or "primary_description" in merged:
+            merged["primary_description"] = info.description
+        merged["description"] = info.description
+
+    if info.datasheet_url:
+        merged["datasheet_url"] = info.datasheet_url
+        merged.pop("datasheet", None)
+        # Mark this URL as having been verified by the distributor's
+        # `lookup` chain — `tools.distributor_search._verify_datasheet`
+        # HEAD-probes every non-trusted-vendor URL with a 3 s timeout
+        # before returning a `PartInfo`, so the URL we just wrote is
+        # at most the few seconds of fan-out latency stale.
+        # `run_datasheet_audit` honours this marker and skips its own
+        # HEAD probe, which on dense BOMs (12-15 components) was the
+        # second-largest contributor to finalize_p1 wall-clock after
+        # the distributor lookups themselves.
+        merged["_distributor_url_verified"] = True
+
+    if info.lifecycle_status != "unknown":
+        merged["lifecycle_status"] = info.lifecycle_status
+
+    if info.source:
+        merged["distributor_source"] = info.source
+
+    if info.product_url:
+        merged["product_url"] = info.product_url
+        merged["distributor_url"] = info.product_url
+        source_key = _source_url_key(info.source)
+        if source_key:
+            merged[source_key] = info.product_url
+
+    if info.unit_price_usd is not None:
+        merged["unit_price_usd"] = info.unit_price_usd
+    if info.unit_price is not None:
+        merged["unit_price"] = info.unit_price
+    if info.unit_price_currency:
+        merged["unit_price_currency"] = info.unit_price_currency
+    if info.stock_quantity is not None:
+        merged["stock_quantity"] = info.stock_quantity
+    if info.region:
+        merged["stock_region"] = info.region
+
+    return merged
 
 def run_part_validation_audit(
     component_recommendations: list[dict[str, Any]],
@@ -315,7 +384,10 @@ def run_part_validation_audit(
                 scrubbed = {**c}
                 for k in ("datasheet_url", "datasheet",
                           "product_url", "unit_price_usd",
-                          "lifecycle_status"):
+                          "unit_price", "unit_price_currency",
+                          "stock_quantity", "stock_region",
+                          "lifecycle_status", "distributor_source",
+                          "distributor_url", "digikey_url", "mouser_url"):
                     scrubbed.pop(k, None)
                 scrubbed["_hallucinated"] = True
                 enriched.append(scrubbed)
@@ -351,35 +423,7 @@ def run_part_validation_audit(
 
         # Enrich the component dict with authoritative values. The LLM's
         # fields survive only when the distributor didn't provide one.
-        merged = {**c}
-        if info.manufacturer:
-            merged["manufacturer"] = info.manufacturer
-        if info.datasheet_url:
-            merged["datasheet_url"] = info.datasheet_url
-            # Mark this URL as having been verified by the distributor's
-            # `lookup` chain — `tools.distributor_search._verify_datasheet`
-            # HEAD-probes every non-trusted-vendor URL with a 3 s timeout
-            # before returning a `PartInfo`, so the URL we just wrote is
-            # at most the few seconds of fan-out latency stale.
-            # `run_datasheet_audit` honours this marker and skips its own
-            # HEAD probe, which on dense BOMs (12-15 components) was the
-            # second-largest contributor to finalize_p1 wall-clock after
-            # the distributor lookups themselves. Safe because:
-            #   * `_verify_datasheet` already stripped the URL when the
-            #     probe failed, so a `None`/empty URL never gets here.
-            #   * The trusted-vendor fast-path in both `_verify_datasheet`
-            #     and `run_datasheet_audit` short-circuits identically,
-            #     so trusted URLs never paid for a probe in the first
-            #     place — marking them is a no-op but harmless.
-            merged["_distributor_url_verified"] = True
-        if info.lifecycle_status != "unknown":
-            merged["lifecycle_status"] = info.lifecycle_status
-        merged.setdefault("distributor_source", info.source)
-        if info.product_url:
-            merged.setdefault("product_url", info.product_url)
-        if info.unit_price_usd is not None:
-            merged.setdefault("unit_price_usd", info.unit_price_usd)
-        enriched.append(merged)
+        enriched.append(_merge_part_info(c, info))
 
     return enriched, issues
 

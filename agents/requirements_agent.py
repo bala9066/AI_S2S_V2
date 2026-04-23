@@ -847,7 +847,7 @@ If any of these are missing from your tool call, you MUST add them before submit
 - Make smart engineering assumptions (e.g., if they say "motor controller" assume industrial temp range, common MCUs, standard interfaces)
 - Prioritize RoHS-compliant components with long lifecycle status.
 - **DIAGRAMS — use the structured `block_diagram` / `architecture` fields.** You emit JSON (direction + nodes + edges + subgraphs); the backend renders guaranteed-valid Mermaid. Do NOT write Mermaid syntax by hand unless the structured schema truly cannot express what you need — the legacy `block_diagram_mermaid` / `architecture_mermaid` string fields are retained only as a last-resort fallback and go through a salvager that produces lower-quality output.
-- **MANDATORY RETRIEVAL STEP — `find_candidate_parts` BEFORE `generate_requirements`:** For every signal-chain stage that ends up in `component_recommendations` (LNA, mixer, filter/preselector, limiter, ADC, DAC, PLL/VCO, LDO, MCU, FPGA, TCXO, etc.), call the `find_candidate_parts` tool FIRST with the canonical `stage` id and a short `spec_hint` (freq range / NF / package / resolution — ~10 words max). You may batch multiple `find_candidate_parts` calls in sequence before emitting `generate_requirements`. When selecting the MPN for each stage you MUST pick from the returned `candidates[].part_number` list and copy `datasheet_url` verbatim from the same candidate. If a stage has zero candidates, widen the hint and call again, or omit the stage — never invent an MPN. Picks that do not trace back to a `find_candidate_parts` result will fail the `not_from_candidate_pool` audit gate.
+- **MANDATORY RETRIEVAL STEP — `find_candidate_parts` BEFORE `generate_requirements`:** For every signal-chain stage that ends up in `component_recommendations` (LNA, mixer, filter/preselector, limiter, ADC, DAC, PLL/VCO, LDO, MCU, FPGA, TCXO, etc.), call the `find_candidate_parts` tool FIRST with the canonical `stage` id and a short `spec_hint` (freq range / NF / package / resolution — ~10 words max). You may batch multiple `find_candidate_parts` calls in sequence before emitting `generate_requirements`. When selecting the MPN for each stage you MUST pick from the returned `candidates[].part_number` list and copy `datasheet_url`, `product_url`, `source`, and the source-specific `digikey_url` / `mouser_url` fields verbatim from the same candidate. If a stage has zero candidates, widen the hint and call again, or omit the stage — never invent an MPN. Picks that do not trace back to a `find_candidate_parts` result will fail the `not_from_candidate_pool` audit gate.
 - **ANTI-HALLUCINATION RULE**: Do NOT fabricate component part numbers. ONLY use part numbers you are CONFIDENT exist and are currently in production. If unsure, use the manufacturer family name + key specs (e.g., "Analog Devices HMC-series LNA, 2-18 GHz, 2 dB NF") instead of guessing a specific part number. NEVER write TBD, TBC, TBA, or "to be determined/confirmed" anywhere. Every spec value must come from a confirmed requirement or a real datasheet — NEVER invent performance numbers.
 - **LIFECYCLE GATE — NO STALE PARTS**: Every `component_recommendations` entry MUST be a part that is **currently in active production**. You MUST set `lifecycle_status` to "active" for every component; if you cannot confirm the part is in active production (e.g. manufacturer still lists it on its product page without "NRND" / "Not Recommended for New Designs" / "Last Time Buy" / "Obsolete" / "Discontinued" banners), DO NOT recommend it. If a classic part you would normally recommend is now NRND or EOL, pick its successor family instead. Explicitly banned stale parts (DO NOT use these under any circumstances): `HMC-C024`, `HMC-1040`, `HMC1040LP5CE`, `HMC1040LP4E`, `HMC1020LP4E`, `HMC516`, `HMC-C070`, `HMC-C072`, `HMC-ALH435`, `HMC-ALH508`, `MCR03ERTJ201` (Rohm chip resistor — DigiKey discontinued), any Hittite-branded MPNs that begin with `HMC-` followed by a three-digit number and end with the letter `C` (Analog Devices' Hittite acquisition parts from the 2008-2012 catalogue — most are now NRND). **Preferred currently-shipping alternatives (use these families):**
   - **Broadband RF LNA (2-18 / 6-18 GHz):** Analog Devices `HMC8410`, `HMC8411`, `ADL8104`, `ADL8106`; Qorvo `QPL9057`, `TQL9066`, `TQL9092`; Mini-Circuits `PMA3-83LN+`, `PSA4-5043+`, `PMA-5451+`; NXP `BGA7210N6`; MACOM `MAAL-011111`
@@ -856,7 +856,7 @@ If any of these are missing from your tool call, you MUST add them before submit
   - **Chip resistors / passives:** Yageo `RC0603` family, Panasonic `ERJ-3GEY` / `ERJ-3EK`, Vishay `CRCW0603` (NOT Rohm `MCR03ERTJ` — Rohm `MCR-series` is OK but avoid the `ERTJ` sub-family)
 - **BANNED MANUFACTURER: VPT Inc.** Do NOT recommend any VPT brand components. Use Vicor, Murata Power Solutions, TDK-Lambda, Cosel, or TI equivalents instead.
 - **ALWAYS include `datasheet_url`** for every component in the `component_recommendations` array. Use ONLY real, publicly accessible manufacturer datasheet URLs. Preferred domains: `ti.com`, `analog.com`, `mouser.com/datasheet`, `maximintegrated.com`, `nxp.com`, `st.com`, `renesas.com`, `microchip.com`, `infineon.com`, `onsemi.com`, `xilinx.com`, `latticesemi.com`, `murata.com`, `vishay.com`, `coilcraft.com`, `vicorpower.com`. If you are NOT certain the exact URL exists, use the manufacturer's product search page (e.g. `https://www.ti.com/product/LM5175`) rather than guessing a PDF path. NEVER fabricate PDF paths. Never leave `datasheet_url` empty.
-- Include `digikey_url` where known (e.g., `https://www.digikey.com/en/products/detail/texas-instruments/...`).
+- Include `digikey_url` for DigiKey candidates and `mouser_url` for Mouser candidates. Also set `distributor_source` to `digikey` or `mouser` so the BOM renderer can label the link correctly.
 - **FOR RF DESIGNS**: Always populate the `gain_loss_budget` array. Every stage in the RF signal chain (antenna/input → LNA/driver → PA stages → filters → output) must be a row. Use real datasheet values for gain, P1dB, NF. Calculate cumulative gain and cascaded NF (Friis formula) correctly. Include system-level parameters (center_freq_mhz, bandwidth_mhz, input_power_dbm, target_output_dbm). Additionally populate these sub-arrays **only when the design requirement specifically calls for it**: `harmonic_rejection` (when spurious/harmonic spec is mentioned), `power_vs_frequency` (when flatness across band is specified), `power_vs_input` (when dynamic range, linearity or 1 dB compression is specified), `cable_loss` (when cable runs, antenna feed, or connector budget is mentioned). Add `input_return_loss_db` and `output_return_loss_db` per stage whenever return loss / VSWR is a requirement.
 - **NEVER use XML tags in your responses.** No `<output>`, `<field_name>`, `<safety_flag>`, or any other XML/HTML wrapper tags.
   Use ONLY markdown: `**bold**`, `## headers`, `- lists`, `| tables |`, code blocks. XML tags will break the UI renderer.
@@ -1245,6 +1245,19 @@ GENERATE_REQUIREMENTS_TOOL = {
                         "digikey_url": {
                             "type": "string",
                             "description": "DigiKey product page URL if available (e.g. https://www.digikey.com/en/products/detail/...).",
+                        },
+                        "mouser_url": {
+                            "type": "string",
+                            "description": "Mouser product page URL if the selected candidate came from Mouser.",
+                        },
+                        "distributor_source": {
+                            "type": "string",
+                            "enum": ["digikey", "mouser", "seed", "chromadb"],
+                            "description": "Distributor/source that validated the selected part.",
+                        },
+                        "product_url": {
+                            "type": "string",
+                            "description": "Source distributor product page URL, copied from find_candidate_parts.product_url.",
                         },
                         "lifecycle_status": {
                             "type": "string",
@@ -1932,9 +1945,10 @@ class RequirementsAgent(BaseAgent):
                 "`generate_requirements` as your FINAL tool call. Every MPN in "
                 "`component_recommendations` MUST be copied verbatim from one of "
                 "the `find_candidate_parts` `candidates[].part_number` values "
-                "returned during this turn; copy the corresponding `datasheet_url` "
+                "returned during this turn; copy the corresponding `datasheet_url`, "
+                "`product_url`, `source`, and `digikey_url` / `mouser_url` "
                 "verbatim too. Inventing an MPN or altering the distributor's "
-                "datasheet URL will fail the `not_from_candidate_pool` audit gate. "
+                "URLs will fail the `not_from_candidate_pool` audit gate. "
                 "If no candidate fits a stage after a second widened retrieval, "
                 "OMIT that stage from the BOM rather than inventing a part.\n"
                 "\n"
@@ -3036,18 +3050,68 @@ class RequirementsAgent(BaseAgent):
 
     async def _handle_search_components(self, input_data: dict) -> dict:
         """Handle component search tool calls."""
-        if not self.component_search:
-            return {
-                "query": input_data.get("query", ""),
-                "results": [],
-                "count": 0,
-                "error": "ComponentSearchTool not available",
-                "message": "Component search is disabled. Using LLM knowledge for recommendations."
-            }
-
         query = input_data.get("query", "")
         category = input_data.get("category")
-        n_results = input_data.get("n_results", 5)
+        try:
+            n_results = int(input_data.get("n_results", 5))
+        except (TypeError, ValueError):
+            n_results = 5
+        n_results = max(1, min(n_results, 10))
+
+        def _fallback_distributor_search(message: str = "") -> dict:
+            try:
+                from tools.parametric_search import find_candidates
+                stage = category or query
+                candidates = find_candidates(
+                    stage,
+                    query,
+                    max_per_source=n_results,
+                    max_total=n_results,
+                    timeout_s=10.0,
+                )
+            except Exception as exc:
+                self.log(f"Distributor component search failed: {exc}", "warning")
+                return {
+                    "query": query,
+                    "results": [],
+                    "count": 0,
+                    "error": str(exc),
+                    "message": message or "Distributor component search failed.",
+                }
+
+            return {
+                "query": query,
+                "results": [
+                    {
+                        "part_number": c.part_number,
+                        "manufacturer": c.manufacturer,
+                        "description": c.description,
+                        "category": category or "",
+                        "key_specs": {},
+                        "datasheet_url": c.datasheet_url,
+                        "product_url": c.product_url,
+                        "distributor_url": c.product_url,
+                        "lifecycle_status": c.lifecycle_status,
+                        "source": c.source,
+                        "unit_price": c.unit_price,
+                        "unit_price_currency": c.unit_price_currency,
+                        "stock_quantity": c.stock_quantity,
+                        "stock_region": c.region,
+                        "relevance_score": 1.0,
+                    }
+                    for c in candidates
+                ],
+                "count": len(candidates),
+                "message": message or (
+                    "Results came from live DigiKey/Mouser distributor search."
+                ),
+            }
+
+        if not self.component_search:
+            return _fallback_distributor_search(
+                "Component vector search is disabled; using live DigiKey/Mouser "
+                "distributor search instead."
+            )
 
         try:
             results = self.component_search.search(
@@ -3055,31 +3119,37 @@ class RequirementsAgent(BaseAgent):
                 category=category,
                 n_results=n_results,
             )
-
-            return {
-                "query": query,
-                "results": [
-                    {
-                        "part_number": r.component.part_number,
-                        "manufacturer": r.component.manufacturer,
-                        "description": r.component.description,
-                        "category": r.component.category,
-                        "key_specs": r.component.key_specs,
-                        "relevance_score": r.relevance_score,
-                    }
-                    for r in results
-                ],
-                "count": len(results),
-            }
         except Exception as e:
             self.log(f"Component search failed: {e}", "warning")
-            return {
-                "query": query,
-                "results": [],
-                "count": 0,
-                "error": str(e),
-                "message": "Component search failed. Using LLM knowledge for recommendations."
-            }
+            return _fallback_distributor_search(
+                "Component vector search failed; using live DigiKey/Mouser "
+                "distributor search instead."
+            )
+
+        if not results:
+            return _fallback_distributor_search(
+                "No local component-vector results; using live DigiKey/Mouser "
+                "distributor search instead."
+            )
+
+        return {
+            "query": query,
+            "results": [
+                {
+                    "part_number": r.component.part_number,
+                    "manufacturer": r.component.manufacturer,
+                    "description": r.component.description,
+                    "category": r.component.category,
+                    "key_specs": r.component.key_specs,
+                    "datasheet_url": r.component.datasheet_url,
+                    "lifecycle_status": r.component.lifecycle_status,
+                    "estimated_cost_usd": r.component.estimated_cost_usd,
+                    "relevance_score": r.relevance_score,
+                }
+                for r in results
+            ],
+            "count": len(results),
+        }
 
     # Categories where the failed BOM row is still in the payload and we
     # can deterministically swap it for a known-good candidate of the same
@@ -3295,6 +3365,8 @@ class RequirementsAgent(BaseAgent):
             new_mfg = replacement.get("manufacturer") or ""
             new_url = replacement.get("datasheet_url") or ""
             new_lc = (replacement.get("lifecycle_status") or "active").strip().lower() or "active"
+            new_product_url = replacement.get("product_url") or replacement.get("distributor_url") or ""
+            new_source = (replacement.get("source") or "").strip().lower()
 
             # Mutate the row — preserve whichever key schema the row uses.
             if "primary_part" in row or "primary_manufacturer" in row:
@@ -3310,6 +3382,19 @@ class RequirementsAgent(BaseAgent):
                 row.pop("datasheet", None)
             if "lifecycle_status" in row or new_lc:
                 row["lifecycle_status"] = new_lc
+            if new_source:
+                row["distributor_source"] = new_source
+            if new_product_url:
+                row["product_url"] = new_product_url
+                row["distributor_url"] = new_product_url
+                if new_source == "digikey":
+                    row["digikey_url"] = new_product_url
+                elif new_source == "mouser":
+                    row["mouser_url"] = new_product_url
+            for k in ("unit_price", "unit_price_currency", "unit_price_usd",
+                      "stock_quantity", "stock_region"):
+                if replacement.get(k) is not None:
+                    row[k] = replacement.get(k)
             # Clear any hallucination flag the audit added.
             row.pop("_hallucinated", None)
             row["_auto_fix_replaced"] = failed_mpn
@@ -3442,6 +3527,30 @@ class RequirementsAgent(BaseAgent):
         _stage_key = stage.strip().lower()
         _stage_bucket = self._offered_candidates_by_stage.setdefault(_stage_key, [])
         _bucket_seen = {(r.get("part_number") or "").strip().upper() for r in _stage_bucket}
+
+        def _candidate_record(c) -> dict:
+            source = (c.source or "").strip().lower()
+            rec = {
+                "part_number": c.part_number,
+                "manufacturer": c.manufacturer,
+                "description": c.description,
+                "datasheet_url": c.datasheet_url,
+                "product_url": c.product_url,
+                "distributor_url": c.product_url,
+                "lifecycle_status": c.lifecycle_status,
+                "source": c.source,
+                "unit_price": c.unit_price,
+                "unit_price_currency": c.unit_price_currency,
+                "unit_price_usd": c.unit_price_usd,
+                "stock_quantity": c.stock_quantity,
+                "stock_region": c.region,
+            }
+            if source == "digikey":
+                rec["digikey_url"] = c.product_url
+            elif source == "mouser":
+                rec["mouser_url"] = c.product_url
+            return rec
+
         for c in candidates:
             mpn = (c.part_number or "").strip().upper()
             if not mpn:
@@ -3450,15 +3559,7 @@ class RequirementsAgent(BaseAgent):
             if mpn in _bucket_seen:
                 continue
             _bucket_seen.add(mpn)
-            _stage_bucket.append({
-                "part_number": c.part_number,
-                "manufacturer": c.manufacturer,
-                "description": c.description,
-                "datasheet_url": c.datasheet_url,
-                "product_url": c.product_url,
-                "lifecycle_status": c.lifecycle_status,
-                "source": c.source,
-            })
+            _stage_bucket.append(_candidate_record(c))
 
         self.log(
             f"find_candidate_parts stage={stage!r} hint={hint!r} "
@@ -3471,21 +3572,12 @@ class RequirementsAgent(BaseAgent):
             "stage": stage,
             "spec_hint": hint,
             "count": len(candidates),
-            "candidates": [
-                {
-                    "part_number": c.part_number,
-                    "manufacturer": c.manufacturer,
-                    "description": c.description,
-                    "datasheet_url": c.datasheet_url,
-                    "product_url": c.product_url,
-                    "lifecycle_status": c.lifecycle_status,
-                    "source": c.source,
-                }
-                for c in candidates
-            ],
+            "candidates": [_candidate_record(c) for c in candidates],
             "message": (
-                "Pick ONLY from `candidates[].part_number`. Copy `datasheet_url` verbatim. "
-                "Do not invent alternatives. If none fit, call this tool again with a wider hint."
+                "Pick ONLY from `candidates[].part_number`. Copy `datasheet_url` "
+                "and the source-specific distributor URL (`digikey_url` or "
+                "`mouser_url`) verbatim. Do not invent alternatives. If none "
+                "fit, call this tool again with a wider hint."
             ) if candidates else (
                 "No candidates found. Widen the spec_hint (e.g. drop the frequency or package), "
                 "or call again with a different stage. Do not invent an MPN."
@@ -7466,7 +7558,14 @@ typical passive/active bands).</p>
             # value None (common now that find_candidate_parts may surface
             # candidates with datasheet_url=None from Mouser's data gaps).
             ds_url = _verified_url((comp.get('datasheet_url') or '').strip(), part, mfr)
+            source = (comp.get('distributor_source') or comp.get('source') or '').strip().lower()
+            product_url = (comp.get('product_url') or comp.get('distributor_url') or '').strip()
             dk_url = (comp.get('digikey_url') or '').strip()
+            ms_url = (comp.get('mouser_url') or '').strip()
+            if product_url and not dk_url and source == "digikey":
+                dk_url = product_url
+            if product_url and not ms_url and source == "mouser":
+                ms_url = product_url
 
             # Primary heading with part number as a link if datasheet available
             part_str = f"[{part}]({ds_url})" if ds_url else part
@@ -7485,9 +7584,31 @@ typical passive/active bands).</p>
             if ds_url:
                 links.append(f"[📄 Datasheet]({ds_url})")
             if dk_url:
-                links.append(f"[🛒 DigiKey]({dk_url})")
+                links.append(f"[DigiKey]({dk_url})")
+            if ms_url:
+                links.append(f"[Mouser]({ms_url})")
+            if product_url and not dk_url and not ms_url:
+                links.append(f"[Distributor]({product_url})")
             if links:
                 lines.append("  ".join(links))
+                lines.append("")
+
+            meta_bits = []
+            if source:
+                meta_bits.append(f"source: {source}")
+            price = comp.get("unit_price")
+            currency = comp.get("unit_price_currency")
+            if price is not None and currency:
+                meta_bits.append(f"unit price: {price} {currency}")
+            stock = comp.get("stock_quantity")
+            region = comp.get("stock_region") or comp.get("region")
+            if stock is not None:
+                label = f"stock: {stock}"
+                if region:
+                    label += f" ({region})"
+                meta_bits.append(label)
+            if meta_bits:
+                lines.append("*Distributor data:* " + " | ".join(str(x) for x in meta_bits))
                 lines.append("")
 
             # Key specs — remove 'datasheet' key if LLM stuffed the URL there

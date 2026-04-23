@@ -269,6 +269,53 @@ def test_part_validation_enriches_when_found(monkeypatch):
     assert c["datasheet_url"] == "https://www.analog.com/en/products/adl8107.html"
     assert c["lifecycle_status"] == "active"
     assert c["distributor_source"] == "digikey"
+    assert c["product_url"] == "https://www.digikey.com/..."
+    assert c["digikey_url"] == "https://www.digikey.com/..."
+    assert c["unit_price_usd"] == 24.0
+    assert c["stock_quantity"] == 180
+
+
+def test_part_validation_enriches_primary_shape_with_mouser_fields(monkeypatch):
+    monkeypatch.setenv("MOUSER_API_KEY", "z")
+    monkeypatch.setenv("SKIP_DISTRIBUTOR_LOOKUP", "")
+    from services.rf_audit import run_part_validation_audit
+    from tools.digikey_api import PartInfo
+    from unittest.mock import patch
+
+    real = PartInfo(
+        part_number="STM32F407VGT6",
+        manufacturer="STMicroelectronics",
+        description="ARM Cortex-M4 MCU",
+        datasheet_url=None,
+        product_url="https://www.mouser.in/ProductDetail/STMicroelectronics/STM32F407VGT6",
+        lifecycle_status="active",
+        unit_price_usd=None,
+        stock_quantity=0,
+        source="mouser",
+        unit_price=1106.05,
+        unit_price_currency="INR",
+        region="IN",
+    )
+    with patch("services.rf_audit._distributor_lookup", return_value=real):
+        enriched, issues = run_part_validation_audit([{
+            "function": "MCU control",
+            "primary_part": "STM32F407VGT6",
+            "primary_manufacturer": "Wrong",
+            "primary_description": "Old text",
+        }])
+
+    assert issues == []
+    c = enriched[0]
+    assert c["primary_manufacturer"] == "STMicroelectronics"
+    assert c["primary_description"] == "ARM Cortex-M4 MCU"
+    assert c["manufacturer"] == "STMicroelectronics"
+    assert c["description"] == "ARM Cortex-M4 MCU"
+    assert c["mouser_url"].startswith("https://www.mouser.in/")
+    assert c["product_url"] == c["mouser_url"]
+    assert c["distributor_source"] == "mouser"
+    assert c["unit_price"] == 1106.05
+    assert c["unit_price_currency"] == "INR"
+    assert c["stock_region"] == "IN"
 
 
 def test_part_validation_flags_nrnd_parts(monkeypatch):

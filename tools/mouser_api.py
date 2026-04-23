@@ -276,10 +276,16 @@ def _parse_search_response(payload: dict, requested_pn: str) -> Optional[PartInf
         except (TypeError, ValueError):
             continue
 
-    # Region of the stock figure — explicit field first, then infer from
-    # the response's `MouserRegionCodePrefix`, then from MOUSER_API_URL's
-    # host. Empty string when none of those resolve.
-    region = _infer_region(best, results=(payload or {}).get("SearchResults") or {})
+    product_url = (best.get("ProductDetailUrl") or "").strip() or None
+
+    # Region of the stock figure / price book. Explicit API fields win,
+    # then the returned product URL/currency, then MOUSER_API_URL's host.
+    region = _infer_region(
+        best,
+        results=(payload or {}).get("SearchResults") or {},
+        product_url=product_url,
+        currency=price_currency,
+    )
 
     # Prefer dedicated fields but tolerate the legacy all-caps variants.
     mfr = (
@@ -304,7 +310,7 @@ def _parse_search_response(payload: dict, requested_pn: str) -> Optional[PartInf
         manufacturer=str(mfr).strip(),
         description=str(desc).strip(),
         datasheet_url=str(ds_url).strip() or None,
-        product_url=(best.get("ProductDetailUrl") or "").strip() or None,
+        product_url=product_url,
         lifecycle_status=lifecycle,
         unit_price_usd=price_usd,
         stock_quantity=stock,
@@ -315,14 +321,22 @@ def _parse_search_response(payload: dict, requested_pn: str) -> Optional[PartInf
     )
 
 
-def _infer_region(part: dict, *, results: dict) -> str:
+def _infer_region(
+    part: dict,
+    *,
+    results: dict,
+    product_url: Optional[str] = None,
+    currency: Optional[str] = None,
+) -> str:
     """Best-effort region derivation for Mouser stock figures.
 
     Priority:
       1. part["Region"] / part["MouserRegion"] — explicit per-item.
       2. results["MouserRegionCodePrefix"] — response-level (e.g. "IN").
-      3. MOUSER_API_URL host TLD — `.in` / `.de` / `.com` heuristic.
-      4. Empty string when nothing resolves.
+      3. product URL host TLD (mouser.in -> IN).
+      4. price currency when it strongly implies a country (INR -> IN).
+      5. MOUSER_API_URL host TLD.
+      6. Empty string when nothing resolves.
     """
     for key in ("Region", "MouserRegion", "RegionCode"):
         v = (part.get(key) or "").strip().upper()
@@ -332,13 +346,31 @@ def _infer_region(part: dict, *, results: dict) -> str:
         v = (results.get(key) or "").strip().upper()
         if v:
             return v[:3]
-    # TLD heuristic
+    url_region = _region_from_url(product_url or "")
+    if url_region:
+        return url_region
+    cur = (currency or "").strip().upper()
+    if cur == "INR":
+        return "IN"
+    if cur == "USD":
+        return "US"
+    if cur == "EUR":
+        return "EU"
+    api_region = _region_from_url(_config()[1])
+    if api_region:
+        return api_region
+    return ""
+
+
+def _region_from_url(url: str) -> str:
     try:
         from urllib.parse import urlparse
-        host = urlparse(_config()[1]).hostname or ""
+        host = urlparse(url or "").hostname or ""
         tld = host.rsplit(".", 1)[-1].upper()
-        if tld in {"IN", "DE", "FR", "UK", "JP", "CN", "BR", "SG", "HK"}:
+        if tld in {"IN", "DE", "FR", "JP", "CN", "BR", "SG", "HK"}:
             return tld
+        if tld == "UK":
+            return "UK"
         if tld == "COM":
             return "US"
     except Exception:

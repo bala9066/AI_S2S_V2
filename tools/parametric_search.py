@@ -334,6 +334,30 @@ def find_candidates(
         except Exception as exc:  # noqa: BLE001
             log.debug("parametric_search.bulk_mpn_err q=%r: %s", query, exc)
 
+    # Cross-populate the exact-MPN lookup cache used by `finalize_p1`'s
+    # audit (services/rf_audit.py -> tools.distributor_search.lookup).
+    # Every PartInfo we just pulled via keyword_search IS a verified
+    # distributor record — feeding it into the exact-lookup cache keyed
+    # by upper-cased MPN means the audit phase skips a redundant round-
+    # trip to DigiKey/Mouser per component. A typical P1 run has 10-15
+    # BOM rows whose MPNs are a subset of the shortlists; this collapses
+    # the 60-90 s audit down to ~10 s.
+    #
+    # Safety: we only INSERT — never overwrite an existing entry — so a
+    # prior `distributor_search.lookup` result (which already ran the
+    # datasheet URL verification pass) keeps priority. If the entry is
+    # net-new, the downstream render-time URL probe in requirements_agent
+    # still catches any dead datasheet link.
+    try:
+        from tools import distributor_search as _ds
+        with _ds._cache_lock:  # type: ignore[attr-defined]
+            for _info in merged:
+                _key = (_info.part_number or "").strip().upper()
+                if _key and _key not in _ds._cache:  # type: ignore[attr-defined]
+                    _ds._cache[_key] = _info  # type: ignore[attr-defined]
+    except Exception as _exc:  # pragma: no cover — best-effort warm
+        log.debug("parametric_search.cross_cache_skip: %s", _exc)
+
     if max_total is None:
         max_total = 2 * max_per_source
     return merged[:max_total]

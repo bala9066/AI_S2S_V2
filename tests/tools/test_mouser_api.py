@@ -201,6 +201,26 @@ def test_price_in_inr_does_not_pollute_usd_field(configured):
     assert info.unit_price_currency == "INR"
 
 
+def test_india_product_url_sets_region_in(configured):
+    body = json.dumps({
+        "SearchResults": {
+            "NumberOfResult": 1,
+            "Parts": [{
+                "ManufacturerPartNumber": "STM32F407VGT6",
+                "Manufacturer": "STMicroelectronics",
+                "LifecycleStatus": "Active",
+                "ProductDetailUrl": "https://www.mouser.in/ProductDetail/STMicroelectronics/STM32F407VGT6",
+                "PriceBreaks": [{"Quantity": 1, "Price": "₹1106.05", "Currency": "INR"}],
+            }]
+        }
+    })
+    with _mock_urlopen(body):
+        info = lookup("STM32F407VGT6")
+    assert info is not None
+    assert info.region == "IN"
+    assert info.unit_price_currency == "INR"
+
+
 def test_price_currency_inferred_from_symbol_when_field_blank(configured):
     """Some older Mouser responses omit the Currency field and only send
     the symbol in the Price string — fall back to symbol matching."""
