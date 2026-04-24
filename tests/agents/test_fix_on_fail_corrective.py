@@ -153,25 +153,29 @@ class TestSeverityFilter:
 class TestRetryCap:
     """The fix-on-fail retry budget drives worst-case P1 wall-clock: each
     extra retry is another ~90 s LLM round-trip + candidate fetch. This
-    guard fails loudly if someone bumps the cap further without updating
-    the perf note in the agent source.
+    guard fails loudly if someone bumps the cap up without updating the
+    perf note in the agent source.
 
     History:
       - 2026-04-22: lowered 2 → 1 to fix a 12-min pathological P1 caused
         by the LLM never converging when distributors were rate-limited.
-      - 2026-04-24: raised 1 → 2 once the DigiKey circuit-breaker (P7)
-        and MPN-shape gate (P9) made retry 2 cheap and useful — Mouser
-        can now fill stages DigiKey couldn't on the second corrective.
+      - 2026-04-24 (P10, morning): raised 1 → 2 once the DigiKey
+        circuit-breaker (P7) and MPN-shape gate (P9) appeared to make
+        retry 2 cheap and useful.
+      - 2026-04-24 (P14, afternoon): reverted to 1 because the user
+        still saw 11-12 min P1 runs on a dense RF spec. Demo-day
+        pragmatism: drop retry 2, take the small auto-fix-quality hit,
+        cap worst-case wall-clock under ~6 min.
     """
 
-    def test_max_retries_bounded_at_two(self):
-        # Two retries is the new ceiling. The deterministic
+    def test_max_retries_bounded_at_one(self):
+        # One retry is the demo-time ceiling. The deterministic
         # `_auto_fix_blockers` pass still handles the common case for
-        # free; the LLM retries are reserved for residuals where Mouser
-        # needs a second chance to widen `find_candidate_parts`.
-        assert RequirementsAgent._FIX_ON_FAIL_MAX_RETRIES == 2, (
-            "Perf guardrail: raising _FIX_ON_FAIL_MAX_RETRIES above 2 "
-            "inflates P1 worst-case wall-clock. If this change is "
-            "intentional, update the perf note in "
-            "agents/requirements_agent.py and this test together."
+        # free; the single LLM retry catches the residuals.
+        assert RequirementsAgent._FIX_ON_FAIL_MAX_RETRIES == 1, (
+            "Perf guardrail: raising _FIX_ON_FAIL_MAX_RETRIES above 1 "
+            "inflates P1 worst-case wall-clock by ~3 min per extra "
+            "retry. If this change is intentional, update the perf "
+            "note in agents/requirements_agent.py and this test "
+            "together."
         )

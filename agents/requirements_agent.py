@@ -1623,24 +1623,21 @@ class RequirementsAgent(BaseAgent):
     # turn and ask the LLM to re-emit `generate_requirements`. Each retry
     # adds one extra LLM round-trip, so cap small.
     #
-    # Perf guardrail (revised 2026-04-24, was 1 since 2026-04-22):
-    # bumped 1 → 2 because:
-    #   1. The DigiKey 429 circuit-breaker (P7, 2026-04-23) collapses the
-    #      worst-case post-LLM tail from ~4 min to <30 s — the original
-    #      "12-min P1" pathological case is no longer reachable.
-    #   2. The MPN-shape pre-emit gate (P9, 2026-04-24) catches the most
-    #      common hallucination class (descriptions in part_number) BEFORE
-    #      it reaches the audit, so the LLM retry budget is now spent on
-    #      genuinely-hard residuals instead of obvious junk.
-    #   3. User feedback on the "13 hallucinated parts" run showed retry 1
-    #      could converge IF the LLM widened `find_candidate_parts` between
-    #      attempts — a second retry gives Mouser a chance to fill stages
-    #      DigiKey couldn't, which is the dominant failure mode.
-    # Worst case is now ~2 × 90 s LLM round-trip + 30 s candidate fetch
-    # ≈ 3.5 min total fix-on-fail tail (down from the old 12 min ceiling).
-    # If you bump this further, update this comment AND
+    # Perf guardrail (revised 2026-04-24, second time):
+    #   - 2026-04-22: lowered 2 → 1 to fix a 12-min pathological P1.
+    #   - 2026-04-24 (P10, morning): raised 1 → 2 expecting that the new
+    #     DigiKey circuit-breaker (P7) + MPN-shape gate (P9) would keep
+    #     the worst-case under 4 min while the extra retry let Mouser
+    #     converge on stages DigiKey couldn't.
+    #   - 2026-04-24 (P14, afternoon): user reports P1 still taking
+    #     ~12 min on a dense RF spec. Demo is imminent — revert to 1
+    #     and accept the slightly weaker auto-fix in exchange for a
+    #     hard ceiling on wall-clock. The improvements from P7/P9
+    #     remain in place; we just no longer pay for the second LLM
+    #     round-trip.
+    # If you bump this back up, update this comment AND
     # `tests/agents/test_fix_on_fail_corrective.py::TestRetryCap`.
-    _FIX_ON_FAIL_MAX_RETRIES = 2
+    _FIX_ON_FAIL_MAX_RETRIES = 1
     _FIX_ON_FAIL_CATEGORIES = frozenset({
         "hallucinated_part",
         "not_from_candidate_pool",

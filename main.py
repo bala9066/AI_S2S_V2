@@ -1174,6 +1174,13 @@ def _sanitize_mermaid_code(code: str) -> str:
     return code
 
 
+# Bump this whenever the docx render pipeline changes (mermaid sanitiser,
+# pandoc args, fallback shape, etc.). Cached .docx files written under a
+# different version are ignored. P14 (2026-04-24): salvage() pass added in
+# front of `_sanitize_mermaid_code` to fix quoted edge labels.
+_DOCX_CACHE_VERSION = 2
+
+
 def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:
     """
     Pre-render ```mermaid``` blocks to PNG images using local Node.js + cairosvg.
@@ -1188,11 +1195,29 @@ def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:
     tmp = _pl.Path(tmp_dir)
 
     # ── 1. Collect all mermaid blocks ─────────────────────────────────────────
+    # Route every mermaid block through the canonical `salvage()` pipeline
+    # in `tools/mermaid_salvage.py` BEFORE the in-process `_sanitize_mermaid_code`
+    # pass.  Why both, in order?
+    #   - `salvage()` is the single source of truth used by the React
+    #     chat/docs renderers (P13, 2026-04-24). It catches the edge-label
+    #     pattern (`A -- "label" --> B` → `A -->|label| B`) that breaks
+    #     mermaid.ink/mmdc/node — which otherwise causes the DOCX export
+    #     to fall through to "(rendered in browser — source below)" with
+    #     a blank diagram. User-reported on 2026-04-24.
+    #   - `_sanitize_mermaid_code` (legacy, kept) handles a few
+    #     orthogonal patterns (Ohm/deg ASCIIfication, `((label))` →
+    #     `(label)`, ID("...") nested-paren normalisation) that the
+    #     salvager doesn't cover. Running it second gives us both nets.
+    from tools.mermaid_salvage import salvage as _mermaid_salvage
     blocks = []  # list of (match, code)
     for m in MERMAID_RE.finditer(md_text):
-        # Sanitize the mermaid code BEFORE rendering to fix AI-generation errors
         original_code = m.group(1).strip()
-        sanitized_code = _sanitize_mermaid_code(original_code)
+        salvaged_code, _fixes = _mermaid_salvage(original_code)
+        sanitized_code = _sanitize_mermaid_code(salvaged_code)
+        if _fixes:
+            log.info(
+                "mermaid.docx_salvage fixes=%s", ",".join(_fixes),
+            )
         blocks.append((m, sanitized_code))
 
     if not blocks:
@@ -1273,11 +1298,18 @@ async def convert_document_to_docx(project_id: int, filename: str):
     # ── Disk cache: serve cached .docx if source hasn't changed ───────────────
     # Cache lives in a hidden sub-folder so it never appears in document lists
     # and old pre-mermaid cached files are automatically bypassed.
+    #
+    # The cache key is keyed on `_DOCX_CACHE_VERSION` (defined below). Bump
+    # that constant whenever the mermaid render pipeline or pandoc invocation
+    # changes — old cached .docx files (rendered before the change) will then
+    # be bypassed automatically. Source-mtime invalidation alone isn't
+    # enough: re-running the same `architecture.md` through a fixed renderer
+    # must produce a fresh .docx, even if the markdown didn't change.
     cache_dir = src_path.parent / ".docx_cache"
     cache_dir.mkdir(exist_ok=True)
-    cache_path = cache_dir / out_filename
+    cache_path = cache_dir / f"{stem}.v{_DOCX_CACHE_VERSION}.docx"
     if cache_path.exists() and cache_path.stat().st_mtime >= src_path.stat().st_mtime:
-        log.info("docx.cache_hit", extra={"file": filename})
+        log.info("docx.cache_hit", extra={"file": filename, "v": _DOCX_CACHE_VERSION})
         cached_data = cache_path.read_bytes()
         return StreamingResponse(
             iter([cached_data]),
