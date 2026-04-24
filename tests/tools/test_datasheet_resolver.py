@@ -3,14 +3,22 @@ guarantees every BOM row gets a clickable datasheet link.
 
 Coverage matrix:
 
-  * `_slug`               — URL-safe normalisation
-  * `_search_fallback_url` — never empty, properly URL-encoded
-  * `_guess_mfr_url`       — manufacturer pattern matching, miss returns None
-  * `build_chain`          — order, dedup, always ends with search_fallback
-  * `_probe`               — trusted short-circuit, cache hit, cache miss → live → write
-  * `resolve_datasheet`    — first probe pass wins, falls all the way through,
-                              never returns is_valid=False
-  * `resolve_url`          — convenience wrapper
+  * `_distributor_search_url` — never empty, properly URL-encoded,
+                                always lands on DigiKey
+  * `build_chain`             — order, dedup, always ends with
+                                distributor_search; NEVER includes
+                                manufacturer or Google URLs
+  * `_probe`                  — trusted short-circuit, cache hit,
+                                cache miss → live → write
+  * `resolve_datasheet`       — first probe pass wins, falls all the
+                                way through, never returns is_valid=False
+  * `resolve_url`             — convenience wrapper
+
+History note (2026-04-24): the old `_slug`, `_search_fallback_url`,
+and `_guess_mfr_url` helpers were removed when the resolver was
+restricted to DigiKey/Mouser-only links per user feedback that
+manufacturer-site fallbacks (analog.com / qorvo.com / ti.com) and
+Google search fallbacks were producing wrong or off-platform URLs.
 
 The cache singleton is redirected at a temp DB per test so we never
 touch the shipped `data/component_cache.db`. `verify_url` is patched
@@ -29,10 +37,8 @@ from services import component_cache as cc
 from tools import datasheet_resolver as dr
 from tools.datasheet_resolver import (
     ResolvedDatasheet,
-    _guess_mfr_url,
+    _distributor_search_url,
     _probe,
-    _search_fallback_url,
-    _slug,
     build_chain,
     resolve_datasheet,
     resolve_url,
@@ -87,131 +93,50 @@ def _part(
 
 
 # ---------------------------------------------------------------------------
-# _slug
+# _distributor_search_url — replaces the old _slug / _guess_mfr_url /
+# _search_fallback_url helpers. Single contract: always returns a
+# DigiKey keyword-search URL for the given MPN, never empty, never
+# off-platform.
 # ---------------------------------------------------------------------------
 
-class TestSlug:
-    def test_passes_through_safe_chars(self):
-        assert _slug("ADL8107") == "ADL8107"
-        assert _slug("HMC-8410") == "HMC-8410"
-        assert _slug("LM3.3-1.5") == "LM3.3-1.5"
-
-    def test_replaces_unsafe_chars(self):
-        # Spaces, slashes, weird punctuation collapse to a single dash.
-        assert _slug("ADL 8107") == "ADL-8107"
-        assert _slug("ADL/8107") == "ADL-8107"
-        assert _slug("ADL  8107") == "ADL-8107"
-
-    def test_strips_leading_trailing_whitespace(self):
-        assert _slug("  ADL8107  ") == "ADL8107"
-
-    def test_empty_returns_empty(self):
-        assert _slug("") == ""
-        assert _slug(None) == ""  # type: ignore[arg-type]
-
-
-# ---------------------------------------------------------------------------
-# _search_fallback_url
-# ---------------------------------------------------------------------------
-
-class TestSearchFallbackUrl:
-    def test_returns_google_search_url(self):
-        url = _search_fallback_url("ADL8107")
-        assert url.startswith("https://www.google.com/search?q=")
+class TestDistributorSearchUrl:
+    def test_returns_digikey_search_url(self):
+        url = _distributor_search_url("ADL8107")
+        assert url.startswith(
+            "https://www.digikey.com/en/products/result?keywords="
+        )
         assert "ADL8107" in url
-        assert "datasheet" in url
 
     def test_url_encodes_special_chars(self):
-        url = _search_fallback_url("HMC 8410 / IF")
-        # Spaces / slashes must be percent-encoded — never raw in the URL.
+        # Spaces / slashes / "+" inside an MPN must be percent-encoded
+        # so the URL is well-formed at DigiKey's edge. Mini-Circuits
+        # MPNs end in "+" routinely (`ZHL-42W+`, `ZX85-12-8SA-S+`).
+        url = _distributor_search_url("ZX85-12-8SA-S+")
         assert " " not in url
-        assert "/IF" not in url  # the "/" inside the MPN gets escaped
-        # Decoding round-trips back to the original (with " datasheet" suffix).
-        # Strip the prefix to extract just the q param.
-        q = url.split("q=", 1)[1]
-        assert urllib.parse.unquote(q) == "HMC 8410 / IF datasheet"
+        assert url.endswith("ZX85-12-8SA-S%2B"), (
+            "trailing + must be percent-encoded as %2B for DigiKey search"
+        )
 
-    def test_empty_part_number_still_returns_a_url(self):
-        # Even with no MPN we still return a working Google search page —
-        # the contract is "never null".
-        url = _search_fallback_url("")
-        assert url.startswith("https://www.google.com/search?q=")
-        assert "datasheet" in url
+    def test_empty_mpn_still_returns_a_url(self):
+        # Contract: never null. Even with no MPN we still return the
+        # DigiKey search root with an empty keywords param.
+        url = _distributor_search_url("")
+        assert url == "https://www.digikey.com/en/products/result?keywords="
 
+    def test_strips_surrounding_whitespace(self):
+        url = _distributor_search_url("  ADL8107  ")
+        assert url.endswith("ADL8107")
 
-# ---------------------------------------------------------------------------
-# _guess_mfr_url
-# ---------------------------------------------------------------------------
-
-class TestGuessMfrUrl:
-    def test_analog_devices_full_name(self):
-        # _slug doesn't lowercase — preserves MPN case for path correctness.
-        url = _guess_mfr_url("ADL8107", "Analog Devices Inc.")
-        assert url == "https://www.analog.com/en/products/ADL8107.html"
-
-    def test_analog_devices_adi_alias(self):
-        url = _guess_mfr_url("ADL8107", "ADI")
-        assert url == "https://www.analog.com/en/products/ADL8107.html"
-
-    def test_texas_instruments(self):
-        url = _guess_mfr_url("LM5145", "Texas Instruments")
-        assert url == "https://www.ti.com/product/LM5145"
-
-    def test_qorvo_uppercases_mpn(self):
-        url = _guess_mfr_url("qpa9120", "Qorvo")
-        assert url == "https://www.qorvo.com/products/p/QPA9120"
-
-    def test_macom(self):
-        url = _guess_mfr_url("MAAM-011106", "MACOM Technology Solutions")
-        assert "macom.com" in url
-        assert "MAAM-011106" in url
-
-    def test_macom_via_legacy_alias(self):
-        # "M/A-COM" is the historical name, still appears in distributor data.
-        url = _guess_mfr_url("MAAM-011106", "M/A-COM")
-        assert "macom.com" in url
-
-    def test_stmicro(self):
-        url = _guess_mfr_url("STM32F407", "STMicroelectronics")
-        assert "st.com" in url
-        assert "STM32F407" in url
-
-    def test_microchip(self):
-        url = _guess_mfr_url("PIC18F4550", "Microchip Technology")
-        assert "microchip.com" in url
-        assert "PIC18F4550" in url
-
-    def test_infineon(self):
-        url = _guess_mfr_url("BCR401U", "Infineon Technologies")
-        assert "infineon.com" in url
-        assert "BCR401U" in url
-
-    def test_onsemi_canonical(self):
-        url = _guess_mfr_url("NCP1117", "onsemi")
-        assert "onsemi.com" in url
-
-    def test_onsemi_legacy_full_name(self):
-        url = _guess_mfr_url("NCP1117", "ON Semiconductor")
-        assert "onsemi.com" in url
-
-    def test_minicircuits(self):
-        url = _guess_mfr_url("ZHL-42W+", "Mini-Circuits")
-        assert "minicircuits.com" in url
-        assert "ZHL-42W" in url
-
-    def test_unknown_manufacturer_returns_none(self):
-        assert _guess_mfr_url("X1234", "ObscureCo Ltd") is None
-
-    def test_empty_mpn_returns_none(self):
-        assert _guess_mfr_url("", "Analog Devices") is None
-
-    def test_empty_manufacturer_returns_none(self):
-        assert _guess_mfr_url("ADL8107", "") is None
-
-    def test_case_insensitive_match(self):
-        url = _guess_mfr_url("ADL8107", "ANALOG DEVICES INC")
-        assert url is not None
-        assert "analog.com" in url
+    def test_never_points_at_manufacturer_or_search_engine(self):
+        # The whole point of this helper: stay inside DigiKey.
+        for mpn in ("ADL8107", "qpa9120", "STM32F407", "ZHL-42W+", ""):
+            url = _distributor_search_url(mpn)
+            assert "digikey.com" in url
+            assert "google.com" not in url
+            assert "duckduckgo.com" not in url
+            assert "analog.com" not in url
+            assert "qorvo.com" not in url
+            assert "ti.com" not in url
 
 
 # ---------------------------------------------------------------------------
@@ -219,20 +144,27 @@ class TestGuessMfrUrl:
 # ---------------------------------------------------------------------------
 
 class TestBuildChain:
-    def test_full_chain_includes_all_four_rungs(self):
+    def test_full_chain_includes_all_three_rungs(self):
         chain = build_chain(_part())
-        # 1: distributor PDF, 2: product page, 3: mfr guess, 4: search fallback.
-        assert len(chain) == 4
+        # 1: distributor PDF, 2: distributor product page, 3: DigiKey MPN-search.
+        # The old `mfr_guess` (analog.com / qorvo.com / ...) and
+        # `search_fallback` (google.com) rungs were dropped on
+        # 2026-04-24 — every rung now stays inside DigiKey/Mouser.
+        assert len(chain) == 3
         sources = [src for _, src in chain]
-        assert sources == ["distributor_pdf", "product_url", "mfr_guess", "search_fallback"]
+        assert sources == ["distributor_pdf", "product_url", "distributor_search"]
 
-    def test_chain_always_ends_with_search_fallback(self):
-        # Even a totally bare PartInfo (no datasheet, no product url, unknown mfr)
-        # still gets a valid Google fallback as the last rung.
+    def test_chain_always_ends_with_distributor_search(self):
+        # Even a totally bare PartInfo (no datasheet, no product url) still
+        # gets a valid DigiKey MPN-search URL as the last rung. Manufacturer
+        # is irrelevant — we don't guess vendor URLs anymore.
         bare = _part(datasheet_url=None, product_url=None, mfr="ObscureCo")
         chain = build_chain(bare)
-        assert chain[-1][1] == "search_fallback"
-        assert chain[-1][0].startswith("https://www.google.com/search?q=")
+        assert chain[-1][1] == "distributor_search"
+        assert chain[-1][0].startswith(
+            "https://www.digikey.com/en/products/result?keywords="
+        )
+        assert "ADL8107" in chain[-1][0]
 
     def test_skips_missing_distributor_pdf(self):
         info = _part(datasheet_url=None)
@@ -247,25 +179,38 @@ class TestBuildChain:
         assert sources[0] == "distributor_pdf"
 
     def test_dedupes_when_product_url_equals_datasheet_url(self):
-        same = "https://www.analog.com/en/products/adl8107.html"
+        same = "https://www.digikey.com/en/products/detail/analog-devices/ADL8107"
         info = _part(datasheet_url=same, product_url=same)
         sources = [src for _, src in build_chain(info)]
         # product_url is dropped because it equals the datasheet rung.
         assert sources.count("distributor_pdf") == 1
         assert "product_url" not in sources
 
-    def test_skips_mfr_guess_for_unknown_manufacturer(self):
-        info = _part(mfr="ObscureCo")
-        sources = [src for _, src in build_chain(info)]
+    def test_no_mfr_guess_rung_at_all(self):
+        # The old `mfr_guess` rung is gone. Even for a vendor whose URL
+        # template was previously hard-coded (Analog Devices), the chain
+        # MUST NOT include any `analog.com` / `qorvo.com` / vendor URL
+        # that wasn't supplied by the distributor.
+        info = _part(
+            datasheet_url=None, product_url=None, mfr="Analog Devices",
+        )
+        chain = build_chain(info)
+        sources = [src for _, src in chain]
         assert "mfr_guess" not in sources
-        # Still ends with search fallback.
-        assert sources[-1] == "search_fallback"
+        assert "search_fallback" not in sources
+        # And no URL on any rung points at a manufacturer site.
+        for url, _ in chain:
+            assert "analog.com" not in url
+            assert "qorvo.com" not in url
+            assert "ti.com" not in url
+            assert "google.com" not in url
+            assert "duckduckgo.com" not in url
 
-    def test_minimal_chain_is_just_search_fallback(self):
+    def test_minimal_chain_is_just_distributor_search(self):
         info = _part(datasheet_url=None, product_url=None, mfr="ObscureCo")
         chain = build_chain(info)
         assert len(chain) == 1
-        assert chain[0][1] == "search_fallback"
+        assert chain[0][1] == "distributor_search"
 
     def test_pure_function_no_side_effects(self):
         # build_chain must not touch the network or the cache. We prove
@@ -273,7 +218,7 @@ class TestBuildChain:
         with patch("tools.datasheet_resolver.verify_url") as mock_verify, \
              patch("tools.datasheet_resolver.get_default") as mock_cache:
             chain = build_chain(_part())
-            assert len(chain) == 4
+            assert len(chain) == 3
             mock_verify.assert_not_called()
             mock_cache.assert_not_called()
 
@@ -387,51 +332,36 @@ class TestResolveDatasheet:
         assert result.chain_position == 2
         assert result.url == "https://www.analog.com/en/products/ADL8107.html"
 
-    def test_falls_through_to_mfr_guess_when_distributor_links_dead(self, temp_cache):
-        # Both distributor links 404; only the mfr guess passes.
-        info = _part(
-            datasheet_url="https://distributor.invalid/dead.pdf",
-            product_url="https://distributor.invalid/dead.html",
-        )
-        # _analog_devices_url preserves MPN case — see _slug docstring.
-        guess = "https://www.analog.com/en/products/ADL8107.html"
-
-        def fake_verify(url, timeout=3.0):
-            return url == guess
-
-        with patch("tools.datasheet_resolver.is_trusted_vendor_url",
-                   return_value=False), \
-             patch("tools.datasheet_resolver.verify_url",
-                   side_effect=fake_verify):
-            result = resolve_datasheet(info)
-        assert result.source == "mfr_guess"
-        assert result.chain_position == 3
-        assert result.url == guess
-
-    def test_falls_all_the_way_to_search_fallback_when_nothing_probes(self, temp_cache):
+    def test_falls_all_the_way_to_distributor_search_when_nothing_probes(self, temp_cache):
         # Nothing in the chain passes a probe. Resolver MUST return the
-        # Google fallback, not give up.
+        # DigiKey MPN-search URL — never an empty string, never an
+        # off-platform Google/DuckDuckGo URL, never a guessed mfr URL.
         info = _part(
             datasheet_url="https://distributor.invalid/dead.pdf",
             product_url="https://distributor.invalid/dead.html",
-            mfr="ObscureCo Ltd",  # no mfr_guess pattern matches
+            mfr="Analog Devices",  # would have triggered the old mfr_guess
         )
         with patch("tools.datasheet_resolver.is_trusted_vendor_url",
                    return_value=False), \
              patch("tools.datasheet_resolver.verify_url",
                    return_value=False):
             result = resolve_datasheet(info)
-        assert result.source == "search_fallback"
-        assert result.url.startswith("https://www.google.com/search?q=")
+        assert result.source == "distributor_search"
+        assert result.url.startswith(
+            "https://www.digikey.com/en/products/result?keywords="
+        )
         assert "ADL8107" in result.url
-        # is_valid is True even for the fallback — it's a working link
-        # by definition (Google never 404s on a search query).
+        # is_valid is True even for the fallback — DigiKey's keyword-search
+        # URL never 404s by construction.
         assert result.is_valid is True
+        # And we MUST NOT have ended up on a manufacturer site or Google.
+        assert "analog.com" not in result.url
+        assert "google.com" not in result.url
 
-    def test_search_fallback_is_never_probed(self, temp_cache):
-        """Even if every other probe fails AND we'd love to verify it,
-        the Google URL is the contractual last-resort. Make sure we
-        don't probe it (it'd waste a request and pollute the cache)."""
+    def test_distributor_search_is_never_probed(self, temp_cache):
+        """The DigiKey MPN-search URL is the contractual last-resort.
+        Don't probe it — it'd waste a request and pollute the cache for
+        a URL that never 404s by design."""
         info = _part(
             datasheet_url=None, product_url=None, mfr="ObscureCo",
         )
@@ -439,7 +369,7 @@ class TestResolveDatasheet:
                    return_value=False), \
              patch("tools.datasheet_resolver.verify_url") as mock_verify:
             result = resolve_datasheet(info)
-        assert result.source == "search_fallback"
+        assert result.source == "distributor_search"
         mock_verify.assert_not_called()
 
     def test_trusted_vendor_url_returned_without_live_probe(self, temp_cache):
@@ -485,4 +415,6 @@ class TestResolveUrl:
                    return_value=False):
             url = resolve_url(bare)
         assert url
-        assert url.startswith("https://www.google.com/search?q=")
+        assert url.startswith(
+            "https://www.digikey.com/en/products/result?keywords="
+        )

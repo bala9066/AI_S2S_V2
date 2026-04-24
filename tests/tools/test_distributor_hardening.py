@@ -339,8 +339,10 @@ class TestDatasheetVerificationOnAccept:
 
     def test_bad_datasheet_url_replaced_with_fallback_when_not_trusted(self, mouser_configured):
         """When the distributor's PDF fails its probe, the resolver swaps in
-        a fallback URL (manufacturer guess or Google search). Old behaviour
-        stripped the URL entirely, leaving an empty BOM cell — see
+        a DigiKey MPN-search URL (last rung of the chain). Old behaviour
+        stripped the URL entirely, leaving an empty BOM cell. The 2026-04-24
+        rewrite kept this contract but moved the fallback from
+        google.com → digikey.com so users never land off-platform — see
         tools/datasheet_resolver.py docstring for the rationale."""
         body = json.dumps({"SearchResults": {"NumberOfResult": 1, "Parts": [{
             "ManufacturerPartNumber": "X", "Manufacturer": "V",
@@ -353,10 +355,15 @@ class TestDatasheetVerificationOnAccept:
             info = distributor_search.lookup("X")
         assert info is not None
         # URL is no longer None — it falls through to the always-good
-        # Google "MPN datasheet" search link as the last chain rung.
+        # DigiKey MPN-search link as the last chain rung.
         assert info.datasheet_url is not None
         assert info.datasheet_url != "https://stale.example/bad.pdf"
-        assert info.datasheet_url.startswith("https://www.google.com/search?q=")
+        assert info.datasheet_url.startswith(
+            "https://www.digikey.com/en/products/result?keywords="
+        )
+        # Must NOT be off-platform.
+        assert "google.com" not in info.datasheet_url
+        assert "duckduckgo.com" not in info.datasheet_url
 
     def test_trusted_vendor_url_preserved_without_head_call(self, mouser_configured):
         body = json.dumps({"SearchResults": {"NumberOfResult": 1, "Parts": [{
