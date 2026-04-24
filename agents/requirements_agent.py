@@ -1653,6 +1653,43 @@ class RequirementsAgent(BaseAgent):
     # captured and the deferred audit + fix-on-fail loop take over.
     _PRE_EMIT_GATE_MAX_ATTEMPTS = 2
 
+    # Layer-2.5: MPN-shape validator. Rejects entries whose `part_number`
+    # is clearly NOT a manufacturer part number — e.g. the LLM stuffing
+    # a description like "Discrete thin-film 50 Ohm pad" into the field.
+    # Real MPN traits we lean on:
+    #   - no internal whitespace (DigiKey / Mouser strip it on lookup)
+    #   - 3..40 chars after trim
+    #   - at least one digit OR the whole string is uppercase + dashes
+    #     (covers part families like `LMK04832`, `ADL8107`, `XCKU040`,
+    #     `ZX85-12-8SA-S+`, `CL05B104KP5NNNC`)
+    #   - first char is alphanumeric (not punctuation)
+    # This runs BEFORE the candidate-pool check so the LLM gets an
+    # immediate, unambiguous rejection — no attempt counter, the shape
+    # check is non-negotiable.
+    _MPN_BAD_RE = __import__("re").compile(r"\s")  # any whitespace inside
+
+    @classmethod
+    def _looks_like_mpn(cls, s: str) -> bool:
+        """Return True iff `s` could plausibly be a manufacturer part number.
+        False for descriptions / role labels / free text."""
+        s = (s or "").strip()
+        if not (3 <= len(s) <= 40):
+            return False
+        if cls._MPN_BAD_RE.search(s):
+            return False
+        if not (s[0].isalnum()):
+            return False
+        # Must contain at least one digit, OR be entirely uppercase+symbols
+        # (covers passive families like "GRM188R71C104KA01D" and packages
+        # like "TQFN-32"). The all-lowercase-no-digit case is what catches
+        # words like "thinfilm" or "attenuator".
+        has_digit = any(ch.isdigit() for ch in s)
+        if has_digit:
+            return True
+        if s.upper() == s and any(ch.isalpha() for ch in s):
+            return True
+        return False
+
     def get_system_prompt(self, project_context: dict) -> str:
         base = SYSTEM_PROMPT.format(
             design_type=project_context.get("design_type", "general"),
@@ -2309,6 +2346,48 @@ class RequirementsAgent(BaseAgent):
                 ).strip()
                 if _mpn:
                     _bom_entries.append((_role, _mpn))
+
+            # MPN-shape gate FIRST — `"Discrete thin-film 50 Ohm pad"` etc
+            # has no business reaching the pool check or the audit. These
+            # are rejected unconditionally (no attempt counter).
+            _shape_violations = [
+                (r, m) for r, m in _bom_entries if not self._looks_like_mpn(m)
+            ]
+            if _shape_violations:
+                self.log(
+                    f"[pre-emit-gate] BLOCKED — {len(_shape_violations)} BOM "
+                    f"entry(ies) have non-MPN-shaped part_number "
+                    f"(spaces / descriptions / free text)",
+                    "warning",
+                )
+                _msg_lines = [
+                    f"BLOCKED: {len(_shape_violations)} BOM entry(ies) have "
+                    f"a `part_number` that is NOT a manufacturer part number "
+                    f"— it looks like a description or role label. EVERY row "
+                    f"must use the exact MPN string from a "
+                    f"`find_candidate_parts` result. Real MPNs have no "
+                    f"internal spaces, are 3-40 chars, and contain digits "
+                    f"(e.g. `ADL8107`, `HMC624LP4E`, `ZX85-12-8SA-S+`).",
+                    "",
+                    "REJECTED ENTRIES (descriptions in part_number field):",
+                ]
+                for _role, _bad in _shape_violations[:10]:
+                    _msg_lines.append(f"  - {_role}: {_bad!r}")
+                if len(_shape_violations) > 10:
+                    _msg_lines.append(
+                        f"  ... and {len(_shape_violations) - 10} more"
+                    )
+                _msg_lines.extend([
+                    "",
+                    "Fix: replace each rejected `part_number` with the real "
+                    "MPN copied verbatim from a `find_candidate_parts` "
+                    "candidate. If no candidate exists for that role, OMIT "
+                    "the row rather than inventing or describing one.",
+                ])
+                return {
+                    "status": "rejected",
+                    "message": "\n".join(_msg_lines),
+                }
 
             _no_pool_violation = (not _pool) and bool(_bom_entries)
             _pool_violations = (
