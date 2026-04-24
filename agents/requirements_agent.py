@@ -3167,7 +3167,23 @@ class RequirementsAgent(BaseAgent):
                     chosen = cands[-1]
                 if not chosen and llm_url and llm_url.startswith("http"):
                     chosen = llm_url
-                ds_link = f"[Datasheet]({chosen})" if chosen else "—"
+                # Label the link honestly. Since P11/P12, `chosen` might be
+                # a distributor keyword-search URL rather than a real PDF —
+                # calling it "Datasheet" misleads users into expecting a
+                # PDF preview.
+                if chosen:
+                    _cl = chosen.lower()
+                    if _cl.endswith(".pdf") or "/datasheet/" in _cl or "/media/" in _cl:
+                        _label = "Datasheet"
+                    elif "digikey.com" in _cl or "digikey.in" in _cl:
+                        _label = "DigiKey"
+                    elif "mouser.com" in _cl or "mouser.in" in _cl:
+                        _label = "Mouser"
+                    else:
+                        _label = "Product page"
+                    ds_link = f"[{_label}]({chosen})"
+                else:
+                    ds_link = "—"
                 # v16 — lifecycle badge. Hardcoded blacklist wins over LLM claim.
                 stale, _reason = _stale_check(part)
                 claimed = str(comp.get("lifecycle_status", "") or "").strip().lower()
@@ -7773,16 +7789,39 @@ typical passive/active bands).</p>
                 "",
             ])
 
-            # Quick-link row for datasheet / DigiKey
+            # Quick-link row — label each link based on where it actually
+            # points, not on generic "Datasheet" text.  Since the P11/P12
+            # datasheet-URL rewrite, `ds_url` can be:
+            #   - a real datasheet PDF URL → "📄 Datasheet"
+            #   - a DigiKey keyword-search URL → "🔗 DigiKey"
+            #   - a Mouser keyword-search URL → "🔗 Mouser"
+            # Labelling those as "Datasheet" was misleading users into
+            # expecting a PDF preview when clicking would land them on a
+            # distributor catalog page. User feedback 2026-04-24.
+            def _link_label(url: str) -> str:
+                u = url.lower()
+                if u.endswith(".pdf") or "/datasheet/" in u or "/media/" in u:
+                    return "📄 Datasheet"
+                if "digikey.com" in u or "digikey.in" in u:
+                    return "🔗 DigiKey"
+                if "mouser.com" in u or "mouser.in" in u:
+                    return "🔗 Mouser"
+                return "🔗 Product page"
+
             links = []
+            seen_urls: set[str] = set()  # dedupe across ds/dk/ms buckets
             if ds_url:
-                links.append(f"[📄 Datasheet]({ds_url})")
-            if dk_url:
-                links.append(f"[DigiKey]({dk_url})")
-            if ms_url:
-                links.append(f"[Mouser]({ms_url})")
-            if product_url and not dk_url and not ms_url:
-                links.append(f"[Distributor]({product_url})")
+                links.append(f"[{_link_label(ds_url)}]({ds_url})")
+                seen_urls.add(ds_url)
+            if dk_url and dk_url not in seen_urls:
+                links.append(f"[🔗 DigiKey]({dk_url})")
+                seen_urls.add(dk_url)
+            if ms_url and ms_url not in seen_urls:
+                links.append(f"[🔗 Mouser]({ms_url})")
+                seen_urls.add(ms_url)
+            if product_url and product_url not in seen_urls and not dk_url and not ms_url:
+                links.append(f"[{_link_label(product_url)}]({product_url})")
+                seen_urls.add(product_url)
             if links:
                 lines.append("  ".join(links))
                 lines.append("")
