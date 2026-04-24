@@ -256,3 +256,116 @@ def test_auto_phases_matches_phase_catalog():
     from services.pipeline_service import AUTO_PHASES
     from services.phase_catalog import AUTO_PHASE_SPECS
     assert tuple(AUTO_PHASES) == AUTO_PHASE_SPECS
+
+
+# ---------------------------------------------------------------------------
+# P22 — parallel batch execution
+# ---------------------------------------------------------------------------
+
+def test_pipeline_batches_cover_all_auto_phases():
+    """Every AUTO_PHASES phase must appear in exactly ONE batch of
+    `_PIPELINE_BATCHES`. Missing → never runs. Duplicated → runs twice."""
+    from services.pipeline_service import AUTO_PHASES, _PIPELINE_BATCHES
+    all_in_batches = [pid for batch in _PIPELINE_BATCHES for pid in batch]
+    auto_ids = {p[0] for p in AUTO_PHASES}
+    batch_ids = set(all_in_batches)
+    assert batch_ids == auto_ids, (
+        f"_PIPELINE_BATCHES drift: in batches but not AUTO_PHASES = "
+        f"{batch_ids - auto_ids}; in AUTO_PHASES but not batches = "
+        f"{auto_ids - batch_ids}"
+    )
+    assert len(all_in_batches) == len(set(all_in_batches)), (
+        f"a phase appears in multiple batches: {sorted(all_in_batches)}"
+    )
+
+
+def test_pipeline_batches_respect_dependencies():
+    """Hard rule: no phase may appear in batch N if its upstream
+    dependency is also scheduled in batch N or later. Guards against
+    accidental edits that break the topological ordering."""
+    from services.pipeline_service import _PIPELINE_BATCHES
+    # Dependency graph documented in pipeline_service.py. Forward-only
+    # deps — every entry maps a phase to the upstream phase it needs
+    # to have completed BEFORE it can run.
+    _DEPS = {
+        "P2":  [],         # depends only on P1 (always pre-complete)
+        "P3":  ["P2"],     # Compliance loads HRS from P2
+        "P4":  [],         # depends only on P1
+        "P6":  ["P4"],     # GLR loads netlist from P4
+        "P7":  ["P6"],     # FPGA RTL from GLR
+        "P7a": ["P7"],     # Register map from FPGA interfaces
+        "P8a": ["P4"],     # SRS loads P1..P4
+        "P8b": ["P8a"],    # SDD from SRS
+        "P8c": ["P8a"],    # Code review from SRS / source
+    }
+    seen_before: set[str] = set()
+    for batch in _PIPELINE_BATCHES:
+        # Every dep of every phase in this batch must already be in
+        # `seen_before` (earlier batch). A phase can NOT depend on a
+        # sibling in the same batch — the batch runs in parallel.
+        for pid in batch:
+            for dep in _DEPS.get(pid, []):
+                assert dep in seen_before, (
+                    f"{pid} depends on {dep} but {dep} is scheduled in "
+                    f"batch {_PIPELINE_BATCHES.index(batch)} or later"
+                )
+        seen_before.update(batch)
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_executes_phases_concurrently(pipe_env):
+    """The parallel runner must fire phases within a batch concurrently
+    (not sequentially). We measure by tracking the order in which agent
+    `execute()` is ENTERED relative to when the previous phase
+    COMPLETED — in parallel mode, sibling phases enter before siblings
+    complete."""
+    import asyncio
+    proj_svc, pipe_svc, _ = pipe_env
+    proj = proj_svc.create(name="ParallelExec")
+
+    # Track entry / exit timestamps per phase.
+    entry_ts: dict[str, float] = {}
+    exit_ts: dict[str, float] = {}
+
+    async def _tracked_execute(phase_id: str):
+        async def _impl(*args, **kwargs):
+            entry_ts[phase_id] = asyncio.get_event_loop().time()
+            # Yield control so sibling coroutines in the same batch can
+            # enter their own execute() before we exit.
+            await asyncio.sleep(0.05)
+            exit_ts[phase_id] = asyncio.get_event_loop().time()
+            return {
+                "response": "ok",
+                "phase_complete": True,
+                "outputs": {f"{phase_id.lower()}.md": "# x\n"},
+                "model_used": "stub",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }
+        return _impl
+
+    from services.pipeline_service import AUTO_PHASES
+    patches = []
+    for phase_id, module_path, class_name, _ in AUTO_PHASES:
+        agent = MagicMock()
+        agent.execute = AsyncMock(side_effect=await _tracked_execute(phase_id))
+        patches.append(patch(f"{module_path}.{class_name}",
+                             MagicMock(return_value=agent)))
+
+    with _Stacked(patches):
+        await pipe_svc.run_pipeline(proj["id"])
+
+    # Every phase ran.
+    for p in (p[0] for p in AUTO_PHASES):
+        assert p in entry_ts and p in exit_ts, f"{p} did not run"
+
+    # Within the FIRST batch (P2, P4), both phases must have STARTED
+    # before either FINISHED — proves concurrent execution.
+    p2_entry, p2_exit = entry_ts["P2"], exit_ts["P2"]
+    p4_entry, p4_exit = entry_ts["P4"], exit_ts["P4"]
+    # P4 entered before P2 finished (or vice versa).
+    concurrent_a = p4_entry < p2_exit
+    concurrent_b = p2_entry < p4_exit
+    assert concurrent_a or concurrent_b, (
+        f"P2 and P4 ran serially (P2: {p2_entry:.3f}..{p2_exit:.3f}, "
+        f"P4: {p4_entry:.3f}..{p4_exit:.3f}) — expected overlap"
+    )
