@@ -2731,6 +2731,18 @@ class RequirementsAgent(BaseAgent):
             # patch in place, prune the resolved blockers from the existing
             # audit report, and ship.
             _auto_fix_attempted = False
+
+            # P19 (2026-04-24): wall-clock instrumentation. User feedback
+            # says "don't compromise output to reduce time — check where
+            # time is actually going." Log elapsed at entry and after each
+            # finalize_p1 call so the server log reveals the hot spot
+            # (LLM call vs audit vs distributor lookups vs autofix).
+            _retry_loop_t0 = _time.monotonic()
+            self.log(
+                f"[p1-timing] retry-loop.begin deadline=none "
+                f"max_retries={self._FIX_ON_FAIL_MAX_RETRIES}",
+                "info",
+            )
             for _retry_idx in range(self._FIX_ON_FAIL_MAX_RETRIES + 1):
                 _fin_t0 = _time.monotonic()
                 try:
@@ -2768,6 +2780,16 @@ class RequirementsAgent(BaseAgent):
 
                 if _retry_idx >= self._FIX_ON_FAIL_MAX_RETRIES:
                     break
+
+                # P19 timing instrumentation (no deadline — don't compromise
+                # output). Just log so the server log reveals where minutes
+                # are going on dense specs.
+                _loop_elapsed = _time.monotonic() - _retry_loop_t0
+                self.log(
+                    f"[p1-timing] retry-loop.iter-{_retry_idx} end "
+                    f"elapsed={_loop_elapsed:.1f}s blockers={_blocker_count}",
+                    "info",
+                )
 
                 # ── Deterministic auto-fix layer ────────────────────────
                 # Try mechanical swap-from-candidate-pool BEFORE asking
@@ -3848,6 +3870,19 @@ class RequirementsAgent(BaseAgent):
         arch_mermaid = self._reflow_long_mermaid(arch_mermaid)
         if arch_mermaid:
             arch_content = f"# System Architecture\n## {project_name}\n\n```mermaid\n{arch_mermaid}\n```\n"
+        elif block_mermaid:
+            # P19 (2026-04-24): if the LLM didn't emit an architecture spec but
+            # did produce a block diagram, reuse the block diagram as the
+            # architecture stand-in instead of showing the bare
+            # "will be generated with HRS" placeholder.  User reported empty
+            # architecture.md files — this ensures the file always carries
+            # SOMETHING visual derived from the captured payload.
+            arch_content = (
+                f"# System Architecture\n## {project_name}\n\n"
+                f"*Architecture view derived from the block diagram — "
+                f"rebuild with an explicit `architecture` spec in P2.*\n\n"
+                f"```mermaid\n{block_mermaid}\n```\n"
+            )
         else:
             arch_content = f"# System Architecture\n## {project_name}\n\n*Architecture diagram will be generated with HRS.*\n"
         arch_content = _scrub(arch_content)
@@ -7835,20 +7870,55 @@ typical passive/active bands).</p>
                     return "🔗 Mouser"
                 return "🔗 Product page"
 
-            links = []
-            seen_urls: set[str] = set()  # dedupe across ds/dk/ms buckets
+            # HOST-based dedupe (P19, 2026-04-24): two different URLs on
+            # the SAME distributor (e.g. `ds_url` = digikey.com/keyword search,
+            # `dk_url` = digikey.com/product-detail/...) both rendered as
+            # "🔗 DigiKey 🔗 DigiKey 🔗 Mouser" — ugly and confusing to the
+            # user. Now we cap: max 1 link per distributor host, favouring
+            # the most specific URL (product page > search URL > LLM URL).
+            def _host_bucket(url: str) -> str:
+                u = (url or "").lower()
+                if "digikey.com" in u or "digikey.in" in u: return "digikey"
+                if "mouser.com" in u or "mouser.in" in u:   return "mouser"
+                if u.endswith(".pdf") or "/datasheet/" in u or "/media/" in u:
+                    return "datasheet_pdf"
+                return "other"
+
+            def _url_specificity(url: str) -> int:
+                """Higher = more specific. Product-detail pages beat
+                search URLs; real PDFs beat product pages."""
+                u = (url or "").lower()
+                if u.endswith(".pdf") or "/datasheet/" in u:   return 3
+                if "/products/detail/" in u or "/productdetail" in u: return 2
+                if "/products/result?keywords=" in u or "/c/?q=" in u: return 1
+                return 0
+
+            # Collect candidates with their host + specificity, then pick
+            # the winner per host.
+            candidates: list[tuple[str, str, str]] = []  # (url, host, label)
             if ds_url:
-                links.append(f"[{_link_label(ds_url)}]({ds_url})")
-                seen_urls.add(ds_url)
-            if dk_url and dk_url not in seen_urls:
-                links.append(f"[🔗 DigiKey]({dk_url})")
-                seen_urls.add(dk_url)
-            if ms_url and ms_url not in seen_urls:
-                links.append(f"[🔗 Mouser]({ms_url})")
-                seen_urls.add(ms_url)
-            if product_url and product_url not in seen_urls and not dk_url and not ms_url:
-                links.append(f"[{_link_label(product_url)}]({product_url})")
-                seen_urls.add(product_url)
+                candidates.append((ds_url, _host_bucket(ds_url), _link_label(ds_url)))
+            if dk_url:
+                candidates.append((dk_url, "digikey", "🔗 DigiKey"))
+            if ms_url:
+                candidates.append((ms_url, "mouser", "🔗 Mouser"))
+            if product_url and not dk_url and not ms_url:
+                candidates.append((product_url, _host_bucket(product_url), _link_label(product_url)))
+
+            best_by_host: dict[str, tuple[str, str]] = {}  # host -> (url, label)
+            for url, host, label in candidates:
+                if not url:
+                    continue
+                cur = best_by_host.get(host)
+                if cur is None or _url_specificity(url) > _url_specificity(cur[0]):
+                    best_by_host[host] = (url, label)
+
+            # Render in stable order: datasheet_pdf > digikey > mouser > other.
+            links: list[str] = []
+            for host in ("datasheet_pdf", "digikey", "mouser", "other"):
+                if host in best_by_host:
+                    url, label = best_by_host[host]
+                    links.append(f"[{label}]({url})")
             if links:
                 lines.append("  ".join(links))
                 lines.append("")

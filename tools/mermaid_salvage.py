@@ -269,6 +269,69 @@ def _step_close_brackets(text: str) -> tuple[str, Optional[str]]:
     return ("\n".join(out), "close_brackets" if changed else None)
 
 
+def _step_flatten_brace_hell(text: str) -> tuple[str, Optional[str]]:
+    """Step I-pre-pre — some LLM emissions have nested quotes + braces
+    inside rhombus node labels, e.g.:
+
+        BT1{"{BiasT}" / MBT-283+"}
+        BPF1{{"Preselector / BPF-B140N+ / IL1.5 BW140"}}
+        ADC1[\\"[\\ADC\\] / AD4008BRMZ / 16-bit 500MSPS"\\]
+
+    The main label-sanitiser below uses a non-nested regex
+    `/\{([^}]*)\}/g` which grabs only up to the first `}`, mangling the
+    rest and producing syntactically-garbage output the parser rejects
+    with `Expecting 'DIAMOND_STOP'` (the 2026-04-24 user screenshot).
+
+    This pass flattens any node whose label contains an inner `"` or
+    `{` / `}` / `[` / `]` into a simpler `NODE[clean_label]` form.
+    Regex matches `NODEID<shape-open>...<shape-close>` with a shape
+    token that opens and closes the node, then normalises to a square-
+    bracket node with the stripped label. The rhombus / stadium /
+    trapezoid visual is lost but the diagram actually renders.
+    """
+    original = text
+    # Match any node definition: ID followed by opener to matching closer.
+    # We walk each line and rewrite problematic nodes.
+    lines = text.split("\n")
+    changed = False
+    for idx, line in enumerate(lines):
+        # Cheap check first — only run the heavy regex on lines that
+        # look suspicious (multiple quotes, or brace-inside-brace).
+        stripped = line.strip()
+        if not stripped:
+            continue
+        dq = stripped.count('"')
+        ob = stripped.count('{') + stripped.count('[')
+        cb = stripped.count('}') + stripped.count(']')
+        # Signal: ≥3 quotes, OR ≥2 brace-opens with ≥2 brace-closes.
+        suspicious = dq >= 3 or (ob >= 2 and cb >= 2)
+        if not suspicious:
+            continue
+        # Try to match: NODEID followed by opener to outermost closer.
+        # Use a non-greedy best-effort for the label content.
+        m = re.match(
+            r"^(\s*)([\w][\w\-]*)"              # 1=indent, 2=node-id
+            r"([\[\{\(]+)"                       # 3=opener(s)
+            r"(.*?)"                             # 4=label content (non-greedy)
+            r"([\]\}\)]+)\s*$",                  # 5=closer(s) at end of line
+            line,
+        )
+        if not m:
+            continue
+        indent, node_id, _opener, label, _closer = m.groups()
+        # Extract a clean label: keep alnum + basic punctuation, drop
+        # quotes, nested braces, backslashes.
+        clean = re.sub(r"[\\\"'`{}\[\]<>]", " ", label)
+        clean = re.sub(r"\s{2,}", " ", clean).strip(" /-")
+        if not clean:
+            clean = node_id  # last-resort fallback
+        lines[idx] = f'{indent}{node_id}["{clean}"]'
+        changed = True
+    if changed:
+        return "\n".join(lines), "flatten_brace_hell"
+    return text, None
+
+
 def _step_fix_quoted_edge_labels(text: str) -> tuple[str, Optional[str]]:
     """Step I-pre — Mermaid edge labels live INSIDE pipes (`-->|label|`),
     not inside quotes between dashes (`-- "label" -->`).  The LLM
@@ -371,6 +434,7 @@ _STEPS = (
     _step_strip_frontmatter,
     _step_strip_direction,
     _step_normalise_header,
+    _step_flatten_brace_hell,      # P19: fix NODE{"{nested}" "broken"} patterns
     _step_fix_bare_shapes,
     _step_quote_dangerous_labels,
     _step_close_brackets,
