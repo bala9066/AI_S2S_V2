@@ -152,20 +152,26 @@ class TestSeverityFilter:
 
 class TestRetryCap:
     """The fix-on-fail retry budget drives worst-case P1 wall-clock: each
-    extra retry is another ~3-5 min round-trip on glm-5.1. This guard
-    fails loudly if someone bumps the cap back up without updating the
-    perf note in the agent source, which would reintroduce the 12-min
-    pathological case we fixed on 2026-04-22.
+    extra retry is another ~90 s LLM round-trip + candidate fetch. This
+    guard fails loudly if someone bumps the cap further without updating
+    the perf note in the agent source.
+
+    History:
+      - 2026-04-22: lowered 2 → 1 to fix a 12-min pathological P1 caused
+        by the LLM never converging when distributors were rate-limited.
+      - 2026-04-24: raised 1 → 2 once the DigiKey circuit-breaker (P7)
+        and MPN-shape gate (P9) made retry 2 cheap and useful — Mouser
+        can now fill stages DigiKey couldn't on the second corrective.
     """
 
-    def test_max_retries_bounded_at_one(self):
-        # Deterministic `_auto_fix_blockers` handles the common case for
-        # free; one LLM retry is enough to catch the residual. Going back
-        # to 2 was observed never to converge when retry 1 didn't — all
-        # it bought was minutes of latency.
-        assert RequirementsAgent._FIX_ON_FAIL_MAX_RETRIES == 1, (
-            "Perf guardrail: raising _FIX_ON_FAIL_MAX_RETRIES inflates P1 "
-            "worst-case wall-clock by ~3-5 min per extra retry. If this "
-            "change is intentional, update the perf note in "
+    def test_max_retries_bounded_at_two(self):
+        # Two retries is the new ceiling. The deterministic
+        # `_auto_fix_blockers` pass still handles the common case for
+        # free; the LLM retries are reserved for residuals where Mouser
+        # needs a second chance to widen `find_candidate_parts`.
+        assert RequirementsAgent._FIX_ON_FAIL_MAX_RETRIES == 2, (
+            "Perf guardrail: raising _FIX_ON_FAIL_MAX_RETRIES above 2 "
+            "inflates P1 worst-case wall-clock. If this change is "
+            "intentional, update the perf note in "
             "agents/requirements_agent.py and this test together."
         )
