@@ -370,6 +370,46 @@ class TestFixQuotedEdgeLabels:
         # Use thick form since one side is `==`.
         assert "A ==>|label| B" in cleaned
 
+    def test_dotted_arrow_with_quoted_label(self):
+        # Regression for 2026-04-24 chat-page parse error:
+        #   "CLK1 -. \"170 MHz LVPECL\" .-> ADC1"
+        # The dotted form has a leading `-.` on the left and a `.->`
+        # tail on the right (the `.` comes first, then `->`). Earlier
+        # versions of this regex matched `-.->` as tail which is the
+        # UNLABELED dotted-arrow token — so labelled dotted edges
+        # slipped through unsalvaged.
+        raw = 'flowchart LR\n    CLK1 -. "170 MHz LVPECL" .-> ADC1\n'
+        cleaned, fixes = salvage(raw)
+        assert "fix_quoted_edge_labels" in fixes
+        assert "CLK1 -.->|170 MHz LVPECL| ADC1" in cleaned
+        assert '-. "170 MHz LVPECL"' not in cleaned
+
+    def test_full_channelised_fe_screenshot_diagram(self):
+        # End-to-end version of the exact source in screenshot 2026-04-24
+        # channelised FE: a mix of normal, thick, and dotted arrows with
+        # quoted labels, one of each type per arrow style.
+        raw = (
+            "flowchart LR\n"
+            '    ANT1 -- "RF per channel" --> SMA1\n'
+            '    SMA1 -- "Analog RF" --> ADC1\n'
+            '    CLK1 -. "170 MHz LVPECL" .-> ADC1\n'
+            '    CLK1 -. "Ref Clk + SYSREF" .-> FPG1\n'
+            '    ADC1 -- "14-bit parallel LVDS" --> FPG1\n'
+            '    FPG1 == "JESD204C 4+ lanes" ==> OUT1\n'
+            '    PWR1 -- "5V" --> LDO_ADC\n'
+        )
+        cleaned, fixes = salvage(raw)
+        # Every quoted-label edge converted.
+        assert '-- "' not in cleaned
+        assert '== "' not in cleaned
+        assert '-. "' not in cleaned
+        # Spot-check every style preserves intent.
+        assert "ANT1 -->|RF per channel| SMA1" in cleaned
+        assert "CLK1 -.->|170 MHz LVPECL| ADC1" in cleaned
+        assert "FPG1 ==>|JESD204C 4+ lanes| OUT1" in cleaned
+        assert "PWR1 -->|5V| LDO_ADC" in cleaned
+        assert "fix_quoted_edge_labels" in fixes
+
     def test_full_power_tree_screenshot_diagram(self):
         # The exact failure mode from the user's 2026-04-24 screenshot:
         # power-tree with multiple `BUCK -- "+5 V" --> LDOn` edges.

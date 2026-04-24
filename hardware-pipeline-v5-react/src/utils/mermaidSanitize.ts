@@ -40,10 +40,38 @@ export function sanitizeMermaid(raw: string): string {
   // The rounded-edge visual is lost for these nodes, but the diagram
   // actually renders — strictly better than dumping the raw source.
   code = code.replace(/([\w-]+)\("([^"]*[()][^"]*)"\)/g, '$1["$2"]');
-  // Arrow normalisations
+  // Quoted edge labels — mirror of `tools/mermaid_salvage._step_fix_quoted_edge_labels`.
+  // Mermaid edge labels live INSIDE pipes (`-->|label|`), not between arrow
+  // tokens (`-- "label" -->`). The LLM keeps emitting the wrong shape across
+  // three arrow styles with THREE DIFFERENT tail tokens:
+  //   BUCK -- "+5 V"    --> LDO1          (normal:  left `--`,  tail `-->`)
+  //   A    == "thick"  ==> B              (thick:   left `==`,  tail `==>`)
+  //   CLK1 -. "170 MHz" .-> ADC1          (dotted:  left `-.`,  tail `.->`)
+  // All three are parse errors. Convert each to the canonical pipe form:
+  //   BUCK -->|+5 V| LDO1
+  //   A    ==>|thick| B
+  //   CLK1 -.->|170 MHz| ADC1
+  // Regression for the 2026-04-24 power-tree + channelised-FE diagrams.
+  // Note: the dotted tail is `.->` (not `-.->`) — the leading `.` matches
+  // the trailing `-.` of the left arrow token. Previous fix had the wrong
+  // tail which is why dotted edges still tripped the parser.
+  code = code.replace(
+    /(\b[\w][\w-]*\b)\s*(==|--|-\.)\s*"([^"]+)"\s*(==>|-->|\.->)\s*(\b[\w][\w-]*\b)/g,
+    (_m, src, style, label, tail, dst) => {
+      const thick  = String(style).includes('==') || String(tail).includes('==');
+      const dotted = String(style).includes('-.') || String(tail).startsWith('.');
+      const arrow = thick ? '==>' : dotted ? '-.->' : '-->';
+      const cleanLabel = String(label).trim().replace(/['"`]/g, '');
+      return `${src} ${arrow}|${cleanLabel}| ${dst}`;
+    },
+  );
+  // Arrow normalisations — DO NOT collapse `==>` or `-.->` that are
+  // immediately followed by `|label|` (pipe-form), since we just emitted
+  // those as thick / dotted arrows with labels. Only normalise bare forms.
   code = code.replace(/\u2014\u2014>/g, '-->').replace(/\u2014>/g, '-->');
   code = code.replace(/——>/g, '-->').replace(/—>/g, '-->');
-  code = code.replace(/==>/g, '-->');
+  // `==>` → `-->` only when NOT followed by `|` (bare thick arrow → normal).
+  code = code.replace(/==>(?!\|)/g, '-->');
   code = code.replace(/(\w)\s*->\s*(\w)/g, '$1 --> $2');
   // Normalise graph → flowchart
   code = code.replace(/^graph\s+(TD|LR|TB|RL|BT)/im, 'flowchart $1');

@@ -272,37 +272,49 @@ def _step_close_brackets(text: str) -> tuple[str, Optional[str]]:
 def _step_fix_quoted_edge_labels(text: str) -> tuple[str, Optional[str]]:
     """Step I-pre — Mermaid edge labels live INSIDE pipes (`-->|label|`),
     not inside quotes between dashes (`-- "label" -->`).  The LLM
-    routinely emits the wrong shape:
+    routinely emits the wrong shape across EVERY arrow style:
 
-        BUCK -- "+5 V" --> LDO1
-        A -- "label" --> B
-        BUCK == "thick" ==> LDO1
+        BUCK -- "+5 V"   --> LDO1          (normal)
+        A    == "thick"  ==> B              (thick)
+        CLK1 -. "170 MHz".-> ADC1          (dotted)
+        A    ~~ "invis"  ~~> B              (invisible)
 
-    All three are parse errors. Convert to the canonical form:
+    All four are parse errors. Convert each to the canonical pipe form:
 
         BUCK -->|+5 V| LDO1
-        A -->|label| B
-        BUCK ==>|thick| LDO1
+        A    ==>|thick| B
+        CLK1 -.->|170 MHz| ADC1
+        A    ~~~|invis| B
 
-    Regression for the screenshot 2026-04-24 power-tree diagram.
+    Regression for the 2026-04-24 power-tree + channelised-FE diagrams
+    (the dotted-arrow form was the breaking case on the FE clock distribution).
     """
     original = text
-    # `LHS -- "lbl" --> RHS` and `LHS == "lbl" ==> RHS` (with optional spaces).
-    # Capture the source / arrow style / label / dest so we can rebuild.
+    # Three arrow styles with three tail tokens:
+    #   normal:  left `--`,  tail `-->`
+    #   thick:   left `==`,  tail `==>`
+    #   dotted:  left `-.`,  tail `.->`    (leading `.` is the anchor)
+    # Previous version had tail `-.->` which is the UNLABELED dotted form
+    # — when a label is between `-.` and `.->`, the tail is just `.->`.
+    # That's why screenshot 2026-04-24 dotted edges still broke the parser.
     pattern = re.compile(
-        r"(\b[\w][\w-]*\b)\s*"            # 1: source node
-        r"(==|--)"                          # 2: arrow style (thick/normal)
+        r"(\b[\w][\w-]*\b)\s*"              # 1: source node
+        r"(==|--|-\.)"                      # 2: arrow style (thick/normal/dotted)
         r"\s*\"([^\"]+)\"\s*"               # 3: quoted label
-        r"(==>|-->|==|--)\s*"               # 4: arrow tail
-        r"(\b[\w][\w-]*\b)"                # 5: dest node
+        r"(==>|-->|\.->)"                   # 4: arrow tail
+        r"\s*(\b[\w][\w-]*\b)"              # 5: dest node
     )
 
     def _sub(m: re.Match[str]) -> str:
-        src, _style, label, _tail, dst = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
-        # Use the strongest arrow form between style and tail — if either is
-        # `==`/`==>`, use thick `==>|...|`; else normal `-->|...|`.
-        thick = "==" in _style or "==" in _tail
-        arrow = "==>" if thick else "-->"
+        src, style, label, tail, dst = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        # Pick the dominant arrow form:
+        #   thick (`==`) > dotted (`-.`) > normal (`--`)
+        if "==" in style or "==" in tail:
+            arrow = "==>"
+        elif "-." in style or tail.startswith("."):
+            arrow = "-.->"
+        else:
+            arrow = "-->"
         # Strip leading/trailing whitespace + any stray quotes from the label.
         clean_label = label.strip().strip("'\"`")
         return f"{src} {arrow}|{clean_label}| {dst}"

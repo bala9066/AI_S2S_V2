@@ -182,6 +182,59 @@ describe('idempotence', () => {
   });
 });
 
+describe('quoted edge labels (regression for 2026-04-24 chat page errors)', () => {
+  it('PWR1 -- "5V" --> LDO_ADC → canonical pipe form', () => {
+    // Exact pattern from user-reported parse error:
+    //   "Parse error on line 24: ...> OUT1 PWR1 -- "5V" --> LDO_ADC
+    //    ----------------------^ Expecting 'LINK', 'UNICODE_TEX'"
+    const input = 'flowchart TD\n    PWR1 -- "5V" --> LDO_ADC';
+    const out = san(input);
+    expect(out).toMatch(/PWR1\s+-->\|5V\|\s+LDO_ADC/);
+    expect(out).not.toContain('-- "5V" -->');
+  });
+
+  it('dotted arrow with quoted label — CLK1 -. "170 MHz" .-> ADC1', () => {
+    const input = 'flowchart LR\n    CLK1 -. "170 MHz LVPECL" .-> ADC1';
+    const out = san(input);
+    // Dotted arrow → `-.->|label|` form.
+    expect(out).toMatch(/CLK1\s+-\.->\|170 MHz LVPECL\|\s+ADC1/);
+    expect(out).not.toContain('-. "170 MHz');
+  });
+
+  it('thick arrow with quoted label — FPG1 == "JESD204C 4+ lanes" ==> OUT1', () => {
+    const input = 'flowchart LR\n    FPG1 == "JESD204C 4+ lanes" ==> OUT1';
+    const out = san(input);
+    expect(out).toMatch(/FPG1\s+==>\|JESD204C 4\+ lanes\|\s+OUT1/);
+    expect(out).not.toContain('== "JESD204C');
+  });
+
+  it('full channelised-FE diagram from user screenshot', () => {
+    // Condensed version of the actual source in screenshot 1:
+    const input = [
+      'flowchart LR',
+      '    ANT1 -- "RF per channel" --> SMA1',
+      '    SMA1 -- "Analog RF" --> ADC1',
+      '    REF1 -- "25 MHz LVCMOS" --> CLK1',
+      '    CLK1 -. "170 MHz LVPECL" .-> ADC1',
+      '    CLK1 -. "Ref Clk + SYSREF" .-> FPG1',
+      '    ADC1 -- "14-bit parallel LVDS" --> FPG1',
+      '    FPG1 == "JESD204C 4+ lanes" ==> OUT1',
+      '    PWR1 -- "5V" --> LDO_ADC',
+      '    PWR1 -- "5V" --> LDO_33',
+    ].join('\n');
+    const out = san(input);
+    // Every quoted-label edge converts.
+    expect(out).not.toContain('-- "');
+    expect(out).not.toContain('== "');
+    expect(out).not.toContain('-. "');
+    // Spot-check a few.
+    expect(out).toMatch(/ANT1\s+-->\|RF per channel\|\s+SMA1/);
+    expect(out).toMatch(/CLK1\s+-\.->\|170 MHz LVPECL\|\s+ADC1/);
+    expect(out).toMatch(/FPG1\s+==>\|JESD204C 4\+ lanes\|\s+OUT1/);
+    expect(out).toMatch(/PWR1\s+-->\|5V\|\s+LDO_ADC/);
+  });
+});
+
 describe('round-bracket nodes with nested parens in quoted labels', () => {
   it('S11("VGA (AGC)<br/>HMC624LP4E") renders as a single node', () => {
     // Regression for the 12 GHz receiver diagram that fell back to the

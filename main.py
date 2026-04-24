@@ -1224,41 +1224,85 @@ def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:
         return md_text
 
     # ── 2. Render all diagrams in parallel ────────────────────────────────────
+    # Two-tier rendering per diagram:
+    #   Tier A — the user's actual Mermaid source (after salvage + sanitize).
+    #   Tier B — if Tier A fails, fall back to the salvager's FALLBACK_DIAGRAM
+    #            (a minimal always-valid 2-node graph). This guarantees the
+    #            DOCX gets AT LEAST a placeholder image instead of a
+    #            text-only "(rendered in browser — source below)" stub.
+    #            Users have reported the stub not even showing the source
+    #            because pandoc was dropping the unlabeled code fence.
+    from tools.mermaid_salvage import FALLBACK_DIAGRAM as _FALLBACK_MMD
+
     def render_diagram(idx_code):
         idx, code = idx_code
         img_path = str(tmp / f"diagram_{idx}.png")
         log.debug(f"mermaid.render.start idx={idx} path={img_path}")
-        success = _render_mermaid_local(code, img_path)
-        if success:
-            log.info(f"mermaid.render.ok idx={idx} size={_pl.Path(img_path).stat().st_size if _pl.Path(img_path).exists() else 0}")
-        else:
-            log.warning(f"mermaid.render.failed idx={idx}")
-        return idx, img_path if success else None
+        # Tier A — real source
+        if _render_mermaid_local(code, img_path):
+            size = _pl.Path(img_path).stat().st_size if _pl.Path(img_path).exists() else 0
+            log.info(f"mermaid.render.ok idx={idx} size={size}")
+            return idx, img_path, True  # (idx, path, is_real)
+        log.warning(f"mermaid.render.failed idx={idx} — falling back to placeholder diagram")
+        # Tier B — minimal always-valid placeholder
+        placeholder_path = str(tmp / f"diagram_{idx}_placeholder.png")
+        if _render_mermaid_local(_FALLBACK_MMD, placeholder_path):
+            log.info(f"mermaid.render.placeholder_ok idx={idx}")
+            return idx, placeholder_path, False
+        log.warning(f"mermaid.render.placeholder_failed idx={idx}")
+        return idx, None, False
 
-    results: dict[int, str | None] = {}
+    results: dict[int, tuple[str | None, bool]] = {}
     with ThreadPoolExecutor(max_workers=min(len(blocks), 4)) as pool:
         futures = {pool.submit(render_diagram, (i + 1, code)): i for i, (_, code) in enumerate(blocks)}
         for fut in as_completed(futures):
-            idx, path = fut.result()
-            results[idx] = path
+            idx, path, is_real = fut.result()
+            results[idx] = (path, is_real)
 
-    log.info(f"mermaid.render.summary total={len(blocks)} success={sum(1 for p in results.values() if p)} failed={sum(1 for p in results.values() if not p)}")
+    log.info(
+        "mermaid.render.summary total=%d real=%d placeholder=%d failed=%d",
+        len(blocks),
+        sum(1 for (p, real) in results.values() if p and real),
+        sum(1 for (p, real) in results.values() if p and not real),
+        sum(1 for (p, _r) in results.values() if not p),
+    )
 
     # ── 3. Replace blocks in reverse order (preserves string offsets) ─────────
+    # Fallback strategy for the per-block replacement text:
+    #   Real image      → `**Diagram N**` heading + `![Diagram N](...)` inline.
+    #   Placeholder img → same inline image + an explicit "source unavailable in
+    #                     renderer" note + source-code block with `text` lang
+    #                     tag (so pandoc keeps the fence; we stopped using an
+    #                     unlabeled fence because it was dropped on occasion).
+    #   No image at all → bold header + source in `text`-tagged code fence.
+    # In all three cases, the DOCX ends up with visible diagram content —
+    # never a dangling "source below" line with no source under it.
     result_md = md_text
     for i, (m, code) in reversed(list(enumerate(blocks))):
         idx = i + 1
-        img_path = results.get(idx)
-        if img_path:
-            # Convert Windows backslashes to forward slashes for markdown compatibility
-            # Pandoc and python-docx work with forward slashes even on Windows
-            img_path_md = img_path.replace('\\', '/')
-            replacement = f"\n\n**System Architecture Diagram {idx}**\n\n![Diagram {idx}]({img_path_md})\n\n"
-        else:
+        path, is_real = results.get(idx, (None, False))
+        if path and is_real:
+            img_path_md = path.replace('\\', '/')
             replacement = (
-                f"\n\n**System Architecture Diagram {idx}** "
-                f"*(rendered in browser — source below)*\n\n"
-                f"```\n{code}\n```\n\n"
+                f"\n\n**System Architecture Diagram {idx}**\n\n"
+                f"![Diagram {idx}]({img_path_md})\n\n"
+            )
+        elif path:  # placeholder PNG rendered
+            img_path_md = path.replace('\\', '/')
+            replacement = (
+                f"\n\n**System Architecture Diagram {idx}**  "
+                f"*(auto-renderer could not parse the LLM-emitted Mermaid "
+                f"— placeholder shown; full source is preserved below)*\n\n"
+                f"![Diagram {idx} placeholder]({img_path_md})\n\n"
+                f"**Diagram source:**\n\n"
+                f"```text\n{code}\n```\n\n"
+            )
+        else:  # no image at all
+            replacement = (
+                f"\n\n**System Architecture Diagram {idx}**  "
+                f"*(auto-renderer unavailable — source preserved below; "
+                f"paste into https://mermaid.live to view)*\n\n"
+                f"```text\n{code}\n```\n\n"
             )
         result_md = result_md[:m.start()] + replacement + result_md[m.end():]
 
