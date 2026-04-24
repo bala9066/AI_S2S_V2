@@ -269,6 +269,50 @@ def _step_close_brackets(text: str) -> tuple[str, Optional[str]]:
     return ("\n".join(out), "close_brackets" if changed else None)
 
 
+def _step_fix_quoted_edge_labels(text: str) -> tuple[str, Optional[str]]:
+    """Step I-pre — Mermaid edge labels live INSIDE pipes (`-->|label|`),
+    not inside quotes between dashes (`-- "label" -->`).  The LLM
+    routinely emits the wrong shape:
+
+        BUCK -- "+5 V" --> LDO1
+        A -- "label" --> B
+        BUCK == "thick" ==> LDO1
+
+    All three are parse errors. Convert to the canonical form:
+
+        BUCK -->|+5 V| LDO1
+        A -->|label| B
+        BUCK ==>|thick| LDO1
+
+    Regression for the screenshot 2026-04-24 power-tree diagram.
+    """
+    original = text
+    # `LHS -- "lbl" --> RHS` and `LHS == "lbl" ==> RHS` (with optional spaces).
+    # Capture the source / arrow style / label / dest so we can rebuild.
+    pattern = re.compile(
+        r"(\b[\w][\w-]*\b)\s*"            # 1: source node
+        r"(==|--)"                          # 2: arrow style (thick/normal)
+        r"\s*\"([^\"]+)\"\s*"               # 3: quoted label
+        r"(==>|-->|==|--)\s*"               # 4: arrow tail
+        r"(\b[\w][\w-]*\b)"                # 5: dest node
+    )
+
+    def _sub(m: re.Match[str]) -> str:
+        src, _style, label, _tail, dst = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        # Use the strongest arrow form between style and tail — if either is
+        # `==`/`==>`, use thick `==>|...|`; else normal `-->|...|`.
+        thick = "==" in _style or "==" in _tail
+        arrow = "==>" if thick else "-->"
+        # Strip leading/trailing whitespace + any stray quotes from the label.
+        clean_label = label.strip().strip("'\"`")
+        return f"{src} {arrow}|{clean_label}| {dst}"
+
+    text = pattern.sub(_sub, text)
+    if text != original:
+        return text, "fix_quoted_edge_labels"
+    return text, None
+
+
 def _step_isolate_end(text: str) -> tuple[str, Optional[str]]:
     """Step I — if `end` appears on the same line as other content (e.g.
     `FOO[X] end`), split it so `end` is alone. Mermaid requires `end` to
@@ -318,6 +362,7 @@ _STEPS = (
     _step_fix_bare_shapes,
     _step_quote_dangerous_labels,
     _step_close_brackets,
+    _step_fix_quoted_edge_labels,
     _step_isolate_end,
     _step_trim,
 )

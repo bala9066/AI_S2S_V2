@@ -3193,11 +3193,55 @@ class RequirementsAgent(BaseAgent):
                 lines.extend(stale_rows)
                 lines.append("")
 
-        # Block diagram (if present)
-        block = tool_input.get("block_diagram_mermaid", "")
-        if block:
+        # Block diagram — route through the SAME renderer the persistent
+        # block_diagram.md / architecture.md files use (`_render_diagram_field`).
+        # Until 2026-04-24 this block grabbed raw `block_diagram_mermaid`
+        # straight from the LLM, no salvage, no structured-JSON path. The
+        # docs page (`block_diagram.md`) rendered cleanly because the
+        # output-file generator went through `_render_diagram_field`, but
+        # the chat-draft renderer did not — so the same payload showed
+        # broken Mermaid in chat and clean Mermaid in docs.
+        #
+        # User feedback (2026-04-24): "in chat page why block diagram is
+        # same as in documents page block diagram? it should be same right
+        # as in documents page?" → unify the path.
+        #
+        # `_render_diagram_field` preference order:
+        #   1. Structured `block_diagram` JSON spec → `render_block_diagram`
+        #      (deterministic, always valid).
+        #   2. Raw `block_diagram_mermaid` → `salvage()` (handles em-dash
+        #      arrows, frontmatter, unclosed brackets, etc.).
+        #   3. `FALLBACK_DIAGRAM` last resort (always parses).
+        block_mermaid = self._render_diagram_field(
+            tool_input,
+            structured_key="block_diagram",
+            raw_key="block_diagram_mermaid",
+            default_direction="LR",
+            allow_empty=True,
+        )
+        if block_mermaid:
             lines += ["## System Block Diagram", "",
-                      "```mermaid", block.strip(), "```", ""]
+                      "```mermaid", block_mermaid.strip(), "```", ""]
+
+        # Architecture / power-tree diagram — same unified renderer as
+        # block_diagram. Until 2026-04-24 the chat draft only emitted
+        # `block_diagram_mermaid` and the architecture diagram only
+        # appeared in the persistent `architecture.md` file (where it
+        # rendered fine). Adding it here so the chat-page summary shows
+        # both diagrams the same way the docs page does — addresses the
+        # user-reported "chat page diagram looks wrong / different from
+        # docs" gap, where the broken raw `architecture_mermaid` was
+        # what they were actually seeing.
+        arch_mermaid = self._render_diagram_field(
+            tool_input,
+            structured_key="architecture",
+            raw_key="architecture_mermaid",
+            default_direction="TD",
+            allow_empty=True,
+        )
+        if arch_mermaid:
+            lines += ["## System Architecture", "",
+                      "```mermaid", arch_mermaid.strip(), "```", ""]
 
         return "\n".join(lines)
 

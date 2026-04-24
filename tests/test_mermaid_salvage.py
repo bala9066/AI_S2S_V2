@@ -335,3 +335,88 @@ def test_crlf_line_endings_normalised():
     raw = "flowchart LR\r\n    A --> B\r\n"
     cleaned, _ = salvage(raw)
     assert "\r" not in cleaned
+
+
+# ---------------------------------------------------------------------------
+# Quoted edge-label salvage — regression for the 2026-04-24 power-tree bug
+# ---------------------------------------------------------------------------
+
+class TestFixQuotedEdgeLabels:
+    """Mermaid edge labels live inside pipes (`-->|label|`), not between
+    arrow dashes (`-- "label" -->`). The LLM keeps emitting the wrong
+    shape — these tests guard the salvage pass that fixes it."""
+
+    def test_normal_arrow_with_quoted_label(self):
+        raw = 'flowchart TD\n    BUCK -- "+5 V" --> LDO1\n'
+        cleaned, fixes = salvage(raw)
+        assert "fix_quoted_edge_labels" in fixes
+        # Edge converts to canonical pipe form, label preserved.
+        assert "BUCK -->|+5 V| LDO1" in cleaned
+        # Quoted label form must be gone.
+        assert '-- "+5 V" -->' not in cleaned
+
+    def test_thick_arrow_with_quoted_label(self):
+        raw = 'flowchart TD\n    BUCK == "thick" ==> LDO1\n'
+        cleaned, fixes = salvage(raw)
+        assert "fix_quoted_edge_labels" in fixes
+        assert "BUCK ==>|thick| LDO1" in cleaned
+
+    def test_mixed_arrow_styles(self):
+        # Quirky LLM output: dashes on one side, equals on the other.
+        # Salvage promotes to thick arrow because either side is `==`.
+        raw = 'flowchart TD\n    A == "label" --> B\n'
+        cleaned, fixes = salvage(raw)
+        assert "fix_quoted_edge_labels" in fixes
+        # Use thick form since one side is `==`.
+        assert "A ==>|label| B" in cleaned
+
+    def test_full_power_tree_screenshot_diagram(self):
+        # The exact failure mode from the user's 2026-04-24 screenshot:
+        # power-tree with multiple `BUCK -- "+5 V" --> LDOn` edges.
+        raw = (
+            "flowchart TD\n"
+            "    PWR_IN[+28 V MIL Bus Input]\n"
+            "    BUCK[Buck Conv BD9F800MUX 28V 5V 8A]\n"
+            "    LDO1[LDO Ch1 ADM7170 5V 3.3V]\n"
+            "    LDO2[LDO Ch2 ADM7170 5V 3.3V]\n"
+            '    PWR_IN -- "+28 V" --> BUCK\n'
+            '    BUCK -- "+5 V" --> LDO1\n'
+            '    BUCK -- "+5 V" --> LDO2\n'
+        )
+        cleaned, fixes = salvage(raw)
+        # All three edges salvaged.
+        assert cleaned.count('-- "+5 V" -->') == 0
+        assert cleaned.count('-- "+28 V" -->') == 0
+        assert "PWR_IN -->|+28 V| BUCK" in cleaned
+        assert "BUCK -->|+5 V| LDO1" in cleaned
+        assert "BUCK -->|+5 V| LDO2" in cleaned
+        assert "fix_quoted_edge_labels" in fixes
+
+    def test_label_with_inner_quotes_stripped(self):
+        # Stray inner quotes on the label get cleaned during salvage.
+        raw = 'flowchart TD\n    A -- "\'hi\'" --> B\n'
+        cleaned, _ = salvage(raw)
+        assert "A -->|hi| B" in cleaned
+
+    def test_label_with_special_chars_kept(self):
+        # `+`, spaces, decimals all preserved verbatim — they're valid in
+        # pipe-form edge labels.
+        raw = 'flowchart TD\n    A -- "3.3 V @ 500 mA" --> B\n'
+        cleaned, _ = salvage(raw)
+        assert "A -->|3.3 V @ 500 mA| B" in cleaned
+
+    def test_well_formed_pipe_label_left_alone(self):
+        # A diagram that already uses pipe-form labels must NOT trigger
+        # the fix (no false positives).
+        raw = "flowchart TD\n    A -->|already correct| B\n"
+        cleaned, fixes = salvage(raw)
+        assert "fix_quoted_edge_labels" not in fixes
+        assert "A -->|already correct| B" in cleaned
+
+    def test_unrelated_quoted_strings_left_alone(self):
+        # Quotes that are NOT part of an edge-label-between-dashes pattern
+        # must be untouched (e.g. quoted node labels like `A["My Node"]`).
+        raw = 'flowchart TD\n    A["My Node"] --> B\n'
+        cleaned, fixes = salvage(raw)
+        assert "fix_quoted_edge_labels" not in fixes
+        assert 'A["My Node"]' in cleaned
