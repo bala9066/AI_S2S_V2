@@ -84,6 +84,16 @@ class PipelineService:
     Designed to run as a FastAPI BackgroundTask.
     """
 
+    # P23 serial-look status flips. After parallel backend work finishes,
+    # we walk phases in order and toggle pending → in_progress → final
+    # so the frontend sidebar shows a classic P-N-after-P-N visual rather
+    # than simultaneous running indicators. Values are tuned against the
+    # 3-second frontend status poll interval — must be >= poll interval
+    # for the transition to be observable.
+    _STATUS_FLIP_DELAY_S = 3.5       # dwell on "in_progress" between phases
+    _STATUS_FLIP_INTERLUDE_S = 0.6   # brief pause after "completed" before
+                                      # flipping next phase to in_progress
+
     def __init__(
         self,
         project_service: Optional[ProjectService] = None,
@@ -184,6 +194,19 @@ class PipelineService:
             )
             _batch_t0 = time.monotonic()
 
+            # P23: mark ONLY the first phase as in_progress before firing
+            # the batch so the UI sidebar shows "something is running"
+            # during the ~4 min of actual parallel work. The other
+            # sibling phases stay in their prior status (pending) until
+            # the post-batch serial status-flip below transitions them
+            # through in_progress → completed in phase-id order.
+            _lock = self._status_lock(project_id)
+            first_phase = eligible[0]
+            async with _lock:
+                await self._proj_svc.async_set_phase_status(
+                    project_id, first_phase, "in_progress",
+                )
+
             # Fan out this batch. `return_exceptions=True` so one
             # phase's failure doesn't take down sibling phases (match
             # sequential-runner behaviour where we log + continue).
@@ -204,10 +227,11 @@ class PipelineService:
             ]
             results = await asyncio.gather(*coros, return_exceptions=True)
 
-            # Merge per-phase outputs into the shared prior_outputs that
-            # the NEXT batch will read from. Exceptions were already
-            # logged inside _run_single_phase and marked as failed in
-            # DB — here we only process successful returns.
+            # Build per-phase decision map for the serial status flip.
+            # On exception we default to "failed"; otherwise honour what
+            # the phase reported.
+            final_statuses: dict[str, str] = {}
+            elapsed_per_phase: dict[str, float] = {}
             for pid, res in zip(eligible, results):
                 if isinstance(res, Exception):
                     log.warning(
@@ -219,9 +243,45 @@ class PipelineService:
                             "error": str(res)[:300],
                         },
                     )
-                    continue
-                if isinstance(res, dict):
-                    prior_outputs.update(res)
+                    final_statuses[pid] = "failed"
+                    elapsed_per_phase[pid] = 0.0
+                elif isinstance(res, dict):
+                    final_statuses[pid] = res.get("final_status", "completed")
+                    elapsed_per_phase[pid] = float(res.get("elapsed", 0.0))
+                    if res.get("outputs"):
+                        prior_outputs.update(res["outputs"])
+                else:
+                    final_statuses[pid] = "completed"
+                    elapsed_per_phase[pid] = 0.0
+
+            # P23: "serial-look" status flip. Walk phases in batch
+            # (i.e. phase-id) order. The first phase is already
+            # `in_progress`; for each subsequent phase we flip the
+            # previous to its final status, show the next as
+            # `in_progress`, and let the frontend polling (3 s
+            # interval) catch both transitions. This gives the user
+            # the classic sequential pipeline animation even though
+            # the backend did them concurrently.
+            #
+            # `_STATUS_FLIP_DELAY_S` should be >= 2× the frontend poll
+            # interval (default 3 s) so the polling definitely catches
+            # each transition. Set to 3.5 s as a demo-comfort default.
+            for i, pid in enumerate(eligible):
+                if i > 0:
+                    async with _lock:
+                        await self._proj_svc.async_set_phase_status(
+                            project_id, pid, "in_progress",
+                        )
+                    await asyncio.sleep(self._STATUS_FLIP_DELAY_S)
+                # Flip to final status.
+                async with _lock:
+                    await self._proj_svc.async_set_phase_status(
+                        project_id, pid, final_statuses[pid],
+                        extra={"duration_seconds": round(elapsed_per_phase[pid], 2)},
+                    )
+                # Small breather between phases so the "completed"
+                # transition is also observable.
+                await asyncio.sleep(self._STATUS_FLIP_INTERLUDE_S)
 
             log.info(
                 "pipeline.batch_completed",
@@ -250,29 +310,33 @@ class PipelineService:
         class_name: str,
         phase_name: str,
         prior_outputs: dict[str, str],
-    ) -> dict[str, str]:
-        """Execute one phase. Returns the dict of NEW output files this
-        phase wrote (filename → content). Caller merges into the shared
-        `prior_outputs` AFTER the enclosing batch completes, so parallel
-        sibling phases don't race on a mutable shared dict.
+    ) -> dict:
+        """Execute one phase. Returns a result dict with:
+          - `outputs`: dict[filename → content] written by this phase
+          - `final_status`: "completed" or "failed" (what the batch
+                           runner should write to phase_statuses)
+          - `elapsed`: seconds spent in the work
 
-        On agent exception the method catches it, marks the phase failed
-        in DB, and returns an empty dict — matching the
-        "continue-on-failure" behaviour of the old serial runner.
-
-        `prior_outputs` is READ-ONLY from this method's perspective; a
-        caller-provided snapshot is the safe thing to pass when running
-        phases concurrently.
+        P23: status WRITES (in_progress / completed / failed) are NOT
+        performed here anymore — the enclosing batch runner writes them
+        in phase-id order after all sibling phases in the batch have
+        finished so the frontend sidebar shows serial progression.
         """
         log.info("phase.started", extra={"project_id": project_id, "phase": phase_id})
-        # P22: per-project lock serialises all phase_statuses writes so
+        # P22/P23: per-project lock serialises all phase_statuses writes so
         # concurrent phases in the same batch don't lose each other's
-        # updates. The lock is held ONLY across the SQL round-trip, not
-        # across the LLM call — so parallelism is preserved where it
-        # matters (LLM thinking) and only the tiny DB write is serialised.
+        # updates (lost-update race on JSON column). Held ONLY across the
+        # SQL round-trip, not across the LLM call.
+        #
+        # P23 (2026-04-24): the "in_progress" + "completed" status
+        # transitions are NO LONGER written here. The batch runner in
+        # `run_pipeline` writes them in phase-id order AFTER all parallel
+        # work completes, so the frontend sidebar shows phases advancing
+        # one at a time (sequential appearance) while the backend still
+        # executes the batch concurrently (actual speed). This keeps
+        # the ~16-min parallel wall-clock AND the user's preferred
+        # "serial pipeline" visual.
         _lock = self._status_lock(project_id)
-        async with _lock:
-            await self._proj_svc.async_set_phase_status(project_id, phase_id, "in_progress")
         start = time.monotonic()
         new_outputs: dict[str, str] = {}
 
@@ -330,28 +394,27 @@ class PipelineService:
                         )
 
             # Respect phase_complete flag — if agent signals failure, mark as failed
-            # rather than silently completing with no outputs (e.g. P4 tool not called)
+            # rather than silently completing with no outputs (e.g. P4 tool not called).
+            # P23: we DO NOT write the status here — the batch runner writes it
+            # after all phases complete so UI sees a serial flow. We only stash
+            # the decision on the return value.
             phase_complete = result.get("phase_complete", True)
             final_status = "completed" if phase_complete else "failed"
-            async with _lock:
-                await self._proj_svc.async_set_phase_status(
-                    project_id, phase_id, final_status,
-                    extra={"duration_seconds": round(elapsed, 2)},
-                )
-            log.info("phase.completed",
+            log.info("phase.work_complete",
                      extra={"project_id": project_id, "phase": phase_id,
-                            "duration_s": round(elapsed, 2)})
+                            "duration_s": round(elapsed, 2),
+                            "final_status": final_status})
 
         except Exception as exc:
             elapsed = time.monotonic() - start
+            final_status = "failed"
             log.exception("phase.failed",
                           extra={"project_id": project_id, "phase": phase_id})
-            # P22: also under the lock.
+            # P22: phase_output write is separate from phase_status — still
+            # emit it now (the phase_outputs table is per-row, no lost-update
+            # risk) so the error is persisted even if status-flip happens
+            # later in the batch runner.
             async with _lock:
-                await self._proj_svc.async_set_phase_status(
-                    project_id, phase_id, "failed",
-                    extra={"error": str(exc)[:500]},
-                )
                 await self._proj_svc.async_record_phase_output(
                     project_id=project_id,
                     phase_id=phase_id,
@@ -361,10 +424,13 @@ class PipelineService:
                     error_message=str(exc)[:2000],
                     duration_seconds=elapsed,
                 )
-            # Continue to next phase rather than aborting entire pipeline
-            # (allows partial recovery; UI shows which phase failed)
+            # Continue — the batch runner handles status writes in order.
 
-        return new_outputs
+        return {
+            "outputs": new_outputs,
+            "final_status": final_status,
+            "elapsed": elapsed,
+        }
 
     def _load_prior_outputs(self, proj: dict) -> dict[str, str]:
         """Load all previously-written output files into memory for context."""
@@ -391,8 +457,17 @@ class PipelineService:
         if not proj:
             raise ValueError(f"Project {project_id} not found")
 
+        # P23: `_run_single_phase` no longer writes phase_status; we do
+        # it here for the single-phase path so the UI still sees the
+        # classic in_progress → completed transition.
+        _lock = self._status_lock(project_id)
+        async with _lock:
+            await self._proj_svc.async_set_phase_status(
+                project_id, phase_id, "in_progress",
+            )
+
         prior_outputs = self._load_prior_outputs(proj)
-        await self._run_single_phase(
+        res = await self._run_single_phase(
             project_id=project_id,
             proj=proj,
             phase_id=phase_id,
@@ -401,4 +476,14 @@ class PipelineService:
             phase_name=phase_name,
             prior_outputs=prior_outputs,
         )
+        final_status = "completed"
+        elapsed = 0.0
+        if isinstance(res, dict):
+            final_status = res.get("final_status", "completed")
+            elapsed = float(res.get("elapsed", 0.0))
+        async with _lock:
+            await self._proj_svc.async_set_phase_status(
+                project_id, phase_id, final_status,
+                extra={"duration_seconds": round(elapsed, 2)},
+            )
         return await self._proj_svc.async_get(project_id) or {}

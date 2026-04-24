@@ -49,6 +49,14 @@ def pipe_env(tmp_path: Path, monkeypatch):
     from services.pipeline_service import PipelineService
     proj_svc = ProjectService()
     pipe_svc = PipelineService(project_service=proj_svc)
+    # P23: neutralise the UI-facing status-flip delays in tests. The 3.5-s
+    # dwell between `in_progress` and `completed` is a demo-comfort pause
+    # that the frontend's 3-s polling needs to catch the transition; in
+    # tests we don't poll, we assert directly, so the pause just slows
+    # CI. Individual tests that care about timing can restore a non-zero
+    # delay explicitly.
+    pipe_svc._STATUS_FLIP_DELAY_S = 0.0
+    pipe_svc._STATUS_FLIP_INTERLUDE_S = 0.0
 
     yield proj_svc, pipe_svc, tmp_path
 
@@ -310,6 +318,68 @@ def test_pipeline_batches_respect_dependencies():
                     f"batch {_PIPELINE_BATCHES.index(batch)} or later"
                 )
         seen_before.update(batch)
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_flips_phase_statuses_serially_even_when_batch_is_parallel(pipe_env):
+    """P23 — user asked for a serial-looking UI even though the backend
+    executes each batch concurrently. The contract: within a batch,
+    phase_status writes happen in phase-id order (one phase at a time)
+    AFTER the actual parallel work finishes. This test captures the
+    sequence of status writes and asserts the ordering.
+
+    Concretely, for Batch A = (P2, P4):
+      - P2 gets its "in_progress" FIRST (before parallel work starts)
+      - Both P2 and P4 run actual work in parallel
+      - After both finish, the status sequence is:
+            P2 → completed
+            P4 → in_progress
+            P4 → completed
+      — not the other way around, and not simultaneously.
+    """
+    proj_svc, pipe_svc, _ = pipe_env
+    proj = proj_svc.create(name="SerialDisplay")
+    # Tests run way faster if we don't wait the full 3.5 s between flips.
+    pipe_svc._STATUS_FLIP_DELAY_S = 0.05
+    pipe_svc._STATUS_FLIP_INTERLUDE_S = 0.01
+
+    # Wrap `async_set_phase_status` to record the exact order of flips.
+    flip_log: list[tuple[str, str]] = []
+    orig_set = proj_svc.async_set_phase_status
+
+    async def _tracked_set(project_id, phase_id, status, *args, **kwargs):
+        flip_log.append((phase_id, status))
+        return await orig_set(project_id, phase_id, status, *args, **kwargs)
+    proj_svc.async_set_phase_status = _tracked_set
+
+    with _Stacked(_patch_all_phase_agents()):
+        await pipe_svc.run_pipeline(proj["id"])
+
+    # Extract just Batch-A flips (P2, P4).
+    batch_a_flips = [(pid, st) for pid, st in flip_log if pid in ("P2", "P4")]
+    # Expected sequence:
+    #   (P2, in_progress) — fired before parallel work
+    #   (P2, completed)   — after work, P2 first
+    #   (P4, in_progress) — serial transition
+    #   (P4, completed)
+    assert batch_a_flips == [
+        ("P2", "in_progress"),
+        ("P2", "completed"),
+        ("P4", "in_progress"),
+        ("P4", "completed"),
+    ], f"unexpected Batch-A flip sequence: {batch_a_flips}"
+
+    # Also check a 3-phase batch (B = P3, P6, P8a) for the same pattern.
+    batch_b_flips = [(pid, st) for pid, st in flip_log
+                      if pid in ("P3", "P6", "P8a")]
+    assert batch_b_flips == [
+        ("P3", "in_progress"),
+        ("P3", "completed"),
+        ("P6", "in_progress"),
+        ("P6", "completed"),
+        ("P8a", "in_progress"),
+        ("P8a", "completed"),
+    ], f"unexpected Batch-B flip sequence: {batch_b_flips}"
 
 
 @pytest.mark.asyncio
