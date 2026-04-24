@@ -78,6 +78,7 @@ def _part(
     mfr: str = "Analog Devices Inc.",
     datasheet_url: str | None = "https://www.analog.com/media/en/datasheet/adl8107.pdf",
     product_url: str | None = "https://www.analog.com/en/products/ADL8107.html",
+    source: str = "digikey",
 ) -> PartInfo:
     return PartInfo(
         part_number=pn,
@@ -88,7 +89,7 @@ def _part(
         lifecycle_status="active",
         unit_price_usd=24.0,
         stock_quantity=180,
-        source="digikey",
+        source=source,
     )
 
 
@@ -211,6 +212,36 @@ class TestBuildChain:
         chain = build_chain(info)
         assert len(chain) == 1
         assert chain[0][1] == "distributor_search"
+
+    def test_digikey_sourced_part_falls_back_to_digikey(self):
+        # source="digikey" → DigiKey search URL on the last rung.
+        info = _part(datasheet_url=None, product_url=None, source="digikey")
+        chain = build_chain(info)
+        url, source = chain[-1]
+        assert source == "distributor_search"
+        assert url.startswith(
+            "https://www.digikey.com/en/products/result?keywords="
+        )
+
+    def test_mouser_sourced_part_falls_back_to_mouser(self):
+        # source="mouser" → Mouser keyword-search URL on the last rung.
+        # Mirrors user feedback: "digikey/mouser, not only digikey".
+        info = _part(datasheet_url=None, product_url=None, source="mouser")
+        chain = build_chain(info)
+        url, source = chain[-1]
+        assert source == "distributor_search"
+        assert url.startswith("https://www.mouser.com/c/?q=")
+        assert "ADL8107" in url
+
+    def test_unknown_source_defaults_to_digikey(self):
+        # source="seed" / "chromadb" / "" — fall back to DigiKey since
+        # it has the broader catalog.
+        for src in ("seed", "chromadb", "", "unknown"):
+            info = _part(datasheet_url=None, product_url=None, source=src)
+            chain = build_chain(info)
+            assert chain[-1][0].startswith(
+                "https://www.digikey.com/en/products/result?keywords="
+            ), f"source={src!r} should default to DigiKey"
 
     def test_pure_function_no_side_effects(self):
         # build_chain must not touch the network or the cache. We prove

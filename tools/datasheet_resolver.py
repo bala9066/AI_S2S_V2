@@ -119,24 +119,38 @@ def _probe(url: str, *, timeout: float = 3.0) -> bool:
 # Fallback chain construction
 # ---------------------------------------------------------------------------
 
-def _distributor_search_url(part_number: str) -> str:
+def _digikey_search_url(part_number: str) -> str:
+    """DigiKey keyword-search URL for `part_number`."""
+    q = urllib.parse.quote((part_number or "").strip())
+    return f"https://www.digikey.com/en/products/result?keywords={q}"
+
+
+def _mouser_search_url(part_number: str) -> str:
+    """Mouser keyword-search URL for `part_number`."""
+    q = urllib.parse.quote((part_number or "").strip())
+    return f"https://www.mouser.com/c/?q={q}"
+
+
+def _distributor_search_url(part_number: str, *, prefer_mouser: bool = False) -> str:
     """Last-resort URL — never empty, never off-platform.
 
-    Returns DigiKey's keyword-search URL for the MPN. Behaviour:
-      - Single match: DigiKey redirects to the part's product page.
-      - Multiple matches: lands on a filterable result list keyed to
-        the MPN — still useful, still inside the distributor.
-      - Zero matches: shows DigiKey's "no results" page (rare for
-        anything Mouser also doesn't have).
+    Returns DigiKey's keyword-search URL by default; pass
+    `prefer_mouser=True` when the part originated from a Mouser
+    lookup so the user lands on Mouser's catalog instead.
+
+    Behaviour for both endpoints:
+      - Single match: distributor redirects to the part's product page.
+      - Multiple matches: filterable result list keyed to the MPN.
+      - Zero matches: distributor's "no results" page.
 
     Replaces the old `mfr_guess` (vendor URL guesses, often wrong) and
     `search_fallback` (google.com — off-platform) rungs. Per user
-    feedback, the resolver must keep every link inside the
-    DigiKey/Mouser ecosystem so users don't land on stale
-    `analog.com/...` or DuckDuckGo pages.
+    feedback (2026-04-24), the resolver must keep every link inside
+    the DigiKey/Mouser ecosystem so users don't land on stale
+    `analog.com/...` or DuckDuckGo pages — and "DigiKey OR Mouser, not
+    only DigiKey", hence the `prefer_mouser` switch.
     """
-    q = urllib.parse.quote((part_number or "").strip())
-    return f"https://www.digikey.com/en/products/result?keywords={q}"
+    return _mouser_search_url(part_number) if prefer_mouser else _digikey_search_url(part_number)
 
 
 # ---------------------------------------------------------------------------
@@ -148,15 +162,24 @@ def build_chain(info: PartInfo) -> list[tuple[str, str]]:
 
     Pure function: no probes, no cache reads — handy for tests and for
     reasoning about what the resolver would TRY before any I/O. Always
-    ends with the DigiKey MPN-search URL so downstream callers know
-    they can return chain[-1] on universal probe failure.
+    ends with a distributor-search URL so downstream callers know they
+    can return chain[-1] on universal probe failure.
+
+    The fallback distributor (DigiKey vs Mouser) is chosen from
+    `info.source`: a Mouser-sourced part falls back to Mouser's catalog;
+    everything else (digikey / seed / chromadb / unknown) falls back
+    to DigiKey, which has the broader catalog.
     """
     chain: list[tuple[str, str]] = []
     if info.datasheet_url:
         chain.append((info.datasheet_url, "distributor_pdf"))
     if info.product_url and info.product_url != info.datasheet_url:
         chain.append((info.product_url, "product_url"))
-    chain.append((_distributor_search_url(info.part_number), "distributor_search"))
+    prefer_mouser = (info.source or "").strip().lower() == "mouser"
+    chain.append((
+        _distributor_search_url(info.part_number, prefer_mouser=prefer_mouser),
+        "distributor_search",
+    ))
     return chain
 
 
@@ -166,8 +189,8 @@ def resolve_datasheet(info: PartInfo, *, timeout: float = 3.0) -> ResolvedDatash
     Probes are cache-aside via `services.component_cache`, so a warm
     cache turns this into a single SQLite read per URL. The
     `distributor_search` rung (chain[-1]) is never probed — it's
-    accepted as a working "find the datasheet on DigiKey" link by
-    definition (DigiKey's search URL never 404s).
+    accepted as a working "find the datasheet on DigiKey/Mouser" link
+    by definition (both endpoints never 404).
     """
     chain = build_chain(info)
     for pos, (url, source) in enumerate(chain, start=1):
@@ -182,8 +205,9 @@ def resolve_datasheet(info: PartInfo, *, timeout: float = 3.0) -> ResolvedDatash
             )
     # Defensive: chain always ends with distributor_search so we never
     # reach here, but keep the path safe.
+    prefer_mouser = (info.source or "").strip().lower() == "mouser"
     return ResolvedDatasheet(
-        url=_distributor_search_url(info.part_number),
+        url=_distributor_search_url(info.part_number, prefer_mouser=prefer_mouser),
         is_valid=True, source="distributor_search", chain_position=len(chain),
     )
 

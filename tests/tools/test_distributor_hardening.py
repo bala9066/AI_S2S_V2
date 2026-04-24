@@ -339,11 +339,12 @@ class TestDatasheetVerificationOnAccept:
 
     def test_bad_datasheet_url_replaced_with_fallback_when_not_trusted(self, mouser_configured):
         """When the distributor's PDF fails its probe, the resolver swaps in
-        a DigiKey MPN-search URL (last rung of the chain). Old behaviour
+        a distributor MPN-search URL (last rung of the chain). Old behaviour
         stripped the URL entirely, leaving an empty BOM cell. The 2026-04-24
-        rewrite kept this contract but moved the fallback from
-        google.com → digikey.com so users never land off-platform — see
-        tools/datasheet_resolver.py docstring for the rationale."""
+        rewrite kept this contract but moved the fallback off Google /
+        manufacturer sites and onto DigiKey/Mouser. Mouser-sourced parts
+        fall back to Mouser's catalog (since this part came from Mouser),
+        DigiKey-sourced parts fall back to DigiKey."""
         body = json.dumps({"SearchResults": {"NumberOfResult": 1, "Parts": [{
             "ManufacturerPartNumber": "X", "Manufacturer": "V",
             "DataSheetUrl": "https://stale.example/bad.pdf",
@@ -355,15 +356,17 @@ class TestDatasheetVerificationOnAccept:
             info = distributor_search.lookup("X")
         assert info is not None
         # URL is no longer None — it falls through to the always-good
-        # DigiKey MPN-search link as the last chain rung.
+        # Mouser MPN-search link (this part originated from Mouser).
         assert info.datasheet_url is not None
         assert info.datasheet_url != "https://stale.example/bad.pdf"
-        assert info.datasheet_url.startswith(
-            "https://www.digikey.com/en/products/result?keywords="
+        assert info.datasheet_url.startswith("https://www.mouser.com/c/?q="), (
+            f"Mouser-sourced part must fall back to Mouser search, "
+            f"got {info.datasheet_url!r}"
         )
         # Must NOT be off-platform.
         assert "google.com" not in info.datasheet_url
         assert "duckduckgo.com" not in info.datasheet_url
+        assert "analog.com" not in info.datasheet_url
 
     def test_trusted_vendor_url_preserved_without_head_call(self, mouser_configured):
         body = json.dumps({"SearchResults": {"NumberOfResult": 1, "Parts": [{

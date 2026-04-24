@@ -1,34 +1,41 @@
 """
-Canonical datasheet URL builder — fixed-template approach.
+Canonical datasheet URL builder — DigiKey + Mouser only.
 
 Given `(manufacturer, part_number)`, produce the canonical product-page URL
-for that vendor using hand-verified URL templates. This deliberately does
-NOT call the LLM and does NOT do a live fetch — it is a pure function that
-can be unit-tested offline and runs in under a millisecond per call.
+for the BOM table. Per user feedback (2026-04-24), every URL emitted here
+MUST stay inside the DigiKey/Mouser ecosystem — manufacturer-site URLs
+(analog.com, qorvo.com, ti.com, skyworksinc.com, ...) and search-engine
+URLs (duckduckgo.com, google.com) are no longer acceptable because they
+either 404 (vendor URL schemes drift faster than templates can keep up)
+or land users off-platform with no purchase / lifecycle context.
 
-Policy (2026-04-20, v23):
-  The P1 agent frequently hallucinates `datasheet_url` values — either
-  invents a PDF path that 404s, or dumps the URL onto a search page like
-  `https://www.analog.com/en/search.html#q={part}`. Search pages are not
-  datasheets and are not acceptable in deliverables.
+Public APIs:
+  - `canonical_datasheet_url(mfr, part)` → `(digikey_search_url, "search")`
+    Single URL, used when only one is needed.
+  - `candidate_datasheet_urls(mfr, part)` → `[digikey_url, mouser_url]`
+    Both major distributors. The BOM renderer in `requirements_agent.py`
+    HEAD-probes them and picks the first live one (DigiKey wins by
+    default since both endpoints always return 2xx, but a real Mouser
+    PDF the LLM emits — `mouser.com/datasheet/...` — gets priority via
+    the renderer's distributor-domain check).
 
-  This module replaces the LLM as the source of truth for datasheet URLs.
-  The BOM renderer calls `canonical_datasheet_url(mfr, part)` first and
-  only falls back to the LLM-emitted URL when the canonical one HEAD-checks
-  as dead. The LLM's URL becomes a hint, not the ground truth.
+URL shapes (both never 404 by construction):
+  - DigiKey: `https://www.digikey.com/en/products/result?keywords={MPN}`
+  - Mouser:  `https://www.mouser.com/c/?q={MPN}`
 
-Coverage:
-  - 18 major vendors with confirmed URL templates
-  - Handles legacy Hittite / Linear Technology parts → ADI product pages
-  - Normalizes part numbers (uppercase, strip suffixes after LP/EP packaging codes
-    where needed) before substitution
-  - Returns confidence: "canonical" (known template) or "search" (unknown vendor,
-    fall back to vendor-scoped DuckDuckGo search, which is still better than a
-    vendor-site search page because it returns a direct datasheet hit)
+Both endpoints redirect to the part page when there's exactly one
+match, otherwise show a filterable result list keyed to the MPN.
 
-Source of truth: url templates were hand-verified against live vendor sites on
-2026-04-19. Any template that needs changing should be updated here (single
-point of truth) rather than sprinkled through the agent.
+History note (2026-04-24): the manufacturer-URL templates
+(`_adi_candidates`, `_ti`, `_qorvo`, `_skyworks`, `_minicircuits`,
+`_macom`, `_st`, `_microchip`, `_infineon`, `_onsemi`, ...), the
+`_BUILDERS` registry, and the DuckDuckGo fallback have been retained as
+private functions for any test that still imports them, but neither
+public API calls them anymore. The BOM renderer in
+`agents/requirements_agent.py` (`_build_components_md` and the in-chat
+draft renderer) is the dominant caller; both pick up the new behavior
+automatically. Mirror change in `tools/datasheet_resolver.py`
+(P11, 2026-04-24).
 """
 from __future__ import annotations
 
@@ -439,48 +446,57 @@ def _normalize_mfr(mfr: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public API
+# Internal: distributor URL builders — the only two hosts the public
+# APIs are allowed to emit. Both endpoints accept a `keywords=`/`q=`
+# query parameter and never 404 — they redirect to the part page when
+# there's exactly one match, otherwise they show a filterable result
+# list keyed to the MPN.
+# ─────────────────────────────────────────────────────────────────────────────
+def _digikey_search_url(part_number: str) -> str:
+    """DigiKey keyword-search URL for `part_number`."""
+    part = (part_number or "").strip()
+    return f"https://www.digikey.com/en/products/result?keywords={quote(part, safe='')}"
+
+
+def _mouser_search_url(part_number: str) -> str:
+    """Mouser keyword-search URL for `part_number`. Mouser's catalog
+    skews differently from DigiKey's (better Mini-Circuits coverage,
+    weaker general semis), so keeping both in the candidate list gives
+    the BOM renderer a real second option."""
+    part = (part_number or "").strip()
+    return f"https://www.mouser.com/c/?q={quote(part, safe='')}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API — DigiKey + Mouser only, as of 2026-04-24
 # ─────────────────────────────────────────────────────────────────────────────
 def canonical_datasheet_url(
     manufacturer: str,
     part_number: str,
 ) -> Tuple[str, str]:
     """
-    Build the canonical datasheet URL for a `(manufacturer, part_number)` pair.
+    Build the canonical datasheet URL for `(manufacturer, part_number)`.
 
-    Returns `(url, confidence)` where confidence is one of:
-      - `"canonical"` — known vendor + flat product-page URL template
-      - `"search"`    — known vendor but URL template is a vendor-scoped search
-                        (e.g. Skyworks, STMicro — their product URLs are
-                        category-keyed and can't be reconstructed from the
-                        part number alone)
-      - `"unknown"`   — manufacturer not recognized; falls back to a
-                        vendor-scoped DuckDuckGo search (still preferable to
-                        a generic Google search because it keeps context)
+    Always returns `(digikey_search_url, "search")`.  The `manufacturer`
+    argument is intentionally ignored — vendor templates frequently 404
+    (ADI / Qorvo / Skyworks URL schemes drift, slug rules vary by family),
+    and DuckDuckGo / Google fallbacks land users off-platform without
+    purchase / lifecycle data.  This function deliberately returns only
+    one URL; for callers that want both DigiKey and Mouser candidates
+    use `candidate_datasheet_urls` instead.
 
-    Never returns an empty string. Never raises. Safe to call on LLM output.
+    Returns `(url, confidence)`:
+      - `confidence` is always `"search"` because DigiKey's keyword
+        endpoint is a search URL (it redirects to the part page when
+        there's exactly one match — still a "search" semantically).
+      - `url` is non-empty unless `part_number` normalises to "".
+
+    Never raises. Safe to call on LLM output.
     """
     part = normalize_part_number(part_number)
     if not part:
         return ("", "unknown")
-
-    key = _normalize_mfr(manufacturer)
-    if key and key in _BUILDERS:
-        builder, confidence = _BUILDERS[key]
-        try:
-            return (builder(part), confidence)
-        except Exception:
-            pass
-
-    # Unknown vendor — construct a DuckDuckGo datasheet search.
-    # This still returns something clickable that lands on the right datasheet
-    # in most cases (DDG prioritizes vendor PDFs in its instant-answer results).
-    mfr_hint = (manufacturer or "").strip()
-    if mfr_hint:
-        query = f'{part} {mfr_hint} datasheet'
-    else:
-        query = f'{part} datasheet'
-    return (f"https://duckduckgo.com/?q={quote(query)}", "unknown")
+    return (_digikey_search_url(part), "search")
 
 
 def confidence_badge(confidence: str) -> str:
@@ -494,87 +510,76 @@ def confidence_badge(confidence: str) -> str:
 
 def candidate_datasheet_urls(manufacturer: str, part_number: str) -> list[str]:
     """
-    Return an ordered list of candidate product-page URLs for `(mfr, part)`.
+    Return the ordered list of candidate URLs for `(mfr, part)`.
 
-    The BOM renderer HEAD-probes each candidate with a browser-class User-Agent
-    and uses the first 2xx response. This absorbs vendor URL-scheme churn —
-    e.g. ADI migrated some legacy Hittite part pages between `.html` and no-
-    extension paths in 2023 and again in 2025, so single-URL templates go
-    stale. Returning multiple candidates means the renderer self-heals.
+    Returns `[digikey_search_url, mouser_search_url]` — both major
+    distributors get a slot. The BOM renderer in
+    `agents/requirements_agent.py` HEAD-probes each candidate; both
+    endpoints always return 2xx so the FIRST one (DigiKey) wins by
+    default.  The renderer's separate "prefer LLM URL when it's on a
+    distributor domain" logic decides whether a real Mouser product
+    PDF / page (`mouser.com/datasheet/...`) wins ahead of either
+    fallback — see `_distributor_url_priority` there.
 
-    Guaranteed:
-      - Always returns at least one URL.
-      - Last element is always a search / parametric fallback that always
-        resolves (never 404s).
+    The `manufacturer` argument is intentionally ignored — vendor name
+    is not used for URL building anymore.
+
+    Empty list iff `part_number` normalises to "".
     """
     part = normalize_part_number(part_number)
     if not part:
         return []
-
-    key = _normalize_mfr(manufacturer)
-    if key == "analog_devices":
-        return _adi_candidates(part)
-    if key == "texas_instruments":
-        base = _ti_base_part(part)
-        return [
-            f"https://www.ti.com/product/{base}",
-            f"https://www.ti.com/product/{base.upper()}",
-            f"https://www.ti.com/lit/ds/symlink/{base}.pdf",
-            f"https://www.ti.com/sitesearch/en-us/docs/universalsearch.tsp?searchTerm={quote(base)}",
-        ]
-    if key and key in _BUILDERS:
-        # Fallback to the existing single-URL builder plus a generic DuckDuckGo
-        # fallback scoped to the vendor domain.
-        builder, _conf = _BUILDERS[key]
-        primary = builder(part)
-        mfr_hint = (manufacturer or "").strip()
-        ddg = (
-            f"https://duckduckgo.com/?q={quote(f'{part} {mfr_hint} datasheet')}"
-        )
-        return [primary, ddg]
-
-    # Unknown vendor
-    mfr_hint = (manufacturer or "").strip()
-    query = f'{part} {mfr_hint} datasheet' if mfr_hint else f'{part} datasheet'
-    return [f"https://duckduckgo.com/?q={quote(query)}"]
+    return [_digikey_search_url(part), _mouser_search_url(part)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Quick smoke test (runs when invoked as script)
+# Quick smoke test (runs when invoked as script).
+# Updated 2026-04-24 to assert distributor-only behavior — every URL
+# must land on digikey.com OR mouser.com, never on a manufacturer site
+# or a search engine.
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    DK_PREFIX = "https://www.digikey.com/en/products/result?keywords="
+    MS_PREFIX = "https://www.mouser.com/c/?q="
+    BANNED = ("analog.com", "qorvo.com", "ti.com", "skyworksinc.com",
+              "minicircuits.com", "macom.com", "st.com", "microchip.com",
+              "infineon.com", "onsemi.com", "duckduckgo.com", "google.com")
     cases = [
-        ("Analog Devices", "ADL8104", "https://www.analog.com/en/products/adl8104.html", "canonical"),
-        ("ADI",            "HMC8410",       "https://www.analog.com/en/products/hmc8410.html", "canonical"),
-        ("ADI",            "HMC8410LP2FE",  "https://www.analog.com/en/products/hmc8410.html", "canonical"),
-        ("ADI",            "HMC1056LP4BE",  "https://www.analog.com/en/products/hmc1056.html", "canonical"),
-        ("ADI",            "ADL5523ACPZ",   "https://www.analog.com/en/products/adl5523.html", "canonical"),
-        ("ADI",            "ADF4351BCPZ",   "https://www.analog.com/en/products/adf4351.html", "canonical"),
-        ("ADI",            "HMC625BLP5E",   "https://www.analog.com/en/products/hmc625b.html", "canonical"),
-        ("Hittite",        "HMC1056",      "https://www.analog.com/en/products/hmc1056.html", "canonical"),
-        ("Linear Technology","LTC6955IUFD","https://www.analog.com/en/products/ltc6955.html", "canonical"),
-        ("Texas Instruments","LM5175",     "https://www.ti.com/product/lm5175", "canonical"),
-        ("Texas Instruments","LM5175PWPR", "https://www.ti.com/product/lm5175", "canonical"),
-        ("Qorvo",          "TGA2214-CP",   "https://www.qorvo.com/products/p/TGA2214-CP", "canonical"),
-        ("MACOM",          "MAAL-011138",  "https://www.macom.com/products/product-detail/MAAL-011138", "canonical"),
-        ("Mini-Circuits",  "ZX60-P103LN+", None, "canonical"),
-        ("Skyworks",       "SKY65404-31",  None, "search"),
-        ("Microchip",      "PIC32MX170F256B", "https://www.microchip.com/en-us/product/PIC32MX170F256B", "canonical"),
-        ("Murata",         "LQW15AN4N7G80D", "https://www.murata.com/en-global/products/productdetail?partno=LQW15AN4N7G80D", "canonical"),
-        ("SomeUnknownCo",  "XYZ-999",      None, "unknown"),
+        ("Analog Devices",      "ADL8104"),
+        ("ADI",                 "HMC8410"),
+        ("Texas Instruments",   "LM5175"),
+        ("Qorvo",               "TGA2214-CP"),
+        ("Skyworks",            "SKY65404-31"),
+        ("Mini-Circuits",       "ZX60-P103LN+"),
+        ("Mercury Systems",     "AM3063"),
+        ("ROHM Semiconductor",  "BD50GC0JEFJ-E2"),
+        ("SomeUnknownCo",       "XYZ-999"),
     ]
-    print(f"{'Vendor':<24} {'Part':<20} {'Confidence':<10} URL")
+    print(f"{'Vendor':<24} {'Part':<20} canonical URL    +    candidate list")
     print("-" * 120)
     ok = True
-    for mfr, part, expect_url, expect_conf in cases:
+    for mfr, part in cases:
         url, conf = canonical_datasheet_url(mfr, part)
-        badge = confidence_badge(conf)
-        print(f"{mfr:<24} {part:<20} {badge} {conf:<8} {url}")
-        if expect_url and url != expect_url:
-            print(f"   !! EXPECTED: {expect_url}")
+        cands = candidate_datasheet_urls(mfr, part)
+        print(f"{mfr:<24} {part:<20} {conf:<8} {url}")
+        for c in cands:
+            print(f"{'':<24} {'':<20}        +  {c}")
+        # Canonical: DigiKey only.
+        if not url.startswith(DK_PREFIX):
+            print(f"   !! canonical EXPECTED to start with {DK_PREFIX}")
             ok = False
-        if conf != expect_conf:
-            print(f"   !! EXPECTED confidence: {expect_conf}")
+        # Candidates: DigiKey first, Mouser second.
+        if len(cands) != 2:
+            print(f"   !! candidates EXPECTED to be [digikey, mouser]")
             ok = False
+        elif not cands[0].startswith(DK_PREFIX) or not cands[1].startswith(MS_PREFIX):
+            print(f"   !! candidates EXPECTED order [digikey, mouser]")
+            ok = False
+        # Both must be free of banned hosts.
+        for u in [url, *cands]:
+            for bad in BANNED:
+                if bad in u:
+                    print(f"   !! found banned host {bad!r} in URL {u!r}")
+                    ok = False
     print("-" * 120)
     print("ALL PASS" if ok else "SOME CHECKS FAILED")
