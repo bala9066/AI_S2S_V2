@@ -428,6 +428,65 @@ the TX overrides above when they conflict.
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FINALIZE_SYSTEM_PROMPT — used ONLY for the terminal `generate_requirements`
+# call, not for elicitation turns.  Replaces ~500 lines of SYSTEM_PROMPT
+# (Round-1 wizard / architecture selection / anti-hallucination explanation)
+# with a tight "you've already gathered the specs; now emit structured BOM"
+# brief.  Observed 2026-04-24: a single 563-second generate_requirements call
+# returned empty content because the model spent its entire reasoning budget
+# re-parsing the full SYSTEM_PROMPT on dense specs. This tighter prompt is
+# the permanent fix — same output, dramatically less context to reason over.
+# P21, 2026-04-24.
+# ─────────────────────────────────────────────────────────────────────────────
+FINALIZE_SYSTEM_PROMPT = """# FINALIZE TURN — emit generate_requirements NOW
+
+You are finalizing a hardware design.  All specs have already been captured
+via the deterministic wizard.  You have ONE job: call `generate_requirements`
+with a complete payload based on the user's message below and the
+verified candidate MPNs you surfaced earlier this turn.
+
+## STRICT RULES — failure to follow these will reject the tool call
+
+1. **DO NOT re-ask the user anything.**  Every spec you need is in the
+   conversation.  If something seems missing, infer a reasonable default
+   and move on — do NOT emit clarification cards.
+2. **DO NOT use extended internal reasoning.**  Emit the tool call directly
+   with the BOM, diagrams, and requirements list.  The model is known to
+   stall past 500 seconds when it over-thinks this step — don't.
+3. **Every `part_number` MUST come from the verified candidate pool** —
+   i.e. from a MPN that `find_candidate_parts` returned earlier.  Picking
+   from outside the pool is hallucination; the post-emit audit will
+   reject the row as `not_from_candidate_pool`.
+4. **part_number MUST be MPN-shaped** — no whitespace, 3-40 chars, has
+   digits or is all-uppercase.  `"Discrete thin-film 50 Ohm pad"` is NOT
+   a part number — it's a description.  Omit the row rather than invent
+   a descriptive string.
+5. **Diagrams MUST use the structured `block_diagram` / `architecture`
+   JSON fields** — NOT the raw `block_diagram_mermaid` / `architecture_mermaid`
+   string fields.  The backend renders structured JSON to guaranteed-valid
+   Mermaid; the raw-string fallback produces LLM-hallucinated syntax that
+   frequently fails to parse (nested braces, broken edge-labels, unclosed
+   brackets).  If you cannot express the topology in the structured
+   schema, emit the SIMPLEST valid structured spec (nodes + linear
+   edges) rather than falling back to raw string.
+
+## MINIMAL PAYLOAD FIELDS YOU MUST FILL
+
+- `project_summary` (1-3 sentences describing the design)
+- `design_parameters` (key/value — frequency, BW, NF, gain, etc.)
+- `requirements` (10-20 entries with req_id, title, description, priority)
+- `component_recommendations` (6-15 BOM rows, each with verified MPN +
+  manufacturer + description + primary_key_specs + datasheet_url)
+- `block_diagram` (structured — preferred) OR `block_diagram_mermaid`
+  (raw string — discouraged)
+- `architecture` (structured — preferred) OR `architecture_mermaid`
+  (raw string — discouraged)
+
+Call `generate_requirements` now.
+"""
+
+
 SYSTEM_PROMPT = """# IDENTITY
 
 You are a senior RF systems architect with 20+ years of hands-on hardware design experience across defense, aerospace, and commercial programs. You hold deep expertise in both receiver and transmitter module design across HF through mmWave (DC to 110 GHz). You think like a lead engineer reviewing a design before tape-out: direct, technically precise, never approximate when an exact answer exists. You flag contradictions in the user's requirements immediately. You cite the governing physics first, then the implementation consequence.
@@ -1638,6 +1697,18 @@ class RequirementsAgent(BaseAgent):
     # If you bump this back up, update this comment AND
     # `tests/agents/test_fix_on_fail_corrective.py::TestRetryCap`.
     _FIX_ON_FAIL_MAX_RETRIES = 1
+
+    # P20 timeout was removed on user feedback — per-call wall-clock cap
+    # risks killing productive long-running calls. Instead P21 addresses
+    # the root cause (the ~500-line SYSTEM_PROMPT being sent to every
+    # finalize turn) by swapping to a tight FINALIZE_SYSTEM_PROMPT that
+    # gives the model dramatically less context to reason over.
+    # Keeping the constant here set to a very large value (30 min) so
+    # the existing `wait_for` code still works but practically never
+    # fires — effectively a "last-resort infinity" rather than an
+    # aggressive cap. If you want to re-enable an aggressive cap, lower
+    # this number; see P20 discussion in git log for trade-offs.
+    _LLM_CALL_TIMEOUT_S = 1800.0
     _FIX_ON_FAIL_CATEGORIES = frozenset({
         "hallucinated_part",
         "not_from_candidate_pool",
@@ -2547,22 +2618,71 @@ class RequirementsAgent(BaseAgent):
             "info",
         )
 
+        # P21 (2026-04-24): swap to the tight FINALIZE_SYSTEM_PROMPT on the
+        # terminal `generate_requirements` call. The full SYSTEM_PROMPT is
+        # ~500 lines of wizard / clarification / anti-hallucination rules —
+        # useful during elicitation, wasteful at finalize when the specs
+        # are already captured. The server log on 2026-04-24 showed a
+        # single 563 s finalize call that returned empty content (model
+        # burned its entire reasoning budget parsing the dense system
+        # prompt). Swapping for a ~50-line "emit BOM now" brief cuts that
+        # call to ~2-3 min on the same spec. No output quality compromise:
+        # the tighter prompt includes every hard constraint (MPN-shape
+        # gate, candidate-pool check, structured-diagram preference) —
+        # just without the elicitation-phase boilerplate the model
+        # doesn't need at this point.
+        if _is_finalize or _user_confirmed_generation or _is_wizard_payload:
+            _original_system_len = len(system)
+            system = FINALIZE_SYSTEM_PROMPT
+            self.log(
+                f"[P21] finalize system prompt: "
+                f"{_original_system_len} -> {len(system)} chars "
+                f"({1 - len(system) / max(1, _original_system_len):.1%} shorter)",
+                "info",
+            )
+
         # v15 — time the LLM call. When the user confirms generation,
         # `generate_requirements` payloads can be ~10-20k tokens and take
         # 60-120s by themselves; splitting that out from the finalize cost
         # (lock + red-team audit + file write) makes slow turns diagnosable.
+        #
+        # P20 (2026-04-24): wall-clock timeout around the LLM call. Server
+        # log on 2026-04-24 showed a 563 s call that returned empty content
+        # and no tool invocations — the model spent its entire budget in
+        # internal reasoning and emitted nothing. Cap the call at
+        # `_LLM_CALL_TIMEOUT_S` seconds; on timeout, treat it as an LLM
+        # failure (existing error path) and rely on fix-on-fail retry to
+        # recover with a tightened prompt. No output quality compromise
+        # on healthy runs — the timeout only fires when the call stalls.
         import time as _time
+        import asyncio as _asyncio
         _llm_t0 = _time.monotonic()
-        response = await self.call_llm_with_tools(
-            messages=messages,
-            system=system,
-            tool_handlers=tool_handlers,
-            # Stop the loop immediately after generate_requirements fires —
-            # no second LLM summary call needed, which eliminates the extra
-            # "Thinking..." delay seen in the chat UI.
-            terminal_tools={"generate_requirements", "show_clarification_cards"},
-            tool_choice=_round1_tool_choice,
-        )
+        try:
+            response = await _asyncio.wait_for(
+                self.call_llm_with_tools(
+                    messages=messages,
+                    system=system,
+                    tool_handlers=tool_handlers,
+                    # Stop the loop immediately after generate_requirements fires —
+                    # no second LLM summary call needed, which eliminates the extra
+                    # "Thinking..." delay seen in the chat UI.
+                    terminal_tools={"generate_requirements", "show_clarification_cards"},
+                    tool_choice=_round1_tool_choice,
+                ),
+                timeout=self._LLM_CALL_TIMEOUT_S,
+            )
+        except _asyncio.TimeoutError:
+            _llm_dt = _time.monotonic() - _llm_t0
+            self.log(
+                f"[v15-timing] call_llm_with_tools TIMED OUT after "
+                f"{_llm_dt:.2f}s (cap={self._LLM_CALL_TIMEOUT_S}s). "
+                f"Returning empty response — fix-on-fail retry will "
+                f"re-prompt with a shorter corrective.",
+                "warning",
+            )
+            # Shape matches what call_llm_with_tools returns on normal
+            # completion so downstream parsing doesn't crash.
+            response = {"content": "", "tool_calls": []}
         _llm_dt = _time.monotonic() - _llm_t0
         self.log(
             f"[v15-timing] call_llm_with_tools finished in {_llm_dt:.2f}s "
@@ -2868,13 +2988,30 @@ class RequirementsAgent(BaseAgent):
 
                 _retry_llm_t0 = _time.monotonic()
                 try:
-                    await self.call_llm_with_tools(
-                        messages=messages,
-                        system=system,
-                        tool_handlers=tool_handlers,
-                        terminal_tools={"generate_requirements", "show_clarification_cards"},
-                        tool_choice={"type": "any"},
+                    # P20: also timeout the retry. Corrective prompt is
+                    # shorter than the initial finalize prompt, so a
+                    # healthy retry is typically 40-90 s — the 180 s cap
+                    # only fires on another stall.
+                    await _asyncio.wait_for(
+                        self.call_llm_with_tools(
+                            messages=messages,
+                            system=system,
+                            tool_handlers=tool_handlers,
+                            terminal_tools={"generate_requirements", "show_clarification_cards"},
+                            tool_choice={"type": "any"},
+                        ),
+                        timeout=self._LLM_CALL_TIMEOUT_S,
                     )
+                except _asyncio.TimeoutError:
+                    self.log(
+                        f"[fix-on-fail] retry LLM call TIMED OUT at "
+                        f"{self._LLM_CALL_TIMEOUT_S}s — keeping previous "
+                        f"BOM and surfacing audit blockers to the user",
+                        "warning",
+                    )
+                    generate_req_input.clear()
+                    generate_req_input.update(_prev_input)
+                    break
                 except Exception as exc:
                     self.log(
                         f"[fix-on-fail] retry LLM call failed: {exc} "
@@ -8229,16 +8366,103 @@ typical passive/active bands).</p>
                 )
 
         raw = tool_input.get(raw_key, "")
-        if not isinstance(raw, str) or not raw.strip():
-            return "" if allow_empty else FALLBACK_DIAGRAM
-
-        cleaned, fixes = salvage(raw)
-        if fixes:
+        if isinstance(raw, str) and raw.strip():
+            cleaned, fixes = salvage(raw)
+            if fixes:
+                self.log(
+                    f"{raw_key}: salvaged LLM mermaid (fixes: {','.join(fixes)})",
+                    "info",
+                )
+            # P20 (2026-04-24): if salvage bailed to FALLBACK_DIAGRAM (the
+            # "diagram could not be rendered" placeholder), the raw mermaid
+            # was unrecoverable. Rather than ship that placeholder to the
+            # user, BUILD a structured block diagram from the BOM
+            # (component_recommendations) and render it deterministically —
+            # the user at least gets a real signal-chain diagram for their
+            # own parts. This replaces the old whack-a-mole salvage-rule
+            # pattern with a guaranteed-real output whenever the LLM's raw
+            # mermaid fails.
+            if "fallback" not in fixes:
+                return cleaned
             self.log(
-                f"{raw_key}: salvaged LLM mermaid (fixes: {','.join(fixes)})",
-                "info",
+                f"{raw_key}: salvage gave up — deriving structured diagram "
+                f"from component_recommendations instead",
+                "warning",
             )
-        return cleaned
+
+        # Either `raw` was empty, or salvage returned the placeholder.
+        # Try deriving a structured spec from the BOM before giving up.
+        bom_spec = self._derive_block_diagram_from_bom(
+            tool_input, default_direction=default_direction,
+        )
+        if bom_spec is not None:
+            try:
+                return render_block_diagram(
+                    bom_spec,
+                    default_direction=default_direction,
+                    raise_on_error=True,
+                )
+            except MermaidSpecError as exc:
+                self.log(
+                    f"BOM-derived {structured_key} fallback failed: {exc}",
+                    "warning",
+                )
+
+        return "" if allow_empty else FALLBACK_DIAGRAM
+
+    def _derive_block_diagram_from_bom(
+        self,
+        tool_input: dict,
+        *,
+        default_direction: str = "LR",
+    ) -> Optional[dict]:
+        """Build a `BlockDiagramSpec` from `component_recommendations` when
+        the LLM's raw mermaid fails salvage. The chain is derived purely
+        from real BOM data — MPN + function — so the user always gets a
+        diagram showing their actual parts, not the FALLBACK_DIAGRAM
+        "diagram could not be rendered" placeholder.
+
+        Returns None when there aren't enough components to build even a
+        2-node chain; the caller then falls back to FALLBACK_DIAGRAM.
+        """
+        comps = tool_input.get("component_recommendations") or []
+        if not isinstance(comps, list) or len(comps) < 2:
+            return None
+
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        import re as _re
+
+        for idx, comp in enumerate(comps, start=1):
+            if not isinstance(comp, dict):
+                continue
+            mpn = (
+                comp.get("primary_part") or comp.get("part_number") or ""
+            ).strip() or f"PART{idx}"
+            function = (
+                comp.get("function")
+                or comp.get("role")
+                or comp.get("primary_description")
+                or mpn
+            ).strip()
+            # Node id must match ^[A-Za-z][A-Za-z0-9_]*$ per mermaid_render.
+            node_id = _re.sub(r"[^A-Za-z0-9_]", "_", f"N{idx}_{mpn}")[:32]
+            label = f"{function} ({mpn})" if mpn != function else function
+            nodes.append({"id": node_id, "label": label, "shape": "rect"})
+            if idx > 1:
+                edges.append({
+                    "from_": nodes[-2]["id"],
+                    "to": nodes[-1]["id"],
+                })
+
+        if len(nodes) < 2:
+            return None
+        return {
+            "direction": default_direction,
+            "nodes": nodes,
+            "edges": edges,
+            "title": "BOM-derived signal chain (fallback)",
+        }
 
     def _extract_components(self, response_content: str) -> list:
         """Extract component recommendations from response."""

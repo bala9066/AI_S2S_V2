@@ -211,3 +211,120 @@ def test_generate_output_files_uses_block_diagram_as_architecture_fallback(tmp_p
         "user understands the architecture.md is the block diagram, "
         "not the LLM's intended architecture spec."
     )
+
+
+# ---------------------------------------------------------------------------
+# P20 — BOM-derived structured block diagram (ultimate fallback)
+# When raw LLM mermaid is unrecoverable AND no structured spec was
+# provided, derive a linear chain from `component_recommendations` so the
+# user always gets a REAL diagram with their real parts, not the generic
+# FALLBACK_DIAGRAM "diagram could not be rendered" placeholder.
+# ---------------------------------------------------------------------------
+
+def test_bom_derived_fallback_kicks_in_when_no_structured_and_no_raw():
+    """LLM that skips BOTH the structured `block_diagram` spec AND the
+    raw `block_diagram_mermaid` field must NOT produce the generic
+    FALLBACK_DIAGRAM ("diagram could not be rendered") placeholder.
+    Instead, the BOM-derived path must render a structured diagram
+    using the user's actual parts."""
+    agent = _StubAgent()
+    tool_input = {
+        # NO block_diagram (structured) + NO block_diagram_mermaid (raw)
+        "component_recommendations": [
+            {"primary_part": "HMC8410", "function": "LNA"},
+            {"primary_part": "ADL5801", "function": "Mixer"},
+            {"primary_part": "AD9643", "function": "ADC"},
+        ],
+    }
+    out = agent._render_diagram_field(
+        tool_input,
+        structured_key="block_diagram",
+        raw_key="block_diagram_mermaid",
+        default_direction="LR",
+        allow_empty=False,
+    )
+    # Must NOT be the FALLBACK_DIAGRAM placeholder.
+    assert "diagram could not be rendered" not in out
+    assert "ask P1 to regenerate" not in out
+    # The BOM-derived chain must include each real part's MPN in order.
+    assert "HMC8410" in out
+    assert "ADL5801" in out
+    assert "AD9643" in out
+    # It must parse as a valid flowchart.
+    assert out.startswith("flowchart ")
+
+
+def test_bom_derived_fallback_falls_through_when_bom_too_small():
+    """With fewer than 2 components the fallback returns None, and
+    `_render_diagram_field` should honour `allow_empty=True`."""
+    agent = _StubAgent()
+    tool_input = {
+        "component_recommendations": [
+            {"primary_part": "HMC8410", "function": "LNA"},
+        ],  # only 1 component — can't form a chain
+    }
+    out = agent._render_diagram_field(
+        tool_input,
+        structured_key="block_diagram",
+        raw_key="block_diagram_mermaid",
+        default_direction="LR",
+        allow_empty=True,
+    )
+    # allow_empty=True + no structured + no raw + too-small BOM → empty string.
+    assert out == ""
+
+
+def test_derive_block_diagram_from_bom_returns_structured_spec():
+    """Unit test for the helper: given a BOM of 3 components, it returns
+    a dict with nodes + edges forming a linear chain."""
+    agent = _StubAgent()
+    tool_input = {
+        "component_recommendations": [
+            {"primary_part": "HMC8410", "function": "LNA"},
+            {"primary_part": "ADL5801", "function": "Mixer"},
+            {"primary_part": "AD9643", "function": "ADC"},
+        ],
+    }
+    spec = agent._derive_block_diagram_from_bom(tool_input)
+    assert spec is not None
+    assert spec["direction"] == "LR"
+    assert len(spec["nodes"]) == 3
+    assert len(spec["edges"]) == 2  # N1→N2, N2→N3 linear chain
+    # Each node carries the MPN in its label.
+    labels = " ".join(n["label"] for n in spec["nodes"])
+    assert "HMC8410" in labels
+    assert "ADL5801" in labels
+    assert "AD9643" in labels
+    # Edge ids point to the real nodes.
+    node_ids = {n["id"] for n in spec["nodes"]}
+    for e in spec["edges"]:
+        assert e["from_"] in node_ids
+        assert e["to"] in node_ids
+
+
+def test_derive_block_diagram_sanitises_mpn_for_node_ids():
+    """Mermaid node IDs must match `^[A-Za-z][A-Za-z0-9_]*$`. MPNs with
+    `+` / `-` / `/` must be scrubbed before becoming IDs, otherwise the
+    rendered diagram fails to parse."""
+    agent = _StubAgent()
+    tool_input = {
+        "component_recommendations": [
+            {"primary_part": "ZX60-P103LN+", "function": "LNA"},    # + and -
+            {"primary_part": "XCKU040-2FFVA1156I", "function": "FPGA"},
+        ],
+    }
+    spec = agent._derive_block_diagram_from_bom(tool_input)
+    assert spec is not None
+    for node in spec["nodes"]:
+        nid = node["id"]
+        # First char alphanumeric (actually, alpha only per regex).
+        assert nid[0].isalpha(), f"node id {nid!r} must start with a letter"
+        # No +, -, /, spaces.
+        assert "+" not in nid
+        assert "-" not in nid
+        assert "/" not in nid
+        assert " " not in nid
+        # But the label (free text) preserves the real MPN.
+    labels = " ".join(n["label"] for n in spec["nodes"])
+    assert "ZX60-P103LN+" in labels
+    assert "XCKU040-2FFVA1156I" in labels
