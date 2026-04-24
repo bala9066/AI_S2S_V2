@@ -389,11 +389,19 @@ def test_circuit_opens_after_first_429(configured, monkeypatch):
 
 def test_circuit_resets_after_window(configured, monkeypatch):
     """After `reset_rate_limit()` the circuit closes and the next call
-    is allowed through."""
-    digikey_api._mark_rate_limited(0.001)   # open with near-zero window
-    import time; time.sleep(0.01)           # let the tiny window expire
+    is allowed through.
 
-    # Circuit should have expired — _is_rate_limited returns False
+    Originally tested via `_mark_rate_limited(0.001)` + `time.sleep(0.01)`,
+    but that was flaky on Windows CI — sleep granularity is ~15 ms so
+    a 1 ms window sometimes didn't elapse within the 10 ms sleep. Now
+    we test the explicit `reset_rate_limit()` API, which is the code
+    path callers actually depend on."""
+    # Open the circuit for a long window so no natural expiry can help.
+    digikey_api._mark_rate_limited(300)
+    assert digikey_api._is_rate_limited()
+
+    # Explicit reset → circuit closes.
+    digikey_api.reset_rate_limit()
     assert not digikey_api._is_rate_limited()
 
 

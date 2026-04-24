@@ -3126,13 +3126,23 @@ class RequirementsAgent(BaseAgent):
                 if llm_url and llm_url.startswith("http"):
                     probe_set.add(llm_url)
 
-            probes = sorted(probe_set)
-            if probes:
-                with _TPE2(max_workers=min(12, len(probes))) as pool:
-                    results = list(pool.map(_probe, probes))
-                url_live = dict(zip(probes, results))
-            else:
-                url_live = {}
+            # Skip HEAD probing DigiKey/Mouser search URLs — they always
+            # return 2xx by construction (see P17, 2026-04-24). Only probe
+            # LLM-supplied URLs and any other non-trusted hosts. On a typical
+            # BOM of 8 components × 2 candidates this shaves 10-30 s off
+            # the chat-draft render latency.
+            _TRUSTED_HOSTS = ("digikey.com", "digikey.in", "mouser.com", "mouser.in")
+            url_live: dict[str, bool] = {}
+            untrusted: list[str] = []
+            for u in sorted(probe_set):
+                if any(h in u for h in _TRUSTED_HOSTS):
+                    url_live[u] = True  # short-circuit
+                else:
+                    untrusted.append(u)
+            if untrusted:
+                with _TPE2(max_workers=min(12, len(untrusted))) as pool:
+                    results = list(pool.map(_probe, untrusted))
+                url_live.update(dict(zip(untrusted, results)))
 
             # v16 — import stale-parts checker so per-row lifecycle badges can
             # warn the user inline about any part the LLM slipped past the
@@ -7686,6 +7696,17 @@ typical passive/active bands).</p>
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
+
+        # Hosts whose URLs are always live by construction — candidate_datasheet_urls
+        # emits only DigiKey/Mouser keyword-search endpoints since P12, and both
+        # return 2xx for any query (result list, filtered list, or "no results"
+        # page — never a 404). Probing them is 100% wasted latency. P17
+        # (2026-04-24): short-circuit those to True, only probe LLM-supplied
+        # URLs that haven't been vetted by our resolver.
+        _TRUSTED_HOSTS = ("digikey.com", "digikey.in", "mouser.com", "mouser.in")
+        def _is_trusted(url: str) -> bool:
+            return any(h in url for h in _TRUSTED_HOSTS)
+
         def _probe(url: str) -> bool:
             if not url or not url.startswith('http'):
                 return False
@@ -7728,12 +7749,18 @@ typical passive/active bands).</p>
                     probe_set.add(a_llm)
             alt_cands.append(row_alts)
 
-        # Parallel HEAD probes (max 12 workers)
+        # Parallel HEAD probes (max 12 workers) — only for NON-trusted URLs.
+        # Trusted distributor-search URLs are marked live without a round-trip.
         url_ok: dict[str, bool] = {}
-        probes = sorted(probe_set)
-        if probes:
-            with _TPE(max_workers=min(12, len(probes))) as pool:
-                fut_map = {pool.submit(_probe, u): u for u in probes}
+        untrusted: list[str] = []
+        for u in sorted(probe_set):
+            if _is_trusted(u):
+                url_ok[u] = True  # short-circuit
+            else:
+                untrusted.append(u)
+        if untrusted:
+            with _TPE(max_workers=min(12, len(untrusted))) as pool:
+                fut_map = {pool.submit(_probe, u): u for u in untrusted}
                 for fut in _as_completed(fut_map):
                     url_ok[fut_map[fut]] = fut.result()
 
