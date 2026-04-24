@@ -294,17 +294,21 @@ def _step_flatten_brace_hell(text: str) -> tuple[str, Optional[str]]:
     # We walk each line and rewrite problematic nodes.
     lines = text.split("\n")
     changed = False
+    # Heuristic MUST be tight enough not to fire on well-formed diagrams
+    # that happen to have multiple nodes on one line — e.g.
+    # `A[LNA] --> B{Decision}` has 2 opens + 2 closes but is fine.
+    # The failing pattern is ALWAYS characterised by ≥3 quotes in the
+    # suspicious node (the LLM wraps the whole label in outer quotes AND
+    # includes inner quotes — never happens in sanitary emission).
     for idx, line in enumerate(lines):
-        # Cheap check first — only run the heavy regex on lines that
-        # look suspicious (multiple quotes, or brace-inside-brace).
         stripped = line.strip()
         if not stripped:
             continue
         dq = stripped.count('"')
-        ob = stripped.count('{') + stripped.count('[')
-        cb = stripped.count('}') + stripped.count(']')
-        # Signal: ≥3 quotes, OR ≥2 brace-opens with ≥2 brace-closes.
-        suspicious = dq >= 3 or (ob >= 2 and cb >= 2)
+        # Trigger ONLY on 3+ quote marks OR backslash-escaped brackets
+        # (another LLM pathology: `[\"[\ADC\]` with backslash escapes).
+        has_esc_brackets = "\\[" in stripped or "\\]" in stripped or "\\\"" in stripped
+        suspicious = dq >= 3 or has_esc_brackets
         if not suspicious:
             continue
         # Try to match: NODEID followed by opener to outermost closer.

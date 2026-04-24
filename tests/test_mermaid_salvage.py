@@ -460,3 +460,102 @@ class TestFixQuotedEdgeLabels:
         cleaned, fixes = salvage(raw)
         assert "fix_quoted_edge_labels" not in fixes
         assert 'A["My Node"]' in cleaned
+
+
+# ---------------------------------------------------------------------------
+# P19 — flatten-brace-hell: nested quotes + braces inside rhombus labels
+# Regression for the 2026-04-24 user screenshot:
+#   "Parse error on line 6: ...40}} BT1{{BiasT} / MBT-283+"} LNA1"L
+#    Expecting 'DIAMOND_STOP'"
+# ---------------------------------------------------------------------------
+
+class TestFlattenBraceHell:
+    """LLM-emitted rhombus labels with nested `{`, `}`, `"` are the
+    canonical "parse hell" case. Before salvage they produce mermaid
+    parse errors (Expecting DIAMOND_STOP); after salvage they become
+    plain `NODE["clean text"]` square-bracket nodes that always parse."""
+
+    def test_nested_braces_and_quotes_rewritten_to_square_bracket(self):
+        """The exact failure from the user's screenshot."""
+        raw = 'flowchart TD\n    BT1{"{BiasT}" / MBT-283+"}\n'
+        cleaned, fixes = salvage(raw)
+        assert "flatten_brace_hell" in fixes
+        # Node becomes `BT1["..."]` — the inner label text is cleaned.
+        assert 'BT1["' in cleaned
+        # Critical chars stripped: no leftover `"{...}"` constructs.
+        assert '{"' not in cleaned
+        assert '"}' not in cleaned
+        # Original part-number text preserved in some form.
+        assert "BiasT" in cleaned
+        assert "MBT-283" in cleaned
+
+    def test_well_formed_hexagon_with_simple_quoted_label_left_alone(self):
+        # `BPF1{{"Preselector / BPF-B140N+"}}` is VALID mermaid — a hexagon
+        # node with a quoted label containing `/` and `+`. It parses fine
+        # on mermaid's own parser. The flatten pass must NOT touch it,
+        # otherwise we lose the hexagon visual for no reason.
+        raw = 'flowchart TD\n    BPF1{{"Preselector / BPF-B140N+"}}\n'
+        cleaned, fixes = salvage(raw)
+        assert "flatten_brace_hell" not in fixes
+        # Original hexagon preserved.
+        assert 'BPF1{{"' in cleaned or "BPF1{{" in cleaned
+
+    def test_trapezoid_with_escaped_brackets(self):
+        # ADC1 with `[\"[\ADC\]` — escaped brackets inside quoted label.
+        raw = (
+            'flowchart TD\n'
+            '    ADC1[\\"[\\ADC\\] / AD4008BRMZ / 16-bit 500MSPS"\\]\n'
+        )
+        cleaned, fixes = salvage(raw)
+        assert "flatten_brace_hell" in fixes
+        assert 'ADC1["' in cleaned
+        # Part number must survive the flattening.
+        assert "AD4008BRMZ" in cleaned
+
+    def test_simple_well_formed_labels_left_alone(self):
+        # No false positives: `A[label]` and `B{rhombus}` with no nested
+        # quotes / braces must NOT be touched.
+        raw = 'flowchart TD\n    A[LNA] --> B{Decision}\n    B --> C[ADC]\n'
+        cleaned, fixes = salvage(raw)
+        assert "flatten_brace_hell" not in fixes
+        # Original rhombus shape preserved.
+        assert "B{Decision}" in cleaned
+        # Square bracket nodes left intact.
+        assert "A[LNA]" in cleaned
+        assert "C[ADC]" in cleaned
+
+    def test_normal_quoted_label_single_pair_left_alone(self):
+        # `A["Hello World"]` has 2 quotes, 1 `[`, 1 `]` — well-formed.
+        # Must NOT trigger the flattening (only 2 quotes = under threshold).
+        raw = 'flowchart TD\n    A["Hello World"] --> B\n'
+        cleaned, fixes = salvage(raw)
+        assert "flatten_brace_hell" not in fixes
+        assert 'A["Hello World"]' in cleaned
+
+    def test_full_channelised_fe_screenshot_line(self):
+        # End-to-end on the user's screenshot source. The BT1 line is the
+        # only truly-broken one (nested quotes AND unbalanced braces); the
+        # other nodes (ANT1, LIM1, LNA1) are valid mermaid with 2 quotes.
+        raw = (
+            'flowchart LR\n'
+            '    ANT1>"Antenna 5-18 GHz"]\n'
+            '    LIM1[/"Lim PE7602-6 IL 1.2 P+30max"\\]\n'
+            '    BT1{"{BiasT}" / MBT-283+"}\n'
+            '    LNA1>"LNA1 PMA3-352GLN+ G+12 NF2.5 P1+15"]\n'
+            '    ANT1 --> LIM1\n'
+            '    LIM1 --> BT1\n'
+            '    BT1 --> LNA1\n'
+        )
+        cleaned, fixes = salvage(raw)
+        # Brace-hell pass must fire for the BT1 line specifically.
+        assert "flatten_brace_hell" in fixes
+        # Edges must survive intact.
+        assert "ANT1 --> LIM1" in cleaned
+        assert "LIM1 --> BT1" in cleaned
+        assert "BT1 --> LNA1" in cleaned
+        # BT1's part number survives the flattening.
+        assert "MBT-283" in cleaned
+        # Other nodes' part numbers also survive (they may or may not
+        # have been flattened — either is fine, they're all valid now).
+        assert "PMA3-352GLN" in cleaned
+        assert "PE7602-6" in cleaned

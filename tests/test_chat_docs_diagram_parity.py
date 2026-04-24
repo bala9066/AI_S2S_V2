@@ -181,3 +181,33 @@ def test_chat_summary_omits_diagram_section_when_no_block_at_all():
     md = agent._build_response_summary(tool_input)
     assert "## System Block Diagram" not in md
     assert "## System Architecture" not in md
+
+
+# ---------------------------------------------------------------------------
+# P19 — architecture.md fallback when LLM skips the `architecture` spec
+# ---------------------------------------------------------------------------
+
+def test_generate_output_files_uses_block_diagram_as_architecture_fallback(tmp_path):
+    """User report (2026-04-24): architecture.md always shows only
+    "Architecture diagram will be generated with HRS." because the LLM
+    routinely skips the structured `architecture` spec on dense designs.
+
+    Fix (P19): when `arch_mermaid` is empty but `block_mermaid` is
+    present, write architecture.md reusing the block diagram content
+    with a clear note. Never leaves the user with an empty file."""
+    import inspect
+    from agents.requirements_agent import RequirementsAgent
+
+    # Whitebox check — the fallback branch must exist in the source.
+    src = inspect.getsource(RequirementsAgent._generate_output_files)
+    assert "elif block_mermaid:" in src, (
+        "_generate_output_files must have an `elif block_mermaid:` "
+        "branch that reuses the block diagram when architecture is "
+        "empty. Without this, architecture.md ships as a bare "
+        "placeholder on dense designs."
+    )
+    assert "Architecture view derived from the block diagram" in src, (
+        "The fallback branch must include an explanatory note so the "
+        "user understands the architecture.md is the block diagram, "
+        "not the LLM's intended architecture spec."
+    )
