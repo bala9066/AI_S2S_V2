@@ -332,10 +332,33 @@ Do NOT include schematic_data — it is auto-generated from your nodes/edges.
 Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
 """
 
-        response = await self.call_llm(
-            messages=[{"role": "user", "content": user_message}],
-            system=self.get_system_prompt(project_context),
-        )
+        # P26 (2026-04-25): wrap the LLM call in a try/except so that ANY
+        # LLM-side failure (network 404, Ollama not running, rate-limit,
+        # auth, model unavailable, timeout) lands on the SAME BOM-derived
+        # fallback path that already runs when the LLM responds without
+        # a tool call. Before this, an Ollama 404 (the actual cause of
+        # the user's 2026-04-25 P4 failure with project `gvv`) would
+        # raise out of `call_llm`, propagate up to PipelineService, and
+        # mark the whole phase failed — even though we could have built
+        # a perfectly valid netlist from `component_recommendations.md`
+        # with no LLM at all.
+        #
+        # Synthesise an empty `response` (no content, no tool_calls) on
+        # failure so the existing `if netlist_data: ... else:` flow takes
+        # the BOM-build branch automatically. The fallback path writes
+        # all the same files, runs DRC, and reports success when DRC
+        # passes — exactly what the user wants when the LLM is down.
+        try:
+            response = await self.call_llm(
+                messages=[{"role": "user", "content": user_message}],
+                system=self.get_system_prompt(project_context),
+            )
+        except Exception as exc:
+            logger.warning(
+                "P4: LLM call failed (%s) — falling back to BOM-derived netlist",
+                str(exc)[:200],
+            )
+            response = {"content": "", "tool_calls": []}
 
         outputs = {}
         netlist_data = None

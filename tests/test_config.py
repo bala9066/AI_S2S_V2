@@ -118,6 +118,154 @@ class TestSettingsFallbackChain:
         assert chain == ["custom-primary", "custom-fast", "custom-fallback", "custom-last"]
 
 
+class TestSettingsOllamaExclusion:
+    """Regression tests for the 2026-04-25 'Ollama 404 → P4 phase failed' fix.
+
+    Before the fix, `last_resort_model` defaulted to
+    `ollama/qwen2.5-coder:32b` regardless of whether the user actually had
+    Ollama installed (or had that specific model pulled). When the cloud
+    LLMs hit a transient error AND Ollama 404'd at `localhost:11434`, the
+    fallback chain reported "All models in fallback chain failed" — even
+    though the cloud LLMs were perfectly fine on retry. This made every
+    netlist (P4) failure look like an Ollama issue.
+
+    Fix: with a cloud key set, Ollama is no longer in the chain by default.
+    Set `INCLUDE_OLLAMA_FALLBACK=true` to opt back in.
+    """
+
+    def test_no_ollama_in_chain_when_glm_only(self):
+        """With only GLM_API_KEY set, the chain MUST NOT include any
+        ollama/* entry — that's the user's actual production config.
+
+        NOTE on env handling: must set sister keys to "" (not delete) to
+        suppress dotenv re-injection on `reload(config)` — see
+        `test_ollama_included_in_pure_air_gap` docstring.
+        """
+        original_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ["GLM_API_KEY"] = "fake-glm-key"
+            os.environ["DEEPSEEK_API_KEY"] = ""
+            os.environ["ANTHROPIC_API_KEY"] = ""
+            from importlib import reload
+            import config as _config
+            reload(_config)
+            chain = _config.Settings().fallback_chain
+            assert chain, "fallback chain should not be empty"
+            assert not any(m.startswith("ollama") for m in chain), (
+                f"Ollama leaked into fallback chain when only GLM key set: {chain}"
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(original_env)
+            from importlib import reload
+            import config as _config
+            reload(_config)
+
+    def test_no_ollama_in_chain_when_glm_and_deepseek(self):
+        """User's actual .env has GLM + DeepSeek. Chain must be cloud-only."""
+        original_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ["GLM_API_KEY"] = "fake-glm-key"
+            os.environ["DEEPSEEK_API_KEY"] = "fake-deepseek-key"
+            from importlib import reload
+            import config as _config
+            reload(_config)
+            chain = _config.Settings().fallback_chain
+            assert not any(m.startswith("ollama") for m in chain), (
+                f"Ollama leaked into chain when GLM+DeepSeek both set: {chain}"
+            )
+            # And both cloud providers should be reachable in the chain.
+            assert any("glm" in m for m in chain), f"GLM missing from chain: {chain}"
+            assert any("deepseek" in m for m in chain), (
+                f"DeepSeek missing from chain: {chain}"
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(original_env)
+            from importlib import reload
+            import config as _config
+            reload(_config)
+
+    def test_ollama_included_in_pure_air_gap(self):
+        """When NO cloud keys are set, Ollama is the only option — auto-include
+        it (true air-gap mode).
+
+        NOTE: must set keys to empty strings (not just delete) so that the
+        on-import `load_dotenv()` call in config.py does NOT repopulate them
+        from the project's .env file. `load_dotenv` skips keys already
+        present in `os.environ`, including empty-string ones.
+        """
+        original_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ["GLM_API_KEY"] = ""
+            os.environ["DEEPSEEK_API_KEY"] = ""
+            os.environ["ANTHROPIC_API_KEY"] = ""
+            from importlib import reload
+            import config as _config
+            reload(_config)
+            chain = _config.Settings().fallback_chain
+            assert any(m.startswith("ollama") for m in chain), (
+                f"Ollama must be included in pure air-gap mode but chain is: {chain}"
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(original_env)
+            from importlib import reload
+            import config as _config
+            reload(_config)
+
+    def test_ollama_opt_in_via_env(self):
+        """Power-user override: INCLUDE_OLLAMA_FALLBACK=true forces Ollama
+        back into the chain even when cloud keys are set."""
+        original_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ["GLM_API_KEY"] = "fake-glm-key"
+            os.environ["INCLUDE_OLLAMA_FALLBACK"] = "true"
+            from importlib import reload
+            import config as _config
+            reload(_config)
+            chain = _config.Settings().fallback_chain
+            assert any(m.startswith("ollama") for m in chain), (
+                f"INCLUDE_OLLAMA_FALLBACK=true was ignored — chain: {chain}"
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(original_env)
+            from importlib import reload
+            import config as _config
+            reload(_config)
+
+    def test_fallback_chain_dedupes(self):
+        """If FAST_MODEL == PRIMARY_MODEL (user's .env has GLM_FAST_MODEL=glm-5.1
+        and PRIMARY_MODEL=glm-5.1), chain must collapse the duplicate so
+        we don't waste a slot on the same model twice."""
+        original_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ["GLM_API_KEY"] = "fake-glm-key"
+            os.environ["PRIMARY_MODEL"] = "same-model"
+            os.environ["FAST_MODEL"] = "same-model"
+            os.environ["FALLBACK_MODEL"] = "different-model"
+            from importlib import reload
+            import config as _config
+            reload(_config)
+            chain = _config.Settings().fallback_chain
+            assert chain.count("same-model") == 1, (
+                f"chain failed to dedupe: {chain}"
+            )
+            assert "different-model" in chain
+        finally:
+            os.environ.clear()
+            os.environ.update(original_env)
+            from importlib import reload
+            import config as _config
+            reload(_config)
+
+
 class TestSettingsAirGap:
     """Test air-gapped mode detection."""
 

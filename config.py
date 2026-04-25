@@ -65,10 +65,30 @@ class Settings:
         # Priority (auto-detected from available API keys):
         #   GLM via Z.AI  → primary when GLM_API_KEY is set (cheapest, Anthropic-compatible API)
         #   DeepSeek-V3   → fallback when DEEPSEEK_API_KEY is set
-        #   Ollama local  → air-gap / last resort
+        #   Ollama local  → ONLY when no cloud key is set (true air-gap mode), or
+        #                    when the user explicitly opts in via INCLUDE_OLLAMA_FALLBACK=true
         # Override any of these via PRIMARY_MODEL / FAST_MODEL env vars in .env.
+        #
+        # IMPORTANT (2026-04-25 — fix for "Ollama 404 → P4 phase failed"):
+        # Ollama is NOT included in the fallback chain by default when a cloud
+        # LLM key is configured. Previously last_resort_model was always
+        # `ollama/qwen2.5-coder:32b`, which produced a misleading
+        # "All models in fallback chain failed. Last error: Client error
+        # '404 Not Found' for url 'http://localhost:11434/api/chat'"
+        # whenever Ollama was either offline or didn't have that specific
+        # model installed — even though the cloud LLMs were working fine on
+        # subsequent retries. Air-gap users can still get Ollama by setting
+        # `INCLUDE_OLLAMA_FALLBACK=true` in .env, or by clearing all cloud
+        # API keys (auto-detected below).
         _has_glm      = bool(_env("GLM_API_KEY", ""))
         _has_deepseek = bool(_env("DEEPSEEK_API_KEY", ""))
+        _has_anthropic = bool(_env("ANTHROPIC_API_KEY", ""))
+        _has_any_cloud = _has_glm or _has_deepseek or _has_anthropic
+        _include_ollama = (
+            _env_bool("INCLUDE_OLLAMA_FALLBACK", False)
+            or not _has_any_cloud  # auto-include only in pure air-gap mode
+        )
+        _ollama_default = "ollama/qwen2.5-coder:32b" if _include_ollama else ""
         self.primary_model = _env("PRIMARY_MODEL",
             "glm-4.7"      if _has_glm      else
             "deepseek-chat" if _has_deepseek else
@@ -79,8 +99,8 @@ class Settings:
             "ollama/qwen2.5-coder:32b")
         self.fallback_model = _env("FALLBACK_MODEL",
             "deepseek-chat" if (_has_glm and _has_deepseek) else
-            "ollama/qwen2.5-coder:32b")
-        self.last_resort_model = _env("LAST_RESORT_MODEL", "ollama/qwen2.5-coder:32b")
+            _ollama_default)
+        self.last_resort_model = _env("LAST_RESORT_MODEL", _ollama_default)
 
         # --- Ollama (Air-Gap) ---
         self.ollama_base_url = _env("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -143,12 +163,29 @@ class Settings:
 
     @property
     def fallback_chain(self) -> list:
-        return [
+        """Ordered list of models to try, with empty entries removed and
+        duplicates collapsed (so a chain like
+        [glm-5.1, glm-5.1, deepseek-chat, ""] becomes
+        [glm-5.1, deepseek-chat]).
+
+        Empty strings come from `last_resort_model` / `fallback_model`
+        being unset when the user has cloud keys but explicitly opted out
+        of the Ollama air-gap fallback (default behaviour now — see the
+        note in `__init__`)."""
+        raw = [
             self.primary_model,
             self.fast_model,
             self.fallback_model,
             self.last_resort_model,
         ]
+        seen: set[str] = set()
+        chain: list[str] = []
+        for m in raw:
+            if not m or m in seen:
+                continue
+            seen.add(m)
+            chain.append(m)
+        return chain
 
     @property
     def has_any_llm_key(self) -> bool:
