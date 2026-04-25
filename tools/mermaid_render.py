@@ -334,22 +334,26 @@ def _render_node(n: Node) -> str:
 
 
 def _render_edge(edge: Edge) -> str:
-    """Render a single edge: `A --> B` or `A -- "label" --> B`."""
+    """Render a single edge: `A --> B` or `A -->|label| B`.
+
+    Uses pipe-form edge labels (`A -->|label| B`) which is mermaid's most
+    universally-compatible label syntax — the dash-quoted form
+    `A -- "label" --> B` has caused intermittent parse failures across
+    older mermaid versions and the mermaid.ink HTTP API. Pipe form
+    works in mermaid.js (browser), mmdc CLI, and mermaid.ink without
+    exception.
+
+    Pipe content can contain anything except the literal `|` (which we
+    swap to `/` in `_escape_label`). Quotes inside pipe-form labels are
+    rendered literally — no escaping required.
+    """
     e = _normalise_edge(edge)  # type: ignore[arg-type]
     arrow = _ARROW_BY_STYLE.get(e.get("style") or "solid", "-->")
     label = e.get("label")
     if label:
-        safe = _escape_label(label)
-        # Mermaid edge-label form: `A -- "label" --> B`. For dotted/thick
-        # variants, the centre differs; but the arrow-style-with-label is
-        # consistent: replace `-->` with `-- "..." -->` / `-. "..." .->` /
-        # `== "..." ==>`.
-        if arrow == "-->":
-            return f'{e["from_"]} -- "{safe}" --> {e["to"]}'
-        if arrow == "-.->":
-            return f'{e["from_"]} -. "{safe}" .-> {e["to"]}'
-        if arrow == "==>":
-            return f'{e["from_"]} == "{safe}" ==> {e["to"]}'
+        safe = _escape_label(label).replace("|", "/").replace('"', "")
+        # Pipe-form: `A -->|text| B`, `A -.->|text| B`, `A ==>|text| B`.
+        return f'{e["from_"]} {arrow}|{safe}| {e["to"]}'
     return f'{e["from_"]} {arrow} {e["to"]}'
 
 

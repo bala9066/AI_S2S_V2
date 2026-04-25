@@ -85,7 +85,11 @@ def test_minimal_valid_spec():
     assert "A --> B" in out
 
 
-def test_edge_label_renders_in_quoted_form():
+def test_edge_label_renders_in_pipe_form():
+    """Edge labels are emitted in mermaid's pipe form `A -->|label| B`,
+    which is universally compatible across mermaid.js, mmdc, and the
+    mermaid.ink HTTP API. The dash-quoted form `A -- "label" --> B`
+    has caused intermittent parse failures (P26 #11, 2026-04-25)."""
     spec = {
         "nodes": [
             {"id": "A", "label": "a", "shape": "rect"},
@@ -94,7 +98,9 @@ def test_edge_label_renders_in_quoted_form():
         "edges": [{"from": "A", "to": "B", "label": "50 Ohm"}],
     }
     out = render_block_diagram(spec)
-    assert 'A -- "50 Ohm" --> B' in out
+    assert "A -->|50 Ohm| B" in out
+    # The legacy dash-quoted form must NOT appear.
+    assert 'A -- "50 Ohm" -->' not in out
 
 
 def test_edge_style_dotted_and_thick():

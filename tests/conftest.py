@@ -16,6 +16,18 @@ from httpx import Response
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Add project-local `bin/` to PATH so `shutil.which("pandoc")` finds the
+# bundled pandoc.exe (Windows dev install per .gitignore). Without this,
+# tests that skip on `pandoc not installed` are skipped on dev boxes that
+# DO have pandoc bundled in the repo. Idempotent — safe to run multiple
+# times.
+_BIN_DIR = Path(__file__).parent.parent / "bin"
+if _BIN_DIR.exists():
+    _path_sep = os.pathsep
+    _current_path = os.environ.get("PATH", "")
+    if str(_BIN_DIR) not in _current_path.split(_path_sep):
+        os.environ["PATH"] = str(_BIN_DIR) + _path_sep + _current_path
+
 
 @pytest.fixture(scope="session")
 def event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:

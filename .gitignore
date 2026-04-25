@@ -76,3 +76,9 @@ hardware-pipeline-v5-react/C:\*
 *.db-shm
 *.db-wal
 *.db-journal
+
+# Pandoc Windows binary — installed locally per dev box, NOT committed
+# (231MB exe). On Docker/CI pandoc is installed system-wide via apt-get.
+# `main.py::_resolve_pandoc()` checks `bin/pandoc.exe` first, then PATH.
+bin/pandoc.exe
+tools/pandoc_dl/
