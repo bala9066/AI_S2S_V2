@@ -9,8 +9,18 @@ Outputs:
   - fpga_testbench.v        — Self-checking SystemVerilog testbench
   - constraints.xdc         — Vivado XDC timing & I/O constraints
   - fpga_design_report.md   — Design summary (resource estimate, FSM diagram, timing)
+
+P26 #8 (2026-04-25): refactored to PARALLEL sub-calls.
+Previously a single LLM call returned ALL 4 outputs in one ~16K-token
+response, taking 5-12 minutes (LLM generates ~50 tokens/s). Now we
+split into 1 fast metadata call + 4 parallel content calls (one per
+output file). Wall-time drops from ~10 min to ~1.5 min while keeping
+the outputs consistent (all 4 content calls see the SAME metadata —
+module name, port list, clock freq — so the testbench instantiates
+the right module, the XDC pins match the Verilog ports, etc.).
 """
 
+import asyncio
 import logging
 import re
 from pathlib import Path
@@ -100,6 +110,145 @@ GENERATE_FPGA_TOOL = {
 }
 
 # ---------------------------------------------------------------------------
+# P26 #8 (2026-04-25) — split tools for parallel sub-call generation.
+# Each tool produces ONE output file. They all share the same metadata
+# (module name, ports, clock freq) which is generated upfront in a small
+# fast call so the parallel content generators stay consistent.
+# ---------------------------------------------------------------------------
+
+GENERATE_FPGA_METADATA_TOOL = {
+    "name": "generate_fpga_metadata",
+    "description": (
+        "Step 1 of FPGA generation: emit ONLY the design metadata "
+        "(module name, clock, FPGA part, port list, FSMs, resource "
+        "estimate). Subsequent parallel calls will generate the "
+        "Verilog/testbench/XDC/summary files using THIS metadata as "
+        "the consistency contract — keep names and bit-widths short "
+        "and final, no inventing them later."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "module_name":           {"type": "string"},
+            "clock_frequency_mhz":   {"type": "number"},
+            "fpga_part":             {"type": "string"},
+            "ports": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":        {"type": "string"},
+                        "direction":   {"type": "string"},
+                        "width":       {"type": "integer"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["name", "direction", "width"],
+                },
+            },
+            "state_machines": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":        {"type": "string"},
+                        "states":      {"type": "array", "items": {"type": "string"}},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["name", "states"],
+                },
+            },
+            "lut_estimate": {"type": "integer"},
+            "ff_estimate":  {"type": "integer"},
+        },
+        "required": [
+            "module_name", "clock_frequency_mhz", "fpga_part", "ports",
+        ],
+    },
+}
+
+GENERATE_VERILOG_TOOL = {
+    "name": "generate_verilog_top",
+    "description": (
+        "Step 2a: emit the COMPLETE synthesisable Verilog top module "
+        "(`fpga_top.v`) using the metadata established in Step 1. "
+        "Module name, port list, clock freq MUST match the metadata "
+        "exactly — testbench / XDC files are being generated in "
+        "parallel with the same metadata and any divergence breaks "
+        "the design."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "verilog_top": {
+                "type": "string",
+                "description": "Complete synthesisable Verilog source.",
+            },
+        },
+        "required": ["verilog_top"],
+    },
+}
+
+GENERATE_TESTBENCH_TOOL = {
+    "name": "generate_testbench",
+    "description": (
+        "Step 2b: emit the COMPLETE SystemVerilog testbench "
+        "(`fpga_testbench.v`) for the module described in the "
+        "metadata. The DUT instantiation MUST use the metadata's "
+        "module name and port list."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "testbench": {
+                "type": "string",
+                "description": "Complete SystemVerilog testbench source.",
+            },
+        },
+        "required": ["testbench"],
+    },
+}
+
+GENERATE_XDC_TOOL = {
+    "name": "generate_xdc_constraints",
+    "description": (
+        "Step 2c: emit the COMPLETE Vivado XDC file content. Pin "
+        "assignments MUST reference the metadata's port names "
+        "exactly. Clock constraints MUST use the metadata's clock "
+        "frequency."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "xdc_constraints": {
+                "type": "string",
+                "description": "Complete Vivado XDC file content.",
+            },
+        },
+        "required": ["xdc_constraints"],
+    },
+}
+
+GENERATE_SUMMARY_TOOL = {
+    "name": "generate_design_summary",
+    "description": (
+        "Step 2d: emit a human-readable design summary covering the "
+        "Verilog/testbench/XDC files generated in Steps 2a/2b/2c. "
+        "Include resource estimate, key design decisions, FSM "
+        "encoding choices, timing closure notes."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "design_summary": {
+                "type": "string",
+                "description": "Human-readable design summary (markdown OK).",
+            },
+        },
+        "required": ["design_summary"],
+    },
+}
+
+# ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
 
@@ -177,7 +326,18 @@ class FpgaAgent(BaseAgent):
             phase_number="P7",
             phase_name="FPGA Design",
             model=settings.primary_model,
-            tools=[GENERATE_FPGA_TOOL],
+            # P26 #8 — tools list now includes ALL split tools so the LLM
+            # can call them. The legacy `generate_fpga_design` is kept as
+            # a fallback path (used when the metadata sub-call returns
+            # `degraded` from the LLM chain — see `execute()`).
+            tools=[
+                GENERATE_FPGA_METADATA_TOOL,
+                GENERATE_VERILOG_TOOL,
+                GENERATE_TESTBENCH_TOOL,
+                GENERATE_XDC_TOOL,
+                GENERATE_SUMMARY_TOOL,
+                GENERATE_FPGA_TOOL,
+            ],
             max_tokens=16384,
         )
 
@@ -242,44 +402,144 @@ Use the `generate_fpga_design` tool to return:
 Map all registers from the RDT to the register bus. Implement all FSMs identified in the GLR.
 """
 
-        messages = [{"role": "user", "content": user_message}]
-        response = await self.call_llm(
-            messages=messages,
+        # P26 #8 (2026-04-25) — PARALLEL split.
+        #
+        # Step 1: tiny metadata call (~30s) returns module name, port
+        # list, clock freq, FPGA part, FSMs, resource estimates. The
+        # LLM agrees to a small set of design parameters that the
+        # parallel content calls below all share — this is what keeps
+        # the testbench's DUT instantiation, the XDC's pin assignments,
+        # and the design summary all consistent with the Verilog top.
+        #
+        # Step 2: 4 parallel content calls (~60s each, but run
+        # concurrently → ~60s total wall time) generate one file each.
+        # Total wall time: ~90s vs. the previous ~10 min single-call.
+        meta_messages = [{"role": "user", "content": (
+            f"{user_message}\n\n"
+            "Step 1 of 2: call ONLY `generate_fpga_metadata` to lock "
+            "the module name, port list, clock frequency, target FPGA "
+            "part, FSM names, and rough LUT/FF estimate. Step 2 will "
+            "fill in the actual Verilog/testbench/XDC/summary content "
+            "in parallel using your metadata as the contract — KEEP "
+            "names short, final, and consistent so they don't drift."
+        )}]
+        meta_response = await self.call_llm(
+            messages=meta_messages,
             system=self.get_system_prompt(project_context),
+            tool_choice={"type": "tool", "name": "generate_fpga_metadata"},
         )
-
-        fpga_data = None
-
-        if response.get("tool_calls"):
-            for tc in response["tool_calls"]:
-                if tc["name"] == "generate_fpga_design":
-                    fpga_data = tc["input"]
+        metadata = None
+        if meta_response.get("tool_calls"):
+            for tc in meta_response["tool_calls"]:
+                if tc["name"] == "generate_fpga_metadata":
+                    metadata = tc["input"]
                     break
 
-        # Retry up to 2 times with increasing force if tool not called.
-        # Skip retries when chain is exhausted (`degraded=True`).
-        for attempt in range(1, 3):
-            if fpga_data or response.get("degraded"):
-                break
-            logger.warning(f"P7: tool not called — retry {attempt}/2 (forcing tool_choice)")
-            retry_response = await self.call_llm(
-                messages=messages + [
-                    {"role": "assistant", "content": response.get("content", "")},
-                    {"role": "user", "content": (
-                        "You MUST call the `generate_fpga_design` tool NOW. "
-                        "Do NOT write any prose. Your ONLY output must be a tool_use call to "
-                        "`generate_fpga_design` with complete Verilog, testbench, XDC, and report."
-                    )},
-                ],
-                system=self.get_system_prompt(project_context),
-                tool_choice={"type": "tool", "name": "generate_fpga_design"},
+        fpga_data = None
+        response = meta_response
+        if metadata and not meta_response.get("degraded"):
+            import json as _json
+            meta_summary = (
+                "## Locked-in design metadata (Step 1 output)\n"
+                "Use these EXACTLY — do NOT invent new module names "
+                "or port names; the other 3 sub-calls running in "
+                "parallel use the same metadata so divergence will "
+                "break the design.\n\n"
+                f"```json\n{_json.dumps(metadata, indent=2)[:4000]}\n```\n"
             )
-            if retry_response.get("tool_calls"):
-                for tc in retry_response["tool_calls"]:
+            content_messages = [{"role": "user", "content": (
+                f"{user_message}\n\n{meta_summary}\n\n"
+                "Step 2 of 2: emit ONLY this one content tool's output."
+            )}]
+            sys_prompt = self.get_system_prompt(project_context)
+
+            async def _gen_section(tool_name: str) -> dict | None:
+                """Fire one content tool call. On any failure (chain
+                exhausted, rate-limit timeout, tool not called) return
+                None so the caller can fall back without aborting the
+                whole phase."""
+                try:
+                    resp = await self.call_llm(
+                        messages=content_messages,
+                        system=sys_prompt,
+                        tool_choice={"type": "tool", "name": tool_name},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "P7 sub-call %s raised: %s",
+                        tool_name, str(exc)[:200],
+                    )
+                    return None
+                if resp.get("tool_calls"):
+                    for tc in resp["tool_calls"]:
+                        if tc["name"] == tool_name:
+                            return tc["input"]
+                return None
+
+            self.log("P7: dispatching 4 parallel content sub-calls "
+                     "(verilog_top + testbench + xdc + summary)")
+            verilog_res, tb_res, xdc_res, summary_res = await asyncio.gather(
+                _gen_section("generate_verilog_top"),
+                _gen_section("generate_testbench"),
+                _gen_section("generate_xdc_constraints"),
+                _gen_section("generate_design_summary"),
+                return_exceptions=False,
+            )
+            fpga_data = dict(metadata)
+            fpga_data["verilog_top"]     = (verilog_res or {}).get("verilog_top", "")
+            fpga_data["testbench"]       = (tb_res      or {}).get("testbench", "")
+            fpga_data["xdc_constraints"] = (xdc_res     or {}).get("xdc_constraints", "")
+            fpga_data["design_summary"]  = (summary_res or {}).get("design_summary", "")
+            # If ALL 4 came back empty, treat as failure and fall
+            # through to the legacy single-call path below.
+            if not any([fpga_data["verilog_top"],
+                        fpga_data["testbench"],
+                        fpga_data["xdc_constraints"],
+                        fpga_data["design_summary"]]):
+                logger.warning(
+                    "P7: all 4 parallel sub-calls returned empty — "
+                    "falling back to legacy single-call path"
+                )
+                fpga_data = None
+
+        # Legacy single-call fallback (used when the metadata call
+        # failed OR all 4 parallel sub-calls returned empty).
+        if not fpga_data:
+            messages = [{"role": "user", "content": user_message}]
+            response = await self.call_llm(
+                messages=messages,
+                system=self.get_system_prompt(project_context),
+            )
+            if response.get("tool_calls"):
+                for tc in response["tool_calls"]:
                     if tc["name"] == "generate_fpga_design":
                         fpga_data = tc["input"]
-                        response = retry_response
                         break
+
+            # Retry up to 2 times with increasing force if tool not called.
+            # Skip retries when chain is exhausted (`degraded=True`).
+            for attempt in range(1, 3):
+                if fpga_data or response.get("degraded"):
+                    break
+                logger.warning(f"P7: tool not called — retry {attempt}/2 (forcing tool_choice)")
+                retry_response = await self.call_llm(
+                    messages=messages + [
+                        {"role": "assistant", "content": response.get("content", "")},
+                        {"role": "user", "content": (
+                            "You MUST call the `generate_fpga_design` tool NOW. "
+                            "Do NOT write any prose. Your ONLY output must be a tool_use call to "
+                            "`generate_fpga_design` with complete Verilog, testbench, XDC, and report."
+                        )},
+                    ],
+                    system=self.get_system_prompt(project_context),
+                    tool_choice={"type": "tool", "name": "generate_fpga_design"},
+                )
+                if retry_response.get("tool_calls"):
+                    for tc in retry_response["tool_calls"]:
+                        if tc["name"] == "generate_fpga_design":
+                            fpga_data = tc["input"]
+                            response = retry_response
+                            break
 
         outputs: Dict[str, str] = {}
 
