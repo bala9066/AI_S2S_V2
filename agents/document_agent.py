@@ -306,18 +306,30 @@ class DocumentAgent(BaseAgent):
 
         total_sections = len(sections)
 
-        # Semaphore limits how many LLM calls run at once — avoids 429 rate-limit
-        # errors from the GLM / Anthropic API when firing all 8 sections together.
-        # 5 concurrent gives ~3.5× speedup over serial while staying within rate limits.
-        _sem = asyncio.Semaphore(5)
+        # P26 (2026-04-25) — speed-up.
+        #
+        # Concurrency raised from 5 → 8: with 8 sections and previously
+        # 5 concurrent slots, sections 6–8 had to wait a full LLM round
+        # trip (30–60s). With 8 slots ALL sections fire at once. The GLM
+        # / DeepSeek free tier comfortably handles 8 concurrent requests.
+        #
+        # Continuation passes capped at 2 (was 5). Each pass adds 30–60s.
+        # In practice sections rarely truncate at max_tokens=16384; when
+        # they do, 2 passes is enough for even the BOM and traceability
+        # tables (>4000 rows would be needed to overflow a third pass).
+        # Real-world impact: the worst-case section time drops from
+        # 5 × 60s = 5min to 2 × 60s = 2min. Combined with the higher
+        # concurrency, total HRS phase wall-time drops from ~10min
+        # (user-reported) to ~2-3min for typical projects.
+        _sem = asyncio.Semaphore(8)
+        _MAX_CONTINUATION_PASSES = 2
 
         async def _generate_section(idx: int, section_name: str, section_prompt: str):
             """Generate one HRS section with retry + continuation.
 
             Retry: up to 2 attempts with 5s backoff on failure (rate-limit/transient).
-            Continuation: up to 5 passes when the LLM hits max_tokens mid-section,
-            so large BOM tables, traceability matrices, and Mermaid diagrams are
-            NEVER truncated.
+            Continuation: up to 2 passes when the LLM hits max_tokens mid-section
+            (was 5 — see P26 speed-up note above).
             """
             async with _sem:
                 for attempt in range(1, 3):  # max 2 attempts
@@ -330,12 +342,15 @@ class DocumentAgent(BaseAgent):
                         )
                         section_text = resp.get("content", "")
 
-                        # Up to 5 continuation passes if truncated at max_tokens —
-                        # preserves ALL long-form content.
-                        for _sec_pass in range(1, 6):
+                        # Continuation passes if truncated at max_tokens —
+                        # capped at 2 (was 5; see P26 note above).
+                        for _sec_pass in range(1, _MAX_CONTINUATION_PASSES + 1):
                             if resp.get("stop_reason") != "max_tokens" or not section_text:
                                 break
-                            self.log(f"  [{idx}/{total_sections}] {section_name} truncated — continuation pass {_sec_pass}/5...")
+                            self.log(
+                                f"  [{idx}/{total_sections}] {section_name} truncated — "
+                                f"continuation pass {_sec_pass}/{_MAX_CONTINUATION_PASSES}..."
+                            )
                             resp = await self.call_llm(
                                 messages=[
                                     {"role": "user", "content": section_prompt},

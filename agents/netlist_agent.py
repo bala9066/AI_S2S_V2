@@ -663,21 +663,62 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             except Exception as _sdrc_exc:
                 self.log(f"schematic_drc_failed: {_sdrc_exc}", "warning")
 
-        # Phase only flips to "complete" when structured DRC clears with
-        # zero critical / high violations. Outputs are still written so
-        # the operator can inspect what was generated, but the UI shows
-        # the failure state and refuses to advance to P5 until the
-        # binding gap is fixed.
+        # Phase completion gate.
+        #
+        # P26 (2026-04-25) — UX FIX for "netlist generated but showing
+        # FAILED status". User report: P4 sidebar shows red "Failed —
+        # click to retry" but the Documents tab actually has a fully
+        # rendered schematic with 19 symbols / 22 nets and the
+        # AUTO-SYNTHESIZED tag. Reason: the BOM-fallback path is known
+        # to produce approximate connectivity (the LLM-emitted netlist
+        # would have proper pin maps; auto-synth uses heuristics) — so
+        # DRC reports `high` or `critical` violations on roughly every
+        # AUTO-SYNTHESIZED run. Gating phase_complete on DRC means the
+        # phase is marked failed even when the netlist is structurally
+        # complete and visible.
+        #
+        # New gate:
+        #   - LLM-success path (real LLM-emitted netlist with full pin
+        #     maps): keep DRC gate. If critical/high violations, mark
+        #     failed so the operator fixes them before P5.
+        #   - BOM-fallback (auto-synthesized): mark COMPLETED whenever
+        #     `outputs` contains a netlist.json. The AUTO-SYNTHESIZED
+        #     tag in the UI already tells the operator the connectivity
+        #     is approximate; DRC summary is appended to response_text
+        #     so they can see what to fix manually in P5.
+        #
+        # This matches the user's mental model: "if the schematic
+        # rendered, the phase succeeded — DRC warnings are info."
         response_text = response.get("content", "Netlist generated.")
+        is_auto_synth = (
+            netlist_data is None
+            or (response.get("tool_calls") in (None, []))
+        )
         if drc_summary:
             response_text = f"{response_text}\n\n{drc_summary}"
             if not drc_passed:
-                response_text += (
-                    " — phase blocked until critical/high violations clear."
-                )
+                if is_auto_synth:
+                    response_text += (
+                        " — auto-synthesized from BOM, please review the "
+                        "schematic and address DRC warnings before PCB "
+                        "layout."
+                    )
+                else:
+                    response_text += (
+                        " — phase blocked until critical/high violations clear."
+                    )
+        # The phase is "complete" if EITHER:
+        #   (a) we ran the LLM-success path AND DRC passed, OR
+        #   (b) we ran the BOM-fallback AND produced a netlist.json.
+        # Empty `outputs` (no netlist at all) always fails.
+        has_netlist = bool(outputs.get("netlist.json"))
+        if is_auto_synth:
+            phase_complete = has_netlist
+        else:
+            phase_complete = drc_passed and has_netlist
         return {
             "response": response_text,
-            "phase_complete": drc_passed,
+            "phase_complete": phase_complete,
             "outputs": outputs,
         }
 

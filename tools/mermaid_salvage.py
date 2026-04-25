@@ -119,6 +119,73 @@ def _step_normalise_arrows(text: str) -> tuple[str, Optional[str]]:
     return text, None
 
 
+def _step_neutralise_br_tags(text: str) -> tuple[str, Optional[str]]:
+    """Step B-post (2026-04-25) — `<br/>` and `<br />` self-closing HTML
+    tags → `<br>` (mermaid's accepted form).
+
+    Why this matters: mermaid does accept `<br>` inside double-quoted
+    labels for line-break rendering, but the SELF-CLOSING `<br/>` form
+    confuses our own `_step_quote_dangerous_labels` step downstream — the
+    `<` and `>` chars inside `<br/>` make it think the label has hostile
+    characters, triggers a re-quote pass, and produces broken output like
+    `LABEL<br/>"text"<br/>"more"` (extra quotes around every <br>).
+
+    Real failing input from project `gvv` / `hdhf` (2026-04-25):
+        ADC_DIGITAL[\\"ADC / AD9627<br/>+1.8V analog<br/>+3.3V digital"\\]
+    After this step the `<br/>` is normalised so the dangerous-char
+    detector doesn't fire and the trapezoid survives later steps intact.
+    """
+    original = text
+    text = re.sub(r"<br\s*/>", "<br>", text, flags=re.IGNORECASE)
+    if text != original:
+        return text, "neutralise_br_tags"
+    return text, None
+
+
+def _step_normalise_shape_quotes(text: str) -> tuple[str, Optional[str]]:
+    """Step B-post-2 (2026-04-25) — strip REDUNDANT internal quotes from
+    asymmetric / trapezoid / parallelogram shapes that mermaid does NOT
+    require quotes on:
+
+        ADC_DIGITAL[\\"ADC / AD9627"\\]   →  ADC_DIGITAL[\\ADC / AD9627\\]
+        LVDS_OUT[/"LVDS data"/]           →  LVDS_OUT[/LVDS data/]
+        P28V>"+28 VDC Primary"]           →  P28V>+28 VDC Primary]
+
+    The LLM (when JSON-serialising its tool input and emitting Mermaid as
+    a string field) frequently leaks JSON-escape artefacts like `[\\"...\\"\\]`
+    into the text. Mermaid's own parser is tolerant of these in some
+    versions but our `_step_flatten_brace_hell` heuristic — which strips
+    backslashes, quotes, and angle brackets from over-quoted labels —
+    sees the leaked `\\"` and `<br/>` chars together and over-flattens
+    the entire node, mangling shape delimiters.
+
+    Pre-stripping the redundant inner quotes here means the trapezoid
+    shape stays intact through later steps and renders correctly."""
+    original = text
+    # Trapezoid `[\..\]` — the `\` chars here are the SHAPE delimiters, not
+    # escape characters. The `[\"label"\]` form has redundant inner quotes.
+    text = re.sub(
+        r'\[\\\s*"([^"]*)"\s*\\\]',
+        lambda m: f'[\\{m.group(1).strip()}\\]',
+        text,
+    )
+    # Parallelogram `[/.../]` — same redundant-quote pattern.
+    text = re.sub(
+        r'\[/\s*"([^"]*)"\s*/\]',
+        lambda m: f'[/{m.group(1).strip()}/]',
+        text,
+    )
+    # Inverted parallelogram `[\\..\\]` (two backslashes per side).
+    text = re.sub(
+        r'\[\\\\\s*"([^"]*)"\s*\\\\\]',
+        lambda m: f'[\\\\{m.group(1).strip()}\\\\]',
+        text,
+    )
+    if text != original:
+        return text, "normalise_shape_quotes"
+    return text, None
+
+
 def _step_strip_frontmatter(text: str) -> tuple[str, Optional[str]]:
     """Step C — drop `%%{init ...}%%` and `%% comment` lines."""
     original = text
@@ -215,6 +282,13 @@ def _step_quote_dangerous_labels(text: str) -> tuple[str, Optional[str]]:
     changed_any = False
 
     # Each pattern captures (open_delim, inner, close_delim).
+    # P26 (2026-04-25): the bare `[..]` rect pattern was greedily matching
+    # `[\..\]` trapezoid and `[/.../]` parallelogram shapes too, then
+    # re-quoting their labels (which contained `<br>` HTML breaks → caught
+    # by the dangerous-char detector). Result: `[\label\]` got mangled
+    # into `["\label\"]` — broken on render. Now the rect pattern requires
+    # the open `[` is NOT followed by `\` / `/` and the close `]` is NOT
+    # preceded by `\` / `/`, leaving shape variants intact.
     patterns: tuple[tuple[re.Pattern[str], str, str], ...] = (
         (re.compile(r"(\[\[)([^\]\[]*?)(\]\])"), "[[", "]]"),
         (re.compile(r"(\{\{)([^}{]*?)(\}\})"), "{{", "}}"),
@@ -222,12 +296,22 @@ def _step_quote_dangerous_labels(text: str) -> tuple[str, Optional[str]]:
         (re.compile(r"(\[/)([^/\]]*?)(/\])"), "[/", "/]"),
         (re.compile(r"(\[/)([^\\\]]*?)(\\\])"), "[/", "\\]"),
         (re.compile(r"(\[\\)([^\\\]]*?)(\\\])"), "[\\", "\\]"),
-        (re.compile(r"(\[)([^\[\]]*?)(\])"), "[", "]"),
+        (re.compile(r"(\[)(?![\\/])([^\[\]]*?)(?<![\\/])(\])"), "[", "]"),
         (re.compile(r"(\{)([^{}]*?)(\})"), "{", "}"),
         (re.compile(r"(\()([^()]*?)(\))"), "(", ")"),
-        # Flag: `>label]` — but only when not already part of `-->` arrow.
-        # We detect by requiring a word char or `>` right before, but not `-`.
-        (re.compile(r"(?<![-=])(>)([^>\]]*?)(\])"), ">", "]"),
+        # Flag: `>label]` — but only when not already part of `-->` arrow
+        # AND not the `>` inside an HTML `<br>` tag inside a label.
+        # P26 (2026-04-25): the previous (?<![-=]) lookbehind only checked
+        # ONE char back, so for `<br>` the `>` at the end was matched as
+        # a flag-shape opener (since the preceding char `r` is alnum and
+        # not `-`/`=`). We now use a 3-char lookbehind `(?<!<br)` and
+        # `(?<!<BR)` to skip the close-bracket of HTML `<br>` tags.
+        # Combined with the alnum lookbehind `(?<=[A-Za-z0-9_])`, this
+        # only matches `NodeID>` patterns at the start of a node def.
+        (re.compile(
+            r"(?<=[A-Za-z0-9_])(?<![-=<])(?<!<br)(?<!<BR)"
+            r"(>)([^>\]]*?)(\])"
+        ), ">", "]"),
     )
 
     def needs_quote(inner: str) -> bool:
@@ -235,7 +319,15 @@ def _step_quote_dangerous_labels(text: str) -> tuple[str, Optional[str]]:
             return False
         if inner.startswith('"') and inner.endswith('"'):
             return False  # already quoted
-        return bool(re.search(r'[<>#|"\'\\]', inner))
+        # P26 (2026-04-25) — strip `<br>` HTML tags BEFORE checking for
+        # dangerous chars. Mermaid renders `<br>` as a line break inside
+        # labels and our `_step_neutralise_br_tags` has already
+        # normalised any `<br/>` self-closing variant to `<br>`. Without
+        # this, the `<` and `>` inside every `<br>` count as "dangerous"
+        # and the label gets re-quoted — which combined with the OUTER
+        # shape delimiters produces `[\"label\"\]` corruption.
+        check = re.sub(r"<br\s*/?>", "", inner, flags=re.IGNORECASE)
+        return bool(re.search(r'[<>#|"\'\\]', check))
 
     for pat, open_, close_ in patterns:
         def _sub(m: re.Match[str]) -> str:
@@ -310,6 +402,20 @@ def _step_flatten_brace_hell(text: str) -> tuple[str, Optional[str]]:
         has_esc_brackets = "\\[" in stripped or "\\]" in stripped or "\\\"" in stripped
         suspicious = dq >= 3 or has_esc_brackets
         if not suspicious:
+            continue
+        # P26 (2026-04-25) — don't fire on lines that are already a
+        # well-formed trapezoid `[\..\]`, parallelogram `[/.../]`, or
+        # inverted parallelogram `[\\..\\]` shape. The `\` and `/` chars
+        # in those shapes look like "escape brackets" to the heuristic
+        # above but are actually mermaid's SHAPE delimiters. The earlier
+        # `_step_normalise_shape_quotes` already stripped any redundant
+        # inner quotes from these forms, so the line that reaches us here
+        # is parseable mermaid.
+        if re.search(
+            r"\b\w+\s*"
+            r"(?:\[\\[^\\\]]*\\\]|\[/[^/\]]*/\]|\[\\\\[^\\\]]*\\\\\])",
+            stripped,
+        ):
             continue
         # Try to match: NODEID followed by opener to outermost closer.
         # Use a non-greedy best-effort for the label content.
@@ -435,6 +541,9 @@ def _step_trim(text: str) -> tuple[str, Optional[str]]:
 _STEPS = (
     _step_asciify,
     _step_normalise_arrows,
+    _step_neutralise_br_tags,      # P26 (2026-04-25): <br/> -> <br>
+    _step_normalise_shape_quotes,  # P26 (2026-04-25): strip extra quotes
+                                    # from trapezoid/parallelogram shapes
     _step_strip_frontmatter,
     _step_strip_direction,
     _step_normalise_header,

@@ -202,11 +202,23 @@ async def test_run_single_phase_unknown_phase_raises_value_error(pipe_env):
 @pytest.mark.asyncio
 async def test_agent_exception_marks_phase_failed_but_pipeline_continues(pipe_env):
     """An agent that throws must not abort the pipeline — the phase flips
-    to 'failed' and the next phase still runs."""
+    to 'failed' and INDEPENDENT phases still run.
+
+    P26 (2026-04-25) UPDATED SEMANTICS: previously this test asserted
+    that P3 still completed after P2 crashed. With the new DAG scheduler
+    P3 is fail-fast skipped because it depends on P2 (and would only
+    produce a degraded compliance doc lacking HRS context). The test
+    now verifies:
+      - P2 is failed (the actual crash).
+      - P3 is failed (its dep P2 failed — fail-fast skip).
+      - P4 is COMPLETED (independent of P2 — proves pipeline didn't abort).
+      - P6, P7, P7a (all in the P4 chain) also completed — proves the
+        DAG fired downstream phases of the SUCCEEDING branch.
+    """
     proj_svc, pipe_svc, _ = pipe_env
     proj = proj_svc.create(name="ContinueOnFail")
 
-    # P2 blows up, P3 succeeds
+    # P2 blows up; everything else uses stub agents that succeed.
     crash_agent = MagicMock()
     crash_agent.execute = AsyncMock(side_effect=RuntimeError("boom"))
     crash_cls = MagicMock(return_value=crash_agent)
@@ -217,8 +229,108 @@ async def test_agent_exception_marks_phase_failed_but_pipeline_continues(pipe_en
         await pipe_svc.run_pipeline(proj["id"])
 
     statuses = proj_svc.get(proj["id"])["phase_statuses"]
-    assert statuses["P2"]["status"] == "failed"
-    assert statuses["P3"]["status"] == "completed"
+    # P2 itself failed (actual crash).
+    assert statuses["P2"]["status"] == "failed", (
+        f"P2 should be failed, got {statuses.get('P2')}"
+    )
+    # P3 depends on P2 — fail-fast skip (don't waste an LLM call on
+    # garbage input, don't produce a degraded compliance doc).
+    assert statuses["P3"]["status"] == "failed", (
+        f"P3 should be failed (dep P2 crashed), got {statuses.get('P3')}"
+    )
+    # P4 is independent of P2 — must still have completed. This is the
+    # core "pipeline doesn't abort" invariant.
+    assert statuses["P4"]["status"] == "completed", (
+        f"P4 (independent of failed P2) should have completed, "
+        f"got {statuses.get('P4')}"
+    )
+    # P4's downstream chain — P6, P7, P7a — should have all succeeded too.
+    assert statuses["P6"]["status"] == "completed"
+    assert statuses["P7"]["status"] == "completed"
+    assert statuses["P7a"]["status"] == "completed"
+    # P4's other downstream — P8a, P8b, P8c — should have completed.
+    assert statuses["P8a"]["status"] == "completed"
+    assert statuses["P8b"]["status"] == "completed"
+    assert statuses["P8c"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_p7_starts_immediately_after_p6_independent_of_slow_p3(pipe_env):
+    """P26 (2026-04-25) regression test for "struck after glr generation
+    after some time starting fpga".
+
+    Old batch scheduler waited for the slowest phase in Batch B
+    (P3, P6, P8a) before starting Batch C (P7, P8b). When P3 was slow
+    (because it depends on slow P2), P7 — which only needs P6 — was
+    blocked needlessly.
+
+    The new DAG scheduler fires P7 the instant P6 finishes work,
+    regardless of P3's status. This test patches P3 to take a long
+    artificial pause and asserts P7 still completes BEFORE P3.
+    """
+    import asyncio
+    import time
+
+    proj_svc, pipe_svc, _ = pipe_env
+    proj = proj_svc.create(name="DAGCheck")
+
+    # Track when each phase's execute() returns.
+    completion_times: dict[str, float] = {}
+    pipeline_t0 = [0.0]
+
+    def _make_timed_agent(phase_id: str, delay_s: float = 0.0):
+        async def _execute(*args, **kwargs):
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+            completion_times[phase_id] = time.monotonic() - pipeline_t0[0]
+            return {
+                "response": f"{phase_id} ok",
+                "phase_complete": True,
+                "outputs": {f"{phase_id.lower()}.md": f"# {phase_id}\n"},
+                "model_used": "stub-model",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }
+        agent = MagicMock()
+        agent.execute = AsyncMock(side_effect=_execute)
+        return agent
+
+    from services.pipeline_service import AUTO_PHASES
+    patches = []
+    for phase_id, module_path, class_name, _ in AUTO_PHASES:
+        # Make P3 slow (0.6s) — it would otherwise hold up the old
+        # Batch B scheduler. All other phases finish quickly.
+        delay = 0.6 if phase_id == "P3" else 0.05
+        agent = _make_timed_agent(phase_id, delay_s=delay)
+        agent_cls = MagicMock(return_value=agent)
+        patches.append(patch(f"{module_path}.{class_name}", agent_cls))
+
+    pipeline_t0[0] = time.monotonic()
+    with _Stacked(patches):
+        await pipe_svc.run_pipeline(proj["id"])
+
+    # All phases completed.
+    statuses = proj_svc.get(proj["id"])["phase_statuses"]
+    for phase_id, *_ in AUTO_PHASES:
+        assert statuses[phase_id]["status"] == "completed", (
+            f"{phase_id}: {statuses.get(phase_id)}"
+        )
+
+    # P7 must finish BEFORE P3 — proving the DAG scheduler did not
+    # gate P7 on the slow P3. P6 finishes at ~0.05s, P7 fires
+    # immediately and finishes at ~0.10s. P3 finishes at ~0.65s
+    # (after the 0.6s sleep).
+    assert completion_times["P7"] < completion_times["P3"], (
+        f"P7 finished at {completion_times['P7']:.2f}s but P3 at "
+        f"{completion_times['P3']:.2f}s — DAG scheduler should have "
+        f"unblocked P7 long before P3 finished. "
+        f"All times: {completion_times}"
+    )
+    # And P7a (which depends on P7) should also finish before P3.
+    assert completion_times["P7a"] < completion_times["P3"], (
+        f"P7a finished at {completion_times['P7a']:.2f}s but P3 at "
+        f"{completion_times['P3']:.2f}s — entire P4→P6→P7→P7a chain "
+        f"should outpace the slow P2/P3 chain. All: {completion_times}"
+    )
 
 
 @pytest.mark.asyncio

@@ -559,3 +559,150 @@ class TestFlattenBraceHell:
         # have been flattened — either is fine, they're all valid now).
         assert "PMA3-352GLN" in cleaned
         assert "PE7602-6" in cleaned
+
+
+# ---------------------------------------------------------------------------
+# P26 (2026-04-25) — `<br/>` HTML-tag and trapezoid/parallelogram corruption.
+#
+# Real failing input from project `gvv` and `hdhf` (architecture.md):
+#
+#   ADC_DIGITAL[\"ADC / AD9627<br/>+1.8V analog<br/>+3.3V digital"\]
+#
+# The salvage USED TO mangle this into:
+#
+#   ADC_DIGITAL[ADC / AD9627 br/ +1.8V analog br/ +3.3V digital"]
+#
+# because:
+#   1. `_step_quote_dangerous_labels` saw the `<` and `>` inside `<br/>` as
+#      "dangerous chars" and re-quoted the entire label.
+#   2. The flag-shape regex `(?<![-=])(>)([^>\]]*?)(\])` matched the `>`
+#      INSIDE `<br>` as a standalone flag-shape opener (since the only
+#      lookbehind was 1 char wide).
+#   3. `_step_flatten_brace_hell` triggered on `[\..\]` trapezoid and
+#      stripped the `\` shape-delimiters along with the inner quotes.
+#
+# Fixes (in `tools/mermaid_salvage.py`):
+#   - `_step_neutralise_br_tags` (NEW): `<br/>` → `<br>`.
+#   - `_step_normalise_shape_quotes` (NEW): strip redundant inner `"..."`
+#     from `[\..\]`, `[/.../]`, `[\\..\\]` shapes pre-emptively.
+#   - `needs_quote()` strips `<br>` tags before checking for dangerous chars.
+#   - rect `[..]` pattern now requires open `[` is NOT followed by `\` / `/`
+#     and close `]` is NOT preceded by `\` / `/` (so trapezoid + parallelogram
+#     shapes aren't matched by the rect pattern).
+#   - flag-shape `>...]` regex now uses 3-char lookbehinds `(?<!<br)` and
+#     `(?<!<BR)` to skip the closing `>` of HTML `<br>` tags.
+#   - `_step_flatten_brace_hell` skips lines that already look like a
+#     well-formed trapezoid / parallelogram.
+# ---------------------------------------------------------------------------
+
+
+class TestP26HtmlBreakAndShapeDelims:
+    """Regression tests for the 2026-04-25 'salvage corrupts shapes with
+    <br/> + escaped quotes' bug."""
+
+    def test_self_closing_br_normalised_to_open_br(self):
+        """<br/> must be converted to <br> early so downstream steps don't
+        see the slash and treat the `/` as a parallelogram delimiter."""
+        raw = (
+            "flowchart TD\n"
+            '    BUCK["Buck<br/>BD9F800MUX"]\n'
+        )
+        cleaned, fixes = salvage(raw)
+        assert "neutralise_br_tags" in fixes
+        assert "<br>" in cleaned
+        assert "<br/>" not in cleaned
+
+    def test_trapezoid_with_escaped_quotes_survives(self):
+        """`[\\"label"\\]` (LLM JSON-escape leakage) should normalise to
+        `[\\label\\]` cleanly, not get destroyed by quote_dangerous_labels."""
+        raw = (
+            "flowchart TD\n"
+            r'    ADC[\"ADC AD9627"\]' + "\n"
+        )
+        cleaned, fixes = salvage(raw)
+        assert "normalise_shape_quotes" in fixes
+        # The trapezoid shape delimiters must survive intact.
+        assert r"[\ADC AD9627\]" in cleaned, (
+            f"trapezoid shape delimiters mangled — got:\n{cleaned}"
+        )
+
+    def test_trapezoid_with_br_tags_survives(self):
+        """Real failing input from project `gvv`: trapezoid shape with
+        backslash-escaped quotes AND `<br/>` HTML tags inside the label."""
+        raw = (
+            "flowchart TD\n"
+            r'    ADC_DIGITAL[\"ADC / AD9627<br/>+1.8V analog<br/>+3.3V digital"\]' + "\n"
+            "    OTHER[X]\n"
+            "    ADC_DIGITAL --> OTHER\n"
+        )
+        cleaned, fixes = salvage(raw)
+        # Trapezoid delimiters intact:
+        assert r"ADC_DIGITAL[\ADC" in cleaned, (
+            f"trapezoid open mangled — got:\n{cleaned}"
+        )
+        assert r"digital\]" in cleaned, (
+            f"trapezoid close mangled — got:\n{cleaned}"
+        )
+        # No double-quoted artefacts:
+        assert r'[\"' not in cleaned
+        assert r'"\]' not in cleaned
+        # No `br/` orphan from the HTML tag being torn apart:
+        assert " br/ " not in cleaned
+        # Edge survives:
+        assert "ADC_DIGITAL --> OTHER" in cleaned
+
+    def test_parallelogram_with_br_tags_survives(self):
+        """`[/...<br/>.../]` parallelogram must keep its `/` delimiters."""
+        raw = (
+            "flowchart TD\n"
+            '    LVDS_OUT[/"LVDS Output<br/>Data Interface"/]\n'
+        )
+        cleaned, fixes = salvage(raw)
+        assert "[/LVDS Output<br>Data Interface/]" in cleaned, (
+            f"parallelogram mangled — got:\n{cleaned}"
+        )
+
+    def test_asymmetric_flag_with_br_tags_not_split(self):
+        """`>...<br>...]` flag-shape — the `>` inside `<br>` must NOT be
+        treated as a separate flag-shape opener and re-quoted."""
+        raw = (
+            "flowchart TD\n"
+            '    BUCK>"Buck / BD9F800MUX-ZE2<br/>28V to 5V @ 8A"]\n'
+        )
+        cleaned, fixes = salvage(raw)
+        # No extra quote injected after the <br>:
+        assert '<br>"28V' not in cleaned, (
+            f"flag-shape over-quoted on <br> — got:\n{cleaned}"
+        )
+        # Original label intact (just `<br/>` → `<br>`):
+        assert (
+            'BUCK>"Buck / BD9F800MUX-ZE2<br>28V to 5V @ 8A"]'
+        ) in cleaned
+
+    def test_full_gvv_diagram_renders_cleanly(self):
+        """End-to-end: the full power-tree diagram from project `gvv` must
+        survive salvage with NO mangling. This is the diagram the user
+        was complaining about with 'Parse error on line 13'."""
+        raw = (
+            "flowchart TD\n"
+            '    V_MAIN>"+15V Primary Supply"]\n'
+            '    BUCK_5V["Buck +15V to +5V<br/>BD9P135EFV x2"]\n'
+            r'    ADC_ADC[\"ADC x2<br/>AD9648BCPZ-125"\]' + "\n"
+            r'    FPGA_CORE[\"FPGA<br/>XC7K160T-1FFG676I"\]' + "\n"
+            '    LVDS_OUT[/"LVDS Output<br/>Data Interface"/]\n'
+            '    V_MAIN == "+15V" ==> BUCK_5V\n'
+            '    BUCK_5V -- "+5V" --> ADC_ADC\n'
+            '    ADC_ADC -- "LVDS" --> FPGA_CORE\n'
+            '    FPGA_CORE -- "LVDS" --> LVDS_OUT\n'
+        )
+        cleaned, fixes = salvage(raw)
+        # All five node shapes preserved:
+        assert 'V_MAIN>"+15V Primary Supply"]' in cleaned
+        assert 'BUCK_5V["Buck +15V to +5V<br>BD9P135EFV x2"]' in cleaned
+        assert r"ADC_ADC[\ADC x2<br>AD9648BCPZ-125\]" in cleaned
+        assert r"FPGA_CORE[\FPGA<br>XC7K160T-1FFG676I\]" in cleaned
+        assert "LVDS_OUT[/LVDS Output<br>Data Interface/]" in cleaned
+        # No double-quote artefacts on any shape:
+        assert r'<br>"' not in cleaned
+        # The parser's `Parse error on line 13` was caused by these
+        # mangled shapes; with them clean, mermaid will accept the diagram.

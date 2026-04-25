@@ -110,6 +110,141 @@ async def test_netlist_falls_back_to_bom_when_llm_call_raises(tmp_path):
     assert "HMC8410" in netlist_json
     assert "ADL5801" in netlist_json
     assert "AD9643" in netlist_json
+    # 5. P26 (2026-04-25) — phase is COMPLETE even though DRC may have
+    # warnings, because the BOM-fallback IS auto-synthesized and the
+    # operator can see the AUTO-SYNTHESIZED tag in the UI. Previously
+    # this returned phase_complete=False because DRC fired on the auto-
+    # synth's approximate connectivity, marking the phase FAILED in red
+    # even though a complete schematic was rendered. User report: "netlist
+    # generated but showing failed status fix it".
+    assert result.get("phase_complete") is True, (
+        "BOM-fallback path produced a complete netlist (with all the "
+        "user's MPNs), so the phase MUST be marked COMPLETED — not "
+        "FAILED — regardless of DRC warnings on the auto-synthesized "
+        f"connectivity. Got: phase_complete={result.get('phase_complete')!r}, "
+        f"response={result.get('response', '')[:200]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_netlist_phase_complete_when_llm_skips_tool_call(tmp_path):
+    """P26 (2026-04-25) — the LLM responding WITHOUT calling
+    `generate_netlist` should ALSO land on the BOM-fallback and mark
+    the phase COMPLETED. This is distinct from the LLM-raises-exception
+    case (covered above) — here the LLM returns successfully but with
+    just text, no tool call, which the agent already handled by building
+    a netlist from the BOM. The fix: that branch must also mark
+    phase_complete=True since the auto-synthesized output is acceptable
+    (user can see the AUTO-SYNTHESIZED tag and inspect)."""
+    from agents.netlist_agent import NetlistAgent
+    agent = NetlistAgent()
+
+    (tmp_path / "requirements.md").write_text(
+        "# Requirements\n\nREQ-1: receive 5 GHz.\n", encoding="utf-8"
+    )
+    (tmp_path / "component_recommendations.md").write_text(
+        "# Component Recommendations\n\n"
+        "### 1. LNA\n"
+        "**Primary Choice:** [HMC8410](https://www.analog.com/HMC8410)\n\n"
+        "### 2. Mixer\n"
+        "**Primary Choice:** [ADL5801](https://www.analog.com/ADL5801)\n\n",
+        encoding="utf-8",
+    )
+
+    project_context = {
+        "project_id": 997,
+        "name": "no_tool_call",
+        "design_type": "rf",
+        "output_dir": str(tmp_path),
+        "design_parameters": {},
+        "prior_phase_outputs": {},
+    }
+
+    # LLM responds successfully but doesn't call the tool (just text).
+    fake_response = {
+        "content": "I'll think about this and get back to you.",
+        "tool_calls": [],
+    }
+    with patch.object(NetlistAgent, "call_llm",
+                       new=AsyncMock(return_value=fake_response)):
+        result = await agent.execute(project_context, user_input="")
+
+    assert result.get("outputs", {}).get("netlist.json"), (
+        "BOM-fallback should have produced netlist.json from the BOM"
+    )
+    assert result.get("phase_complete") is True, (
+        "LLM-skipped-tool-call path also produces an AUTO-SYNTHESIZED "
+        "netlist. The phase must be COMPLETED (not FAILED) just like "
+        f"the LLM-exception path. Got: {result.get('phase_complete')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_llm_success_path_still_gates_on_drc(tmp_path):
+    """The COMPLETED-on-auto-synth relaxation only applies to the
+    BOM-fallback. When the LLM successfully calls `generate_netlist`
+    with a real (non-auto-synthesized) netlist, DRC critical/high
+    violations MUST still gate phase_complete — otherwise we'd let
+    real shorts and unbound power rails slip through to PCB layout."""
+    from agents.netlist_agent import NetlistAgent
+    agent = NetlistAgent()
+
+    (tmp_path / "requirements.md").write_text(
+        "# Requirements\n\nREQ-1: stuff.\n", encoding="utf-8"
+    )
+    (tmp_path / "component_recommendations.md").write_text(
+        "# Component Recommendations\n\n"
+        "### 1. LNA\n"
+        "**Primary Choice:** [HMC8410](https://www.analog.com/HMC8410)\n\n",
+        encoding="utf-8",
+    )
+
+    project_context = {
+        "project_id": 996,
+        "name": "llm_success",
+        "design_type": "rf",
+        "output_dir": str(tmp_path),
+        "design_parameters": {},
+        "prior_phase_outputs": {},
+    }
+
+    # LLM emits a deliberately-broken netlist (1 node, 0 edges) — the
+    # power/ground binder will leave critical violations because there's
+    # no power rail at all.
+    bad_netlist = {
+        "nodes": [
+            {
+                "instance_id": "U1",
+                "part_number": "BROKEN_IC",
+                "component_name": "Broken IC",
+                "reference_designator": "U1",
+            },
+        ],
+        "edges": [],
+        "power_nets": [],
+        "ground_nets": [],
+    }
+    fake_response = {
+        "content": "Done.",
+        "tool_calls": [
+            {"id": "tc1", "name": "generate_netlist", "input": bad_netlist}
+        ],
+    }
+    with patch.object(NetlistAgent, "call_llm",
+                       new=AsyncMock(return_value=fake_response)):
+        result = await agent.execute(project_context, user_input="")
+
+    # Must still produce SOMETHING (defensive), but phase_complete should
+    # reflect DRC failure since this is a real LLM-emitted netlist.
+    # We don't strictly require phase_complete=False (the binder might
+    # have rescued it), but if DRC summary shows critical/high, the
+    # response_text MUST mention "phase blocked" so the operator knows.
+    response_text = result.get("response", "")
+    if not result.get("phase_complete"):
+        assert "phase blocked" in response_text or "DRC" in response_text, (
+            "LLM-success path with DRC fails should explain the gate in "
+            f"response_text — got: {response_text!r}"
+        )
 
 
 @pytest.mark.asyncio

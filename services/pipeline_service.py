@@ -33,37 +33,68 @@ AUTO_PHASES = list(AUTO_PHASE_SPECS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# P22 (2026-04-24) — parallel batch execution.
+# P26 (2026-04-25) — DAG scheduler (replaces P22's batch scheduler).
 #
-# Dependency graph among auto phases (derived from CLAUDE.md phase refs):
+# User report: "struck after glr generation after some time starting fpga".
+# Root cause of the perceived pause:
 #
-#   P1 (user-driven) ─┬─> P2  (HRS — needs BOM)
-#                      ├─> P4  (Netlist — needs BOM)
-#                      └─> P8a (SRS — needs P1..P4)
-#   P2 ──────────────> P3  (Compliance — needs BOM + HRS)
-#   P4 ──────────────┬─> P6  (GLR — needs netlist)
-#                    └─> P8a (also reads netlist)
-#   P6 ──────────────> P7  (FPGA RTL — needs GLR)
-#   P7 ──────────────> P7a (Register Map — needs FPGA interfaces)
-#   P8a ─────────────┬─> P8b (SDD — needs SRS)
-#                    └─> P8c (Code Review — needs SRS / source files)
+# The previous batch scheduler waited for the SLOWEST phase in each batch
+# before starting the next. With Batch B = (P3, P6, P8a) and P3 depending
+# on slow P2 (HRS, 10+ min in user's project), P7 — which only depends on
+# P6 — could not start until P3 finished, even though P6 had been done
+# for minutes.
 #
-# Collapsing into the tightest topological batches that respect every
-# dependency while maximising parallelism:
+# Phase-level DAG removes that artificial barrier: each phase fires the
+# instant its OWN upstream deps complete. P7 starts as soon as P6 is done,
+# regardless of how long P3 still needs.
 #
-#   Batch A:  P2,  P4             (both depend only on P1)
-#   Batch B:  P3,  P6,  P8a       (P3→P2, P6→P4, P8a→P4 all done after A)
-#   Batch C:  P7,  P8b            (P7→P6, P8b→P8a all done after B)
-#   Batch D:  P7a, P8c            (P7a→P7, P8c→P8a all done after C)
+# Dependency graph (P1 is user-driven, always done before this scheduler):
 #
-# Sequential worst case:  ~9 phases × 4 min = ~36 min
-# Parallel  worst case:   4 batches × 4 min = ~16 min
+#   P2  (HRS)              ← P1
+#   P4  (Netlist)          ← P1
+#   P3  (Compliance)       ← P2, P4
+#   P6  (GLR)              ← P4
+#   P8a (SRS)              ← P4
+#   P7  (FPGA RTL)         ← P6
+#   P8b (SDD)              ← P8a
+#   P7a (Register Map)     ← P7
+#   P8c (Code Review)      ← P8a
 #
-# CORRECTNESS — no phase runs before every upstream dependency has
-# completed. Each phase still gets its full LLM budget; we just issue
-# independent phases concurrently via asyncio.gather. No output quality
-# is compromised — each phase's agent code is unchanged.
+# Two independent chains:
+#   Chain A (slow): P2 → P3                  (HRS-bound critical path)
+#   Chain B (fast): P4 → P6 → P7 → P7a       (parallel to chain A)
+#                   P4 → P8a → P8b → P8c     (parallel to chain A)
+#
+# Worst-case wall time = max(Chain A, longest of Chain B variants).
+# In the user's scenario where HRS is 10 min: pipeline is 10 min, not 16.
+#
+# UI perception is preserved by serialising the STATUS WRITES (not the
+# work) in phase-id order — phase X's "completed" flag only flips after
+# all earlier phase-id flags have flipped. Backend is parallel; frontend
+# sidebar still appears to advance one phase at a time.
 # ─────────────────────────────────────────────────────────────────────────────
+_PHASE_DEPS: dict[str, tuple[str, ...]] = {
+    "P2":  (),
+    "P4":  (),
+    "P3":  ("P2", "P4"),
+    "P6":  ("P4",),
+    "P8a": ("P4",),
+    "P7":  ("P6",),
+    "P8b": ("P8a",),
+    "P7a": ("P7",),
+    "P8c": ("P8a",),
+}
+
+# Phase-id ordering used for serial UI status flips (NOT for execution order).
+# Must include every phase in `_PHASE_DEPS`. Order chosen to match the
+# left-sidebar visual order in the React frontend.
+_PHASE_FLIP_ORDER: tuple[str, ...] = (
+    "P2", "P3", "P4", "P6", "P7", "P7a", "P8a", "P8b", "P8c",
+)
+
+# Back-compat: tests + external callers may import this symbol. Now derived
+# from `_PHASE_DEPS` as a topological grouping for diagnostic logging only —
+# the scheduler ignores it and uses the per-phase DAG instead.
 _PIPELINE_BATCHES: tuple[tuple[str, ...], ...] = (
     ("P2",  "P4"),
     ("P3",  "P6",  "P8a"),
@@ -124,20 +155,24 @@ class PipelineService:
         return lock
 
     async def run_pipeline(self, project_id: int) -> None:
-        """Execute auto phases (P2→P8c) in parallel batches respecting
-        the dependency graph defined in `_PIPELINE_BATCHES`.
+        """Execute auto phases (P2→P8c) using a phase-level DAG scheduler.
 
-        Batch semantics:
-          - Each batch runs via `asyncio.gather(return_exceptions=True)`
-            so one failing phase doesn't cancel sibling phases.
-          - The NEXT batch starts only after every phase in the current
-            batch has terminated (completed or failed).
-          - Outputs from every completed phase in a batch are merged
-            into `prior_outputs` at the batch boundary, so the next
-            batch sees them through the agent's `prior_phase_outputs`.
+        DAG semantics (P26 — replaces P22's batch scheduler):
+          - Each phase fires the instant its OWN dependencies (per
+            `_PHASE_DEPS`) have completed — independent of any sibling
+            phases that might still be running.
+          - `prior_outputs` is updated with each phase's outputs as soon
+            as that phase finishes work, so downstream phases see them
+            without waiting for a batch boundary.
+          - Status writes (the `in_progress` → `completed`/`failed`
+            transitions visible in the UI sidebar) are serialised in
+            phase-id order via `_PHASE_FLIP_ORDER` so the user still
+            sees phases advance one-at-a-time even though they're
+            running in parallel.
+          - A failed dependency marks ALL transitively-downstream phases
+            failed (no work spent on inputs that won't be valid).
 
-        Writes phase status to DB per phase using async sessions so the
-        FastAPI event loop is never blocked. Designed to be called as:
+        Designed to be called as:
         `BackgroundTasks.add_task(svc.run_pipeline, project_id)`.
         """
         proj = await self._proj_svc.async_get(project_id)
@@ -155,160 +190,200 @@ class PipelineService:
         scope = (proj.get("design_scope") or "full").lower()
         _pipeline_t0 = time.monotonic()
 
-        for batch_idx, batch in enumerate(_PIPELINE_BATCHES, start=1):
-            eligible: list[str] = []
-            for phase_id in batch:
-                if phase_id not in _PHASE_META:
-                    log.warning(
-                        "pipeline.phase_unknown_in_batch",
-                        extra={"phase": phase_id, "batch": batch_idx},
-                    )
-                    continue
-                if await self._proj_svc.async_get_phase_status(
-                    project_id, phase_id,
-                ) == "completed":
-                    log.info("pipeline.phase_skipped_completed", extra={"phase": phase_id})
-                    continue
-                if not is_phase_applicable(phase_id, scope):
-                    log.info(
-                        "pipeline.phase_skipped_out_of_scope",
-                        extra={"phase": phase_id, "design_scope": scope},
-                    )
-                    continue
-                eligible.append(phase_id)
-
-            if not eligible:
+        # Determine eligible phases (in `_PHASE_DEPS` but not already
+        # completed and applicable to the project's scope).
+        eligible: set[str] = set()
+        for phase_id in _PHASE_DEPS:
+            if phase_id not in _PHASE_META:
+                log.warning(
+                    "pipeline.phase_unknown",
+                    extra={"phase": phase_id},
+                )
                 continue
+            if await self._proj_svc.async_get_phase_status(
+                project_id, phase_id,
+            ) == "completed":
+                log.info("pipeline.phase_skipped_completed", extra={"phase": phase_id})
+                continue
+            if not is_phase_applicable(phase_id, scope):
+                log.info(
+                    "pipeline.phase_skipped_out_of_scope",
+                    extra={"phase": phase_id, "design_scope": scope},
+                )
+                continue
+            eligible.add(phase_id)
 
-            # Refresh project snapshot once per batch (async read, cheap).
-            proj = await self._proj_svc.async_get(project_id) or proj
+        if not eligible:
+            log.info("pipeline.no_eligible_phases", extra={"project_id": project_id})
+            return
 
-            log.info(
-                "pipeline.batch_started",
-                extra={
-                    "project_id": project_id,
-                    "batch": batch_idx,
-                    "phases": eligible,
-                },
-            )
-            _batch_t0 = time.monotonic()
+        log.info(
+            "pipeline.dag_started",
+            extra={
+                "project_id": project_id,
+                "eligible_phases": sorted(eligible),
+            },
+        )
 
-            # P24 (2026-04-25): event-chained status writes. Replaces P23's
-            # post-batch dwell-and-flip approach which left phases stuck in
-            # "in_progress" while their files were already visible (user
-            # report 2026-04-25: "showing running but its completed").
-            #
-            # Mechanism:
-            #   - Mark the first phase in_progress eagerly (so the sidebar
-            #     shows activity during the parallel work).
-            #   - Each phase coroutine: do the actual work, then wait for
-            #     the previous phase's status-flip event before writing
-            #     its own status. The wait is ZERO when the previous phase
-            #     finished earlier; it gates only when this phase finishes
-            #     out of phase-id order.
-            #   - As soon as a phase flips to completed/failed, it ALSO
-            #     marks the NEXT eligible phase as in_progress (no delay).
-            # Result: status writes happen in real time as work completes,
-            # but constrained to phase-id order. No artificial dwells, no
-            # "completed-but-shown-running" inversions.
-            _lock = self._status_lock(project_id)
+        _lock = self._status_lock(project_id)
+        # `work_done[p]` fires when phase p's work finishes (regardless of
+        # whether the UI status has flipped yet). Downstream phases wait on
+        # this — NOT on the UI flip — so backend stays parallel.
+        work_done: dict[str, asyncio.Event] = {
+            p: asyncio.Event() for p in _PHASE_DEPS
+        }
+        # `flip_done[p]` fires after phase p's status has been written to
+        # the DB (in phase-id order). Phase p flips only after every earlier
+        # phase in `_PHASE_FLIP_ORDER` has flipped — preserving sequential
+        # UI appearance while backend runs in parallel.
+        flip_done: dict[str, asyncio.Event] = {
+            p: asyncio.Event() for p in _PHASE_DEPS
+        }
+        # Phases whose dependency failed — we mark them failed without
+        # running so we don't waste an LLM call on garbage input.
+        skipped_due_to_dep: set[str] = set()
+        # Track outcomes for the tail summary.
+        outcomes: dict[str, str] = {}
 
+        # Mark the first eligible phase (in flip order) as in_progress so
+        # the user sees activity right away.
+        first_eligible_in_flip_order = next(
+            (p for p in _PHASE_FLIP_ORDER if p in eligible), None,
+        )
+        if first_eligible_in_flip_order:
             async with _lock:
                 await self._proj_svc.async_set_phase_status(
-                    project_id, eligible[0], "in_progress",
+                    project_id, first_eligible_in_flip_order, "in_progress",
                 )
 
-            flip_events: list[asyncio.Event] = [
-                asyncio.Event() for _ in eligible
-            ]
-            # A snapshot of `prior_outputs` is passed to each phase so
-            # concurrent agents don't race on the same dict instance.
-            prior_snapshot = dict(prior_outputs)
+        async def _serialised_flip(pid: str, status: str, elapsed: float) -> None:
+            """Write phase pid's status to the DB, but only AFTER every
+            earlier phase in `_PHASE_FLIP_ORDER` has had its status
+            written. Also nudge the next phase to in_progress so the
+            sidebar shows continuous activity."""
+            pid_idx = _PHASE_FLIP_ORDER.index(pid)
+            for prev_idx in range(pid_idx):
+                prev_pid = _PHASE_FLIP_ORDER[prev_idx]
+                if prev_pid in eligible:
+                    await flip_done[prev_pid].wait()
 
-            async def _gated_phase(idx: int, pid: str):
-                """Run one phase's work in parallel, then write its status
-                in batch (phase-id) order via flip_events chaining."""
-                res = await self._run_single_phase(
-                    project_id=project_id,
-                    proj=proj,
-                    phase_id=pid,
-                    module_path=_PHASE_META[pid][0],
-                    class_name=_PHASE_META[pid][1],
-                    phase_name=_PHASE_META[pid][2],
-                    prior_outputs=prior_snapshot,
+            extra = {"duration_seconds": round(elapsed, 2)}
+            async with _lock:
+                await self._proj_svc.async_set_phase_status(
+                    project_id, pid, status, extra=extra,
                 )
-                # Wait for the previous phase in this batch to have
-                # flipped its status before we write ours. Index 0
-                # has no upstream — flips immediately when work done.
-                if idx > 0:
-                    await flip_events[idx - 1].wait()
-
-                final_status = "completed"
-                elapsed_s = 0.0
-                if isinstance(res, dict):
-                    final_status = res.get("final_status", "completed")
-                    elapsed_s = float(res.get("elapsed", 0.0))
-
-                # Flip our status + nudge the next phase to in_progress
-                # in the SAME lock acquire so the frontend poll can
-                # catch them as a single transition.
-                async with _lock:
-                    await self._proj_svc.async_set_phase_status(
-                        project_id, pid, final_status,
-                        extra={"duration_seconds": round(elapsed_s, 2)},
+                # Nudge next eligible phase to in_progress so the UI
+                # sidebar always shows ONE active phase. Skip if next
+                # phase is already failed-by-dep (we'll write its
+                # failed status when its own _serialised_flip runs).
+                next_pid = next(
+                    (p for p in _PHASE_FLIP_ORDER[pid_idx + 1:]
+                     if p in eligible and p not in skipped_due_to_dep),
+                    None,
+                )
+                if next_pid is not None and not flip_done[next_pid].is_set():
+                    next_status = await self._proj_svc.async_get_phase_status(
+                        project_id, next_pid,
                     )
-                    if idx + 1 < len(eligible):
+                    if next_status not in ("in_progress", "completed", "failed"):
                         await self._proj_svc.async_set_phase_status(
-                            project_id, eligible[idx + 1], "in_progress",
+                            project_id, next_pid, "in_progress",
                         )
-                flip_events[idx].set()
-                return res
+            flip_done[pid].set()
 
-            results = await asyncio.gather(
-                *(_gated_phase(i, pid) for i, pid in enumerate(eligible)),
-                return_exceptions=True,
+        async def _phase_worker(pid: str) -> dict:
+            """Run one phase: wait for DAG deps → execute → flip status."""
+            # 1. Wait for all upstream deps to finish their WORK (not their
+            #    UI flip — that's serialised separately).
+            for dep in _PHASE_DEPS[pid]:
+                if dep not in eligible:
+                    # Dep was already completed before this run started,
+                    # OR is out of scope. Either way, treat as satisfied.
+                    continue
+                await work_done[dep].wait()
+                if outcomes.get(dep) == "failed":
+                    # Dep failed — short-circuit. Mark ourselves failed,
+                    # and ALSO short-circuit transitively-downstream deps
+                    # by setting our work_done event so they can see us
+                    # as failed and short-circuit too.
+                    skipped_due_to_dep.add(pid)
+                    outcomes[pid] = "failed"
+                    work_done[pid].set()
+                    log.info(
+                        "pipeline.phase_skipped_dep_failed",
+                        extra={"project_id": project_id, "phase": pid,
+                               "failed_dep": dep},
+                    )
+                    await _serialised_flip(pid, "failed", 0.0)
+                    return {"final_status": "failed", "outputs": {}, "elapsed": 0.0}
+
+            # 2. Run the actual phase work. _run_single_phase already
+            #    handles per-phase exceptions and never raises here.
+            res = await self._run_single_phase(
+                project_id=project_id,
+                proj=proj,
+                phase_id=pid,
+                module_path=_PHASE_META[pid][0],
+                class_name=_PHASE_META[pid][1],
+                phase_name=_PHASE_META[pid][2],
+                # IMPORTANT: pass a snapshot of prior_outputs at the
+                # moment work begins. Phases that complete after us
+                # mustn't retroactively change what this phase saw.
+                prior_outputs=dict(prior_outputs),
             )
 
-            # Merge per-phase outputs into the shared prior_outputs that
-            # the NEXT batch will read from. Failures already logged
-            # inside _run_single_phase / _gated_phase.
-            for pid, res in zip(eligible, results):
-                if isinstance(res, Exception):
-                    log.warning(
-                        "pipeline.batch_phase_exception",
-                        extra={
-                            "project_id": project_id,
-                            "phase": pid,
-                            "batch": batch_idx,
-                            "error": str(res)[:300],
-                        },
-                    )
-                    # On exception inside _gated_phase the status-flip
-                    # never happened. Apply it now so the UI doesn't hang.
+            final_status = "completed"
+            elapsed_s = 0.0
+            if isinstance(res, dict):
+                final_status = res.get("final_status", "completed")
+                elapsed_s = float(res.get("elapsed", 0.0))
+                # Merge outputs into the shared prior_outputs so the next
+                # phase that fires sees them. Safe because each phase
+                # writes a disjoint set of files (per its phase_id).
+                if final_status == "completed" and res.get("outputs"):
+                    prior_outputs.update(res["outputs"])
+
+            outcomes[pid] = final_status
+            # Signal downstream deps that our work is done — they can
+            # start NOW (without waiting for the UI flip).
+            work_done[pid].set()
+            # 3. Now serialise the UI status flip in phase-id order.
+            await _serialised_flip(pid, final_status, elapsed_s)
+            return res if isinstance(res, dict) else {
+                "final_status": final_status, "outputs": {},
+                "elapsed": elapsed_s,
+            }
+
+        # Fire ALL eligible phase workers concurrently. They synchronise
+        # on `work_done` events per the DAG.
+        results = await asyncio.gather(
+            *(_phase_worker(p) for p in eligible),
+            return_exceptions=True,
+        )
+
+        # Defensive: if a worker raised (shouldn't happen — _run_single_phase
+        # catches its own exceptions), mark the phase failed.
+        for pid, res in zip(eligible, results):
+            if isinstance(res, Exception):
+                log.warning(
+                    "pipeline.dag_phase_exception",
+                    extra={"project_id": project_id, "phase": pid,
+                           "error": str(res)[:300]},
+                )
+                if not flip_done[pid].is_set():
                     async with _lock:
                         await self._proj_svc.async_set_phase_status(
                             project_id, pid, "failed",
                             extra={"error": str(res)[:300]},
                         )
-                    continue
-                if isinstance(res, dict) and res.get("outputs"):
-                    prior_outputs.update(res["outputs"])
-
-            log.info(
-                "pipeline.batch_completed",
-                extra={
-                    "project_id": project_id,
-                    "batch": batch_idx,
-                    "phases": eligible,
-                    "duration_s": round(time.monotonic() - _batch_t0, 2),
-                },
-            )
+                    flip_done[pid].set()
 
         log.info(
             "pipeline.completed",
             extra={
                 "project_id": project_id,
                 "total_duration_s": round(time.monotonic() - _pipeline_t0, 2),
+                "outcomes": outcomes,
             },
         )
 
