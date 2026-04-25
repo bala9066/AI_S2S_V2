@@ -84,15 +84,14 @@ class PipelineService:
     Designed to run as a FastAPI BackgroundTask.
     """
 
-    # P23 serial-look status flips. After parallel backend work finishes,
-    # we walk phases in order and toggle pending → in_progress → final
-    # so the frontend sidebar shows a classic P-N-after-P-N visual rather
-    # than simultaneous running indicators. Values are tuned against the
-    # 3-second frontend status poll interval — must be >= poll interval
-    # for the transition to be observable.
-    _STATUS_FLIP_DELAY_S = 3.5       # dwell on "in_progress" between phases
-    _STATUS_FLIP_INTERLUDE_S = 0.6   # brief pause after "completed" before
-                                      # flipping next phase to in_progress
+    # P24 (2026-04-25): kept for back-compat with tests that override
+    # them — the new event-chained status writes don't use artificial
+    # delays anymore (each phase flips as soon as it finishes work AND
+    # the previous phase has flipped). Setting these to non-zero in a
+    # subclass would have NO effect on the new code path; they're left
+    # here only so existing test fixtures that set them to 0 don't break.
+    _STATUS_FLIP_DELAY_S = 0.0
+    _STATUS_FLIP_INTERLUDE_S = 0.0
 
     def __init__(
         self,
@@ -194,27 +193,42 @@ class PipelineService:
             )
             _batch_t0 = time.monotonic()
 
-            # P23: mark ONLY the first phase as in_progress before firing
-            # the batch so the UI sidebar shows "something is running"
-            # during the ~4 min of actual parallel work. The other
-            # sibling phases stay in their prior status (pending) until
-            # the post-batch serial status-flip below transitions them
-            # through in_progress → completed in phase-id order.
+            # P24 (2026-04-25): event-chained status writes. Replaces P23's
+            # post-batch dwell-and-flip approach which left phases stuck in
+            # "in_progress" while their files were already visible (user
+            # report 2026-04-25: "showing running but its completed").
+            #
+            # Mechanism:
+            #   - Mark the first phase in_progress eagerly (so the sidebar
+            #     shows activity during the parallel work).
+            #   - Each phase coroutine: do the actual work, then wait for
+            #     the previous phase's status-flip event before writing
+            #     its own status. The wait is ZERO when the previous phase
+            #     finished earlier; it gates only when this phase finishes
+            #     out of phase-id order.
+            #   - As soon as a phase flips to completed/failed, it ALSO
+            #     marks the NEXT eligible phase as in_progress (no delay).
+            # Result: status writes happen in real time as work completes,
+            # but constrained to phase-id order. No artificial dwells, no
+            # "completed-but-shown-running" inversions.
             _lock = self._status_lock(project_id)
-            first_phase = eligible[0]
+
             async with _lock:
                 await self._proj_svc.async_set_phase_status(
-                    project_id, first_phase, "in_progress",
+                    project_id, eligible[0], "in_progress",
                 )
 
-            # Fan out this batch. `return_exceptions=True` so one
-            # phase's failure doesn't take down sibling phases (match
-            # sequential-runner behaviour where we log + continue).
+            flip_events: list[asyncio.Event] = [
+                asyncio.Event() for _ in eligible
+            ]
             # A snapshot of `prior_outputs` is passed to each phase so
             # concurrent agents don't race on the same dict instance.
             prior_snapshot = dict(prior_outputs)
-            coros = [
-                self._run_single_phase(
+
+            async def _gated_phase(idx: int, pid: str):
+                """Run one phase's work in parallel, then write its status
+                in batch (phase-id) order via flip_events chaining."""
+                res = await self._run_single_phase(
                     project_id=project_id,
                     proj=proj,
                     phase_id=pid,
@@ -223,15 +237,41 @@ class PipelineService:
                     phase_name=_PHASE_META[pid][2],
                     prior_outputs=prior_snapshot,
                 )
-                for pid in eligible
-            ]
-            results = await asyncio.gather(*coros, return_exceptions=True)
+                # Wait for the previous phase in this batch to have
+                # flipped its status before we write ours. Index 0
+                # has no upstream — flips immediately when work done.
+                if idx > 0:
+                    await flip_events[idx - 1].wait()
 
-            # Build per-phase decision map for the serial status flip.
-            # On exception we default to "failed"; otherwise honour what
-            # the phase reported.
-            final_statuses: dict[str, str] = {}
-            elapsed_per_phase: dict[str, float] = {}
+                final_status = "completed"
+                elapsed_s = 0.0
+                if isinstance(res, dict):
+                    final_status = res.get("final_status", "completed")
+                    elapsed_s = float(res.get("elapsed", 0.0))
+
+                # Flip our status + nudge the next phase to in_progress
+                # in the SAME lock acquire so the frontend poll can
+                # catch them as a single transition.
+                async with _lock:
+                    await self._proj_svc.async_set_phase_status(
+                        project_id, pid, final_status,
+                        extra={"duration_seconds": round(elapsed_s, 2)},
+                    )
+                    if idx + 1 < len(eligible):
+                        await self._proj_svc.async_set_phase_status(
+                            project_id, eligible[idx + 1], "in_progress",
+                        )
+                flip_events[idx].set()
+                return res
+
+            results = await asyncio.gather(
+                *(_gated_phase(i, pid) for i, pid in enumerate(eligible)),
+                return_exceptions=True,
+            )
+
+            # Merge per-phase outputs into the shared prior_outputs that
+            # the NEXT batch will read from. Failures already logged
+            # inside _run_single_phase / _gated_phase.
             for pid, res in zip(eligible, results):
                 if isinstance(res, Exception):
                     log.warning(
@@ -243,45 +283,16 @@ class PipelineService:
                             "error": str(res)[:300],
                         },
                     )
-                    final_statuses[pid] = "failed"
-                    elapsed_per_phase[pid] = 0.0
-                elif isinstance(res, dict):
-                    final_statuses[pid] = res.get("final_status", "completed")
-                    elapsed_per_phase[pid] = float(res.get("elapsed", 0.0))
-                    if res.get("outputs"):
-                        prior_outputs.update(res["outputs"])
-                else:
-                    final_statuses[pid] = "completed"
-                    elapsed_per_phase[pid] = 0.0
-
-            # P23: "serial-look" status flip. Walk phases in batch
-            # (i.e. phase-id) order. The first phase is already
-            # `in_progress`; for each subsequent phase we flip the
-            # previous to its final status, show the next as
-            # `in_progress`, and let the frontend polling (3 s
-            # interval) catch both transitions. This gives the user
-            # the classic sequential pipeline animation even though
-            # the backend did them concurrently.
-            #
-            # `_STATUS_FLIP_DELAY_S` should be >= 2× the frontend poll
-            # interval (default 3 s) so the polling definitely catches
-            # each transition. Set to 3.5 s as a demo-comfort default.
-            for i, pid in enumerate(eligible):
-                if i > 0:
+                    # On exception inside _gated_phase the status-flip
+                    # never happened. Apply it now so the UI doesn't hang.
                     async with _lock:
                         await self._proj_svc.async_set_phase_status(
-                            project_id, pid, "in_progress",
+                            project_id, pid, "failed",
+                            extra={"error": str(res)[:300]},
                         )
-                    await asyncio.sleep(self._STATUS_FLIP_DELAY_S)
-                # Flip to final status.
-                async with _lock:
-                    await self._proj_svc.async_set_phase_status(
-                        project_id, pid, final_statuses[pid],
-                        extra={"duration_seconds": round(elapsed_per_phase[pid], 2)},
-                    )
-                # Small breather between phases so the "completed"
-                # transition is also observable.
-                await asyncio.sleep(self._STATUS_FLIP_INTERLUDE_S)
+                    continue
+                if isinstance(res, dict) and res.get("outputs"):
+                    prior_outputs.update(res["outputs"])
 
             log.info(
                 "pipeline.batch_completed",

@@ -8349,6 +8349,30 @@ typical passive/active bands).</p>
         Every path returns ASCII-safe Mermaid — unicode glyphs, edge labels,
         pipe chars, and unclosed brackets are all handled deterministically."""
 
+        # P25 (2026-04-25) RE-ORDERED PRIORITY: prefer the deterministic
+        # paths (LLM structured spec OR BOM-derived) over the raw LLM
+        # mermaid string. Rationale: every iteration of mermaid salvage
+        # in the past 5 sessions has been a whack-a-mole rule for one
+        # specific LLM mis-emission pattern (nested braces, escaped
+        # brackets, mashed-onto-one-line nodes, quoted edge labels with
+        # dotted arrows, etc.). Each new run produces a NEW broken
+        # pattern. Trying to clean raw LLM mermaid is a losing game.
+        #
+        # New priority:
+        #   1. LLM structured `block_diagram` JSON spec (deterministic).
+        #   2. BOM-derived structured chain (deterministic, real parts).
+        #   3. Salvaged raw LLM mermaid (only if no BOM available).
+        #   4. Empty / FALLBACK_DIAGRAM.
+        #
+        # User-facing impact: the architecture / block diagram in the
+        # persistent docs now ALWAYS shows a clean rendered diagram of
+        # the user's actual parts, even when the LLM's raw mermaid is
+        # unparseable. We lose any nuance the LLM tried to express in
+        # raw text (subgraphs, control signals) but gain reliability.
+        # If the LLM emits a proper structured spec (which we now ask
+        # for explicitly in FINALIZE_SYSTEM_PROMPT), it wins outright.
+
+        # Path 1 — LLM structured spec.
         structured = tool_input.get(structured_key)
         if isinstance(structured, dict) and structured.get("nodes"):
             try:
@@ -8361,10 +8385,35 @@ typical passive/active bands).</p>
                 )
             except MermaidSpecError as exc:
                 self.log(
-                    f"structured {structured_key} rejected, falling back to raw mermaid: {exc}",
+                    f"structured {structured_key} rejected, "
+                    f"trying BOM-derived: {exc}",
                     "warning",
                 )
 
+        # Path 2 — BOM-derived structured chain (NOW PROMOTED ABOVE
+        # raw-mermaid salvage). Renders deterministically from
+        # `component_recommendations` so the diagram is guaranteed to
+        # parse and shows the user's real parts.
+        bom_spec = self._derive_block_diagram_from_bom(
+            tool_input, default_direction=default_direction,
+        )
+        if bom_spec is not None:
+            try:
+                return render_block_diagram(
+                    bom_spec,
+                    default_direction=default_direction,
+                    raise_on_error=True,
+                )
+            except MermaidSpecError as exc:
+                self.log(
+                    f"BOM-derived {structured_key} render failed: {exc} — "
+                    f"falling back to raw LLM mermaid salvage",
+                    "warning",
+                )
+
+        # Path 3 — raw LLM mermaid (only reached when no BOM exists,
+        # which is rare). Salvage handles the patterns we've seen
+        # but cannot guarantee parseability.
         raw = tool_input.get(raw_key, "")
         if isinstance(raw, str) and raw.strip():
             cleaned, fixes = salvage(raw)
@@ -8373,25 +8422,11 @@ typical passive/active bands).</p>
                     f"{raw_key}: salvaged LLM mermaid (fixes: {','.join(fixes)})",
                     "info",
                 )
-            # P20 (2026-04-24): if salvage bailed to FALLBACK_DIAGRAM (the
-            # "diagram could not be rendered" placeholder), the raw mermaid
-            # was unrecoverable. Rather than ship that placeholder to the
-            # user, BUILD a structured block diagram from the BOM
-            # (component_recommendations) and render it deterministically —
-            # the user at least gets a real signal-chain diagram for their
-            # own parts. This replaces the old whack-a-mole salvage-rule
-            # pattern with a guaranteed-real output whenever the LLM's raw
-            # mermaid fails.
             if "fallback" not in fixes:
                 return cleaned
-            self.log(
-                f"{raw_key}: salvage gave up — deriving structured diagram "
-                f"from component_recommendations instead",
-                "warning",
-            )
 
-        # Either `raw` was empty, or salvage returned the placeholder.
-        # Try deriving a structured spec from the BOM before giving up.
+        # Path 4 — last-ditch BOM derivation in case path 2 returned
+        # None (e.g. <2 components) but raw was also unrecoverable.
         bom_spec = self._derive_block_diagram_from_bom(
             tool_input, default_direction=default_direction,
         )

@@ -302,6 +302,86 @@ def test_derive_block_diagram_from_bom_returns_structured_spec():
         assert e["to"] in node_ids
 
 
+def test_bom_derived_path_now_preferred_over_raw_llm_mermaid():
+    """P25 (2026-04-25): the user reported repeated mermaid parse
+    failures across many sessions — every run produces a NEW broken
+    pattern in the LLM's raw `block_diagram_mermaid` string. Trying
+    to clean each pattern is whack-a-mole.
+
+    Fix: BOM-derived structured chain is now PROMOTED above raw-mermaid
+    salvage in `_render_diagram_field`. When both `block_diagram_mermaid`
+    (raw, possibly clean) and `component_recommendations` are present,
+    the BOM-derived path wins. Result: the rendered diagram is
+    deterministic and includes the user's real parts; the LLM's
+    free-text mermaid is no longer the primary source of truth.
+
+    This test pins the priority ordering against future refactors that
+    might silently swap them back.
+    """
+    agent = _StubAgent()
+    tool_input = {
+        # NO structured spec
+        "block_diagram_mermaid": (
+            # Even a perfectly-clean raw mermaid string must lose to
+            # the BOM-derived chain when both are present.
+            "flowchart LR\n"
+            "    LEGACY_NODE[Legacy LLM diagram]\n"
+        ),
+        "component_recommendations": [
+            {"primary_part": "HMC8410", "function": "LNA"},
+            {"primary_part": "ADL5801", "function": "Mixer"},
+            {"primary_part": "AD9643", "function": "ADC"},
+        ],
+    }
+    out = agent._render_diagram_field(
+        tool_input,
+        structured_key="block_diagram",
+        raw_key="block_diagram_mermaid",
+        default_direction="LR",
+    )
+    # BOM-derived chain wins — output contains all 3 real MPNs.
+    assert "HMC8410" in out
+    assert "ADL5801" in out
+    assert "AD9643" in out
+    # The LLM's raw mermaid label is NOT in the output.
+    assert "Legacy LLM diagram" not in out
+    assert "LEGACY_NODE" not in out
+
+
+def test_llm_structured_spec_still_wins_over_bom_derived():
+    """The promotion of BOM-derived in P25 must NOT override the LLM's
+    structured `block_diagram` JSON spec when one is provided.
+    Priority order is: structured > BOM-derived > salvaged-raw."""
+    agent = _StubAgent()
+    tool_input = {
+        # LLM provided a structured spec — this must win.
+        "block_diagram": {
+            "direction": "LR",
+            "nodes": [
+                {"id": "LLM_LNA", "label": "LLM-chosen LNA",
+                 "shape": "amplifier"},
+                {"id": "LLM_MIX", "label": "LLM-chosen Mixer",
+                 "shape": "mixer"},
+            ],
+            "edges": [{"from": "LLM_LNA", "to": "LLM_MIX"}],
+        },
+        # And a BOM exists — but should NOT win because structured did.
+        "component_recommendations": [
+            {"primary_part": "HMC8410", "function": "LNA"},
+            {"primary_part": "ADL5801", "function": "Mixer"},
+        ],
+    }
+    out = agent._render_diagram_field(
+        tool_input,
+        structured_key="block_diagram",
+        raw_key="block_diagram_mermaid",
+        default_direction="LR",
+    )
+    # LLM's structured labels appear; BOM MPNs do not.
+    assert "LLM-chosen LNA" in out or "LLM_LNA" in out
+    assert "HMC8410" not in out
+
+
 def test_derive_block_diagram_sanitises_mpn_for_node_ids():
     """Mermaid node IDs must match `^[A-Za-z][A-Za-z0-9_]*$`. MPNs with
     `+` / `-` / `/` must be scrubbed before becoming IDs, otherwise the
