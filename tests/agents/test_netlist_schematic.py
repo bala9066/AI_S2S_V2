@@ -600,3 +600,77 @@ def test_floating_pin_closure_distributes_by_pin_index():
             f"primary closure components in column overlap on y: "
             f"{sorted(biggest_col)}"
         )
+
+
+def test_zero_ic_overlap_across_diverse_topologies():
+    """P26 #5: prove the layout fix is GENERAL — not project-specific.
+    Synthesise schematics for FIVE distinct topologies (radar, comms,
+    SDR, big FPGA design, all-passive RF chain) and assert zero IC
+    overlap on every one. The cumulative-band y-base allocation
+    guarantees this property regardless of how many ICs land in any
+    single band."""
+    from collections import Counter
+    agent = _make_agent()
+
+    topologies = {
+        # 1) Big radar receiver — heavy on RF chain
+        "radar": [{"instance_id": f"U{i}", "reference_designator": f"U{i}",
+                   "component_name": f"LNA #{i}",
+                   "part_number": f"HMC{8410+i}"} for i in range(15)]
+                + [{"instance_id": f"X{i}", "reference_designator": f"X{i}",
+                    "component_name": f"Mixer #{i}",
+                    "part_number": f"ADL{5801+i}"} for i in range(8)]
+                + [{"instance_id": f"A{i}", "reference_designator": f"A{i}",
+                    "component_name": f"ADC #{i}",
+                    "part_number": f"AD{9625+i}"} for i in range(4)],
+        # 2) Comms — balanced ADC + FPGA + power
+        "comms": [{"instance_id": f"U{i}", "reference_designator": f"U{i}",
+                   "component_name": f"ADC #{i}",
+                   "part_number": f"AD{9625+i}"} for i in range(10)]
+                + [{"instance_id": f"P{i}", "reference_designator": f"P{i}",
+                    "component_name": f"LDO Regulator #{i}",
+                    "part_number": f"TPS{7400+i}"} for i in range(8)]
+                + [{"instance_id": f"F{i}", "reference_designator": f"F{i}",
+                    "component_name": f"FPGA #{i}",
+                    "part_number": f"XCZU{4+i}CG"} for i in range(3)],
+        # 3) SDR — clock + LO synth heavy
+        "sdr": [{"instance_id": f"U{i}", "reference_designator": f"U{i}",
+                 "component_name": f"PLL Synth #{i}",
+                 "part_number": f"LMX{2572+i}"} for i in range(12)]
+              + [{"instance_id": f"C{i}", "reference_designator": f"C{i}",
+                  "component_name": f"Clock Distribution #{i}",
+                  "part_number": f"AD{9523+i}"} for i in range(6)],
+        # 4) All-passive RF (limiters, BPFs, attenuators only)
+        "passive_rf": [{"instance_id": f"U{i}", "reference_designator": f"U{i}",
+                        "component_name": f"PIN Diode Limiter #{i}",
+                        "part_number": f"CLA{4603+i}"} for i in range(20)]
+                     + [{"instance_id": f"F{i}", "reference_designator": f"F{i}",
+                         "component_name": f"BPF Filter #{i}",
+                         "part_number": f"BPF{1000+i}"} for i in range(15)],
+        # 5) Many connectors — forces band 0 wrap
+        "connectors": [{"instance_id": f"J{i}", "reference_designator": f"J{i}",
+                        "component_name": f"SMA Connector #{i}",
+                        "part_number": "SMA-F-RF"} for i in range(20)],
+    }
+
+    failures = []
+    for name, nodes in topologies.items():
+        s = _run_schematic(agent, nodes)
+        # Assert single page:
+        if len(s["sheets"]) != 1:
+            failures.append(f"{name}: expected 1 sheet, got {len(s['sheets'])}")
+            continue
+        # Assert zero IC overlap:
+        ic_xys = [(round(c["x"], 1), round(c["y"], 1))
+                  for c in s["sheets"][0]["components"]
+                  if c.get("type") == "ic"]
+        overlaps = [(k, v) for k, v in Counter(ic_xys).items() if v > 1]
+        if overlaps:
+            failures.append(
+                f"{name}: {len(overlaps)} IC overlap positions, e.g. {overlaps[:3]}"
+            )
+
+    assert not failures, (
+        "Layout fix is NOT general across topologies:\n  "
+        + "\n  ".join(failures)
+    )
