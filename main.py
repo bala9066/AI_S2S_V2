@@ -1119,7 +1119,7 @@ def _sanitize_mermaid_code(code: str) -> str:
 # alone produces clean output that all 3 renderers accept. Bump
 # invalidates v4 cached docx files that were rendered with the
 # legacy sanitiser still corrupting the salvaged source.
-_DOCX_CACHE_VERSION = 5
+_DOCX_CACHE_VERSION = 6
 
 
 def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:
@@ -1175,6 +1175,15 @@ def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:
     #            because pandoc was dropping the unlabeled code fence.
     from tools.mermaid_salvage import FALLBACK_DIAGRAM as _FALLBACK_MMD
 
+    def _png_aspect(png_path: str) -> float | None:
+        """Return height/width aspect of the PNG, or None on error."""
+        try:
+            from PIL import Image
+            with Image.open(png_path) as img:
+                return img.size[1] / img.size[0]
+        except Exception:
+            return None
+
     def render_diagram(idx_code):
         idx, code = idx_code
         img_path = str(tmp / f"diagram_{idx}.png")
@@ -1224,9 +1233,27 @@ def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:
         path, is_real = results.get(idx, (None, False))
         if path and is_real:
             img_path_md = path.replace('\\', '/')
+            # P26 #7 (2026-04-25): tall diagrams (height/width > 1.0)
+            # would render at 6 in wide × >6 in tall, overflowing the
+            # remaining page-1 space below the title and getting
+            # bumped to page 2 — user thinks the docx is "empty".
+            # Pass explicit max-height to pandoc via the markdown
+            # image attribute syntax `{ width=... height=... }` so
+            # tall diagrams scale DOWN to fit on page 1 (loses some
+            # readability but stays adjacent to its title).
+            aspect = _png_aspect(path) or 1.0
+            if aspect > 1.0:
+                # Tall diagram: cap height at 7 in (out of 9 in usable
+                # page 1 space after 2 in title block). Width auto-
+                # scales down from 6 in to maintain aspect.
+                attrs = " { height=7in }"
+            else:
+                # Landscape / square: fix width at 6 in, let height
+                # follow the aspect (always fits on page 1).
+                attrs = " { width=6in }"
             replacement = (
                 f"\n\n**System Architecture Diagram {idx}**\n\n"
-                f"![Diagram {idx}]({img_path_md})\n\n"
+                f"![Diagram {idx}]({img_path_md}){attrs}\n\n"
             )
         elif path:  # placeholder PNG rendered
             img_path_md = path.replace('\\', '/')
