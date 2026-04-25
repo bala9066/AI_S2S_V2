@@ -416,7 +416,12 @@ def test_pipeline_batches_respect_dependencies():
         "P7a": ["P7"],     # Register map from FPGA interfaces
         "P8a": ["P4"],     # SRS loads P1..P4
         "P8b": ["P8a"],    # SDD from SRS
-        "P8c": ["P8a"],    # Code review from SRS / source
+        # P26 #12 (2026-04-25): P8c also depends on P8b — `code_agent.py`
+        # loads SDD_*.md (written by P8b) at the start of execute() and
+        # bails with `phase_complete: False` if it can't read SDD. The
+        # pre-fix `["P8a"]` allowed P8c to fire ~3s after P8a finished
+        # while P8b was still ~6 min away from writing SDD.
+        "P8c": ["P8a", "P8b"],
     }
     seen_before: set[str] = set()
     for batch in _PIPELINE_BATCHES:

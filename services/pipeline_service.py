@@ -82,7 +82,14 @@ _PHASE_DEPS: dict[str, tuple[str, ...]] = {
     "P7":  ("P6",),
     "P8b": ("P8a",),
     "P7a": ("P7",),
-    "P8c": ("P8a",),
+    # P8c (Code Generation + Review) loads BOTH SRS_*.md (from P8a) AND
+    # SDD_*.md (from P8b) inside `code_agent.py::execute`. Pre-fix this
+    # tuple was just `("P8a",)` so P8c started ~3s after P8a finished
+    # and immediately returned `phase_complete: False` because SDD wasn't
+    # written yet (P8b takes ~6 min). User-facing symptom: P8c always
+    # "failed" with no error in the DB, no output files generated.
+    # Fixed (P26 #12, 2026-04-25): require BOTH P8a + P8b.
+    "P8c": ("P8a", "P8b"),
 }
 
 # Phase-id ordering used for serial UI status flips (NOT for execution order).
@@ -115,14 +122,22 @@ class PipelineService:
     Designed to run as a FastAPI BackgroundTask.
     """
 
-    # P24 (2026-04-25): kept for back-compat with tests that override
-    # them — the new event-chained status writes don't use artificial
-    # delays anymore (each phase flips as soon as it finishes work AND
-    # the previous phase has flipped). Setting these to non-zero in a
-    # subclass would have NO effect on the new code path; they're left
-    # here only so existing test fixtures that set them to 0 don't break.
+    # P26 #12 (2026-04-25): re-enabled `_STATUS_FLIP_INTERLUDE_S` after
+    # the user reported "elapsed time for compliance only and jumped to
+    # GLR" / "srs and sdd completed [too fast to see]". Root cause: the
+    # frontend polls phase status every 3s, but `_serialised_flip` writes
+    # P3=completed → nudges P4=in_progress → P4 work was already done so
+    # P4=completed within microseconds → P6=in_progress... all between
+    # two UI polls. User saw P3=completed then P6=in_progress with P4
+    # entirely missed. The interlude WAITS after each flip so the next
+    # phase's `in_progress` state survives at least one poll cycle. Set
+    # to 4s = one poll (3s) + buffer (1s) so polls reliably catch each
+    # in_progress state. Total overhead = 9 phases × 4s = ~36s.
+    #
+    # `_STATUS_FLIP_DELAY_S` is unused now; kept for back-compat with
+    # test fixtures that set both. Set to 0 to skip.
     _STATUS_FLIP_DELAY_S = 0.0
-    _STATUS_FLIP_INTERLUDE_S = 0.0
+    _STATUS_FLIP_INTERLUDE_S = 4.0
 
     def __init__(
         self,
@@ -260,7 +275,16 @@ class PipelineService:
             """Write phase pid's status to the DB, but only AFTER every
             earlier phase in `_PHASE_FLIP_ORDER` has had its status
             written. Also nudge the next phase to in_progress so the
-            sidebar shows continuous activity."""
+            sidebar shows continuous activity.
+
+            P26 #12: holds `flip_done[pid]` for `_STATUS_FLIP_INTERLUDE_S`
+            seconds AFTER the DB writes so the next sibling phase whose
+            work is already done can't immediately flip. Without this
+            interlude the user misses parallel-finished phases entirely
+            (their elapsed display blips for less than one 3s poll cycle).
+            The interlude DOES NOT extend phase work time — only the
+            visible status transition is delayed.
+            """
             pid_idx = _PHASE_FLIP_ORDER.index(pid)
             for prev_idx in range(pid_idx):
                 prev_pid = _PHASE_FLIP_ORDER[prev_idx]
@@ -289,6 +313,19 @@ class PipelineService:
                         await self._proj_svc.async_set_phase_status(
                             project_id, next_pid, "in_progress",
                         )
+
+            # Hold the next phase's flip for one poll cycle so the user
+            # actually SEES it transition through in_progress. Skipped
+            # for the LAST phase (nothing to hold open for) and for
+            # failures (failure is the terminal state, no transition to
+            # protect). Configurable via class attr for tests that need
+            # zero-delay execution.
+            if (
+                self._STATUS_FLIP_INTERLUDE_S > 0
+                and status == "completed"
+                and next_pid is not None
+            ):
+                await asyncio.sleep(self._STATUS_FLIP_INTERLUDE_S)
             flip_done[pid].set()
 
         async def _phase_worker(pid: str) -> dict:
