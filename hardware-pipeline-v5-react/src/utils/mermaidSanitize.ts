@@ -162,16 +162,19 @@ export function sanitizeMermaid(raw: string): string {
   code = code.replace(/<(?!br\b)[^>\n]+>/gi, ' ');
 
   // P26 (2026-04-25, second pass): trapezoid `[\..\]` and parallelogram
-  // `[/.../]` shapes — strip REDUNDANT internal quotes the LLM emits when
-  // it JSON-escapes its tool input:
-  //   ADC[\"label"\]    →  ADC[\label\]
-  //   OUT[/"label"/]    →  OUT[/label/]
-  // Mermaid does NOT accept quotes inside `[\..\]` or `[/.../]` — the
-  // inner `"` confuses the parser into looking for a quoted-label close
-  // that then doesn't match the shape's `\]` or `/]` close, and the
-  // diagram fails with "Parse error on line N: ... <unrelated content>"
-  // because parsing got out of sync. Mirror of the backend's
-  // `_step_normalise_shape_quotes` (`tools/mermaid_salvage.py`).
+  // `[/.../]` shapes — strip REDUNDANT internal quotes the LLM emits
+  // when it JSON-escapes its tool input. The trapezoid/parallelogram
+  // family is the ONLY shape group mermaid genuinely REJECTS quoted
+  // labels on; all other shapes (`[[..]]`, `{{..}}`, `((..))`,
+  // `([..])`, `[(..)]`, `[label]`, `(label)`, `{label}`) accept
+  // quoted labels and we leave those alone.
+  //
+  // P26 #4 (fyfu DOCX fix): an earlier "third pass" was stripping
+  // quotes off ALL shape variants — that turned the well-formed
+  // stadium `RF_CH1(["RF Chain 1 (Ant1 to ADC1)"])` into the broken
+  // `RF_CH1([RF Chain 1 (Ant1 to ADC1)])`, which mermaid rejected
+  // because the unquoted inner `(Ant1 to ADC1)` parens trip the
+  // stadium parser. Mirror of backend `_step_normalise_shape_quotes`.
   code = code.replace(/\[\\\s*"([^"]*)"\s*\\\]/g, (_m, inner: string) => `[\\${inner.trim()}\\]`);
   code = code.replace(/\[\/\s*"([^"]*)"\s*\/\]/g, (_m, inner: string) => `[/${inner.trim()}/]`);
   // Ensure `end` (subgraph close) is always on its own line — trailing case

@@ -181,16 +181,9 @@ def _step_normalise_shape_quotes(text: str) -> tuple[str, Optional[str]]:
         lambda m: f'[\\\\{m.group(1).strip()}\\\\]',
         text,
     )
-    # P26 (2026-04-25, third pass) — additional shape variants caught from
-    # project fyfu (block_diagram.md):
-    #   LIM1[/"Lim / CLA4602-000"\]    mixed-slash trapezoid
-    #   ADC1[\"ADC / AD9643"/]         mixed-slash trapezoid_alt
-    #   BUCK[["Buck / LT1107"]]        subroutine (double-bracket)
-    #   BPF{{"Custom Cavity"}}         hexagon
-    #   OSC(("10 MHz Reference"))      circle
-    #   BAY(["RF Chain"])              stadium
-    #   DB[("Database / SPI Flash")]   cylinder
-    # Mermaid does NOT accept quotes inside any of these — strip them.
+    # P26 #4 (2026-04-25, fyfu DOCX fix) — additional MIXED-SLASH
+    # trapezoid variants. Mermaid's `[/..\]` family is the ONLY shape
+    # group that genuinely REJECTS inner quotes.
     text = re.sub(
         r'\[/\s*"([^"]*)"\s*\\\]',
         lambda m: f'[/{m.group(1).strip()}\\]',
@@ -201,31 +194,17 @@ def _step_normalise_shape_quotes(text: str) -> tuple[str, Optional[str]]:
         lambda m: f'[\\{m.group(1).strip()}/]',
         text,
     )
-    text = re.sub(
-        r'\[\[\s*"([^"]*)"\s*\]\]',
-        lambda m: f'[[{m.group(1).strip()}]]',
-        text,
-    )
-    text = re.sub(
-        r'\{\{\s*"([^"]*)"\s*\}\}',
-        lambda m: f'{{{{{m.group(1).strip()}}}}}',
-        text,
-    )
-    text = re.sub(
-        r'\(\(\s*"([^"]*)"\s*\)\)',
-        lambda m: f'(({m.group(1).strip()}))',
-        text,
-    )
-    text = re.sub(
-        r'\(\[\s*"([^"]*)"\s*\]\)',
-        lambda m: f'([{m.group(1).strip()}])',
-        text,
-    )
-    text = re.sub(
-        r'\[\(\s*"([^"]*)"\s*\)\]',
-        lambda m: f'[({m.group(1).strip()})]',
-        text,
-    )
+    # NOTE — DO NOT strip quotes from `[[..]]`, `{{..}}`, `((..))`,
+    # `([..])`, `[(..)]`. Mermaid's parser ACCEPTS quoted labels in
+    # these shapes — and REQUIRES them when the label contains parens
+    # or other special chars. Earlier code stripped them aggressively,
+    # which turned `RF_CH1(["RF Chain 1 (Ant1 to ADC1)"])` into
+    # `RF_CH1([RF Chain 1 (Ant1 to ADC1)])` — mermaid then choked on
+    # the unquoted inner `(Ant1 to ADC1)`:
+    #   "Parse error on line 14: ...RF_CH1([RF Chain 1 (Ant1 to ADC1)])
+    #    -----------------------^ Expecting 'SQE', 'PE', ..."
+    # Quoted labels render correctly in mermaid.js / mermaid.ink / mmdc
+    # for ALL these shapes; leaving the LLM's quotes alone is safer.
     if text != original:
         return text, "normalise_shape_quotes"
     return text, None

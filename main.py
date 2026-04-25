@@ -1183,7 +1183,14 @@ def _sanitize_mermaid_code(code: str) -> str:
 # delimiter preservation. Existing cached `.docx` files were rendered
 # with the OLD salvage that mangled these shapes into placeholders. The
 # bump forces a re-render on next download so users see the real PNGs.
-_DOCX_CACHE_VERSION = 3
+# P26 #4 (2026-04-25, fyfu DOCX fix): bumped to 4 — the v3 salvage was
+# OVER-stripping quotes from `[[..]]` / `((..))` / `(["..(..)"])` family,
+# which then broke mermaid stadium parsing on labels like
+# `RF_CH1(["RF Chain 1 (Ant1 to ADC1)"])`. Now only trapezoid /
+# parallelogram quotes are stripped (those genuinely reject quotes);
+# all other shapes preserve them. v3 cached docx files were rendered
+# with the bad salvage and need re-rendering.
+_DOCX_CACHE_VERSION = 4
 
 
 def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:

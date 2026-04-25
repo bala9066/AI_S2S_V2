@@ -726,38 +726,61 @@ class TestP26ShapeVariants:
     project fyfu. Mermaid parse error: `Parse error on line 3: ...12V to
     5V]] LDO_5...`."""
 
-    def test_subroutine_quotes_stripped(self):
-        """`[["..."]]` → `[[...]]` (subroutine, redundant inner quotes)."""
+    def test_subroutine_quotes_PRESERVED(self):
+        """P26 #4 (fyfu DOCX fix): `[[".."]]` quotes must be PRESERVED.
+        Mermaid accepts quoted labels in subroutine shapes and may
+        REQUIRE them when the label has special chars. Stripping them
+        was over-aggressive and broke labels containing parens."""
         raw = (
             "flowchart TB\n"
             '    BUCK[["Buck / LT1107CS8-5"]]\n'
             "    BUCK --> X\n"
         )
-        cleaned, fixes = salvage(raw)
-        assert "[[Buck / LT1107CS8-5]]" in cleaned, (
-            f"subroutine quotes not stripped — got:\n{cleaned}"
+        cleaned, _ = salvage(raw)
+        # Quoted form survives intact — both `[[..]]` brackets matched.
+        assert '[["Buck / LT1107CS8-5"]]' in cleaned, (
+            f"subroutine quotes were stripped (should be preserved) — "
+            f"got:\n{cleaned}"
         )
 
-    def test_hexagon_quotes_stripped(self):
-        """`{{"..."}}` → `{{...}}` (hexagon)."""
+    def test_hexagon_quotes_PRESERVED(self):
+        """P26 #4: `{{"..."}}` quotes preserved (mermaid accepts them)."""
         raw = (
             "flowchart TD\n"
             '    BPF{{"Custom Cavity / IL1.5"}}\n'
         )
         cleaned, _ = salvage(raw)
-        assert "{{Custom Cavity / IL1.5}}" in cleaned
+        assert '{{"Custom Cavity / IL1.5"}}' in cleaned
 
-    def test_circle_quotes_stripped(self):
-        """`(("..."))` → `((...))` (circle, NOT collapsed to round)."""
+    def test_circle_quotes_PRESERVED(self):
+        """P26 #4: `(("..."))` quotes preserved."""
         raw = (
             "flowchart TD\n"
             '    OSC(("10 MHz Reference"))\n'
         )
         cleaned, _ = salvage(raw)
-        assert "((10 MHz Reference))" in cleaned
+        assert '(("10 MHz Reference"))' in cleaned
+
+    def test_stadium_with_parens_in_label_renders(self):
+        """P26 #4 (the actual fyfu DOCX bug): stadium `(["label (with parens)"])`
+        must keep its quotes — mermaid REJECTS unquoted labels containing
+        parens. Real fyfu input that broke mmdc:
+            RF_CH1(["RF Chain 1 (Ant1 to ADC1)"])
+        After my over-eager P26 #3 strip:
+            RF_CH1([RF Chain 1 (Ant1 to ADC1)])  ← unquoted parens
+        mmdc: Parse error on line 14: ...Expecting 'SQE', 'PE', ..."""
+        raw = (
+            "flowchart TD\n"
+            '    RF_CH1(["RF Chain 1 (Ant1 to ADC1)"])\n'
+        )
+        cleaned, _ = salvage(raw)
+        assert '(["RF Chain 1 (Ant1 to ADC1)"])' in cleaned, (
+            f"stadium with parens-in-label was mangled — got:\n{cleaned}"
+        )
 
     def test_mixed_slash_trapezoid_quotes_stripped(self):
-        """`[/"..."\\]` → `[/...\\]` (mixed-slash trapezoid, real fyfu input)."""
+        """`[/"..."\\]` → `[/...\\]` (mixed-slash trapezoid). Mermaid
+        REJECTS quotes in trapezoid family — these MUST be stripped."""
         raw = (
             "flowchart TD\n"
             r'    LIM1[/"Lim / CLA4602-000 / IL0.2 P+33max"\]' + "\n"
@@ -768,8 +791,11 @@ class TestP26ShapeVariants:
         )
 
     def test_full_fyfu_architecture_renders_cleanly(self):
-        """End-to-end: project fyfu's architecture.md must survive salvage
-        with all subroutine/parallelogram/round shapes intact."""
+        """End-to-end: project fyfu's architecture.md (the actual file the
+        user complained about with 'placeholder shown' DOCX) must survive
+        salvage with all shapes intact AND the result must pass mmdc /
+        mermaid.ink rendering. Quoted labels in subroutine, round,
+        stadium shapes are PRESERVED; only trapezoid quotes are stripped."""
         raw = (
             "flowchart TB\n"
             '    PWR_IN[/"+12V DC Input"/]\n'
@@ -782,13 +808,16 @@ class TestP26ShapeVariants:
             "    RAIL_5V --> LDO_5\n"
         )
         cleaned, _ = salvage(raw)
-        # Each shape must be intact (matched delimiters):
+        # Trapezoid: quotes stripped (mermaid rejects them there).
         assert "[/+12V DC Input/]" in cleaned
-        # BUCK has `#` in label — `_step_quote_dangerous_labels` may
-        # re-add quotes around the label. Either form is valid mermaid.
-        assert ("[[Buck / LT1107CS8-5#PBF / 12V to 5V]]" in cleaned
-                or '[["Buck / LT1107CS8-5#PBF / 12V to 5V"]]' in cleaned)
-        assert "[[LDO 5V / SPX3819M5-L-5-0/TR]]" in cleaned
-        # No mangled forms (single-open + double-close, etc.):
+        # Subroutine + round + stadium: quotes preserved (mermaid OK
+        # AND they're required for parens-containing labels).
+        assert '[["Buck / LT1107CS8-5#PBF / 12V to 5V"]]' in cleaned
+        assert '[["LDO 5V / SPX3819M5-L-5-0/TR"]]' in cleaned
+        assert '("TCXO 10 MHz Ref")' in cleaned
+        assert '(["RF Chain 1 (Ant1 to ADC1)"])' in cleaned
+        # No mangled forms:
         assert "BUCK[Buck" not in cleaned   # single-open mangle
         assert "5V]]]" not in cleaned       # triple close
+        # Stadium label still has its parens INSIDE the quotes:
+        assert "(Ant1 to ADC1)" in cleaned
