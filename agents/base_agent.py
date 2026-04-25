@@ -35,6 +35,73 @@ _otel_tracer = _tracer("hardware-pipeline.agent")
 logger = logging.getLogger(__name__)
 
 
+# P26 (2026-04-25) — 429 rate-limit retry with exponential backoff.
+#
+# Symptom this fixes (project djd, P7 failure):
+#   "All models in fallback chain failed. Last error:
+#    Error code: 429 - {'error': {'code': '1302',
+#    'message': 'Rate limit reached for requests'}}"
+#
+# When the DAG fires P3+P6+P8a+P7+P8b+P8c in parallel and HRS internally
+# fires 8 sub-section calls in parallel, GLM/Z.AI's rate limiter throws
+# 429s. The previous code immediately fell through to the next model in
+# the chain — but with both glm-5.1 and glm-4.7 on the SAME Z.AI account,
+# both hit the rate limit at the same moment and the chain exhausted.
+#
+# New behaviour: on 429 (or other transient errors — 5xx, network), sleep
+# with exponential backoff and retry the SAME model up to N times BEFORE
+# falling through to the next model. Permanent errors (401, 402, 404) still
+# fall through immediately so we don't waste time retrying e.g. a missing
+# DeepSeek balance.
+_RETRY_MAX_ATTEMPTS_PER_MODEL = 3
+_RETRY_BACKOFF_BASE_S = 5.0   # 1st retry waits 5s, 2nd waits 10s, 3rd waits 20s
+_RETRY_BACKOFF_FACTOR = 2.0
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Should we sleep + retry the SAME model, or fall through to the next?
+
+    Transient (retry):  429 rate-limit, 5xx, connection-reset, timeout.
+    Permanent (skip):   401 auth, 402 insufficient balance, 404 model-not-found,
+                        400 bad-request (these won't change on retry).
+    """
+    # Anthropic SDK rate-limit (429) — always transient.
+    if isinstance(exc, anthropic.RateLimitError):
+        return True
+    # Anthropic SDK 5xx → server error → transient.
+    if isinstance(exc, anthropic.APIStatusError):
+        sc = getattr(exc, "status_code", None)
+        if sc is not None:
+            if sc == 429 or 500 <= sc <= 599:
+                return True
+            return False  # 4xx other than 429 = permanent
+        # No status_code attr — fall back to message inspection.
+    # OpenAI SDK (DeepSeek path) — has its own RateLimitError + APIStatusError.
+    try:
+        import openai as _openai
+        if isinstance(exc, _openai.RateLimitError):
+            return True
+        if isinstance(exc, _openai.APIStatusError):
+            sc = getattr(exc, "status_code", None)
+            if sc is not None:
+                if sc == 429 or 500 <= sc <= 599:
+                    return True
+                return False
+    except Exception:
+        pass
+    # httpx network / timeout errors — transient.
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)):
+        return True
+    # Last-resort string sniff for "rate limit" / "429" in the error message,
+    # since httpx-wrapped errors can lose the original status code.
+    s = str(exc).lower()
+    if "rate limit" in s or "429" in s:
+        return True
+    if "503" in s or "502" in s or "504" in s or "service unavailable" in s:
+        return True
+    return False
+
+
 def _get_proxy() -> Optional[str]:
     """
     Detect proxy for outbound HTTPS — in order of priority:
@@ -229,18 +296,42 @@ class BaseAgent(ABC):
             span.set_attribute("llm.max_tokens", max_tokens)
             last_error = None
             for fallback_model in chain:
-                _start_ms = _now_ms()
-                try:
-                    result = await self._call_model(
-                        fallback_model, messages, system, tools, max_tokens, tool_choice
-                    )
-                    if result:
+                # P26 (2026-04-25): per-model retry loop. On 429 / transient
+                # error, sleep with exponential backoff and retry the SAME
+                # model up to _RETRY_MAX_ATTEMPTS_PER_MODEL times BEFORE
+                # falling through to the next model in the chain. See the
+                # `_is_transient_error` docstring for the transient/permanent
+                # split — permanent errors (401/402/404) skip retry and fall
+                # through immediately.
+                attempt_in_model = 0
+                while True:
+                    attempt_in_model += 1
+                    _start_ms = _now_ms()
+                    try:
+                        result = await self._call_model(
+                            fallback_model, messages, system, tools, max_tokens, tool_choice
+                        )
+                        if not result:
+                            # `_call_model` returned None (unknown model type
+                            # or routing failure). NOT transient — no point
+                            # retrying. Fall through to next model.
+                            logger.warning(
+                                "llm.unknown_model phase=%s model=%s — _call_model "
+                                "returned None, falling through",
+                                self.phase_number, fallback_model,
+                                extra={"phase": self.phase_number},
+                            )
+                            last_error = RuntimeError(
+                                f"_call_model returned None for {fallback_model!r}"
+                            )
+                            break  # next model in chain
                         result["model_used"] = fallback_model
                         usage = result.get("usage", {})
                         logger.info(
-                            "llm.call_ok phase=%s model=%s in=%s out=%s",
+                            "llm.call_ok phase=%s model=%s in=%s out=%s attempts=%d",
                             self.phase_number, fallback_model,
                             usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                            attempt_in_model,
                             extra={"phase": self.phase_number, "model": fallback_model},
                         )
                         span.set_attribute("llm.model_used", fallback_model)
@@ -249,6 +340,7 @@ class BaseAgent(ABC):
                         span.set_attribute("llm.stop_reason", result.get("stop_reason", "") or "")
                         span.set_attribute("llm.latency_ms", _now_ms() - _start_ms)
                         span.set_attribute("llm.tool_calls", len(result.get("tool_calls") or []))
+                        span.set_attribute("llm.attempts", attempt_in_model)
                         # B1.3 — persist one llm_calls row per successful call.
                         try:
                             _log_llm_call(
@@ -265,31 +357,68 @@ class BaseAgent(ABC):
                         except Exception as _log_exc:
                             logger.debug("llm_logger.failed: %s", _log_exc)
                         return result
-                except anthropic.RateLimitError as e:
-                    logger.warning(
-                        "llm.rate_limit phase=%s model=%s — trying next",
-                        self.phase_number, fallback_model,
-                        extra={"phase": self.phase_number},
-                    )
-                    last_error = e
-                except anthropic.APIStatusError as e:
-                    if "token" in str(e).lower() or "limit" in str(e).lower():
+                    except anthropic.APIStatusError as e:
+                        # APIStatusError covers 4xx and 5xx — split into
+                        # transient (429, 5xx) and permanent (other 4xx).
+                        if _is_transient_error(e) and attempt_in_model < _RETRY_MAX_ATTEMPTS_PER_MODEL:
+                            backoff_s = _RETRY_BACKOFF_BASE_S * (
+                                _RETRY_BACKOFF_FACTOR ** (attempt_in_model - 1)
+                            )
+                            logger.warning(
+                                "llm.transient_error phase=%s model=%s attempt=%d/%d — "
+                                "sleeping %.1fs and retrying same model. err=%s",
+                                self.phase_number, fallback_model,
+                                attempt_in_model, _RETRY_MAX_ATTEMPTS_PER_MODEL,
+                                backoff_s, str(e)[:200],
+                                extra={"phase": self.phase_number, "model": fallback_model},
+                            )
+                            last_error = e
+                            await asyncio.sleep(backoff_s)
+                            continue  # retry SAME model
+                        # Either non-transient OR exhausted retries — give up
+                        # on this model and try the next.
+                        if _is_transient_error(e):
+                            logger.warning(
+                                "llm.transient_error_exhausted phase=%s model=%s — "
+                                "exhausted %d retries, falling through to next model",
+                                self.phase_number, fallback_model,
+                                _RETRY_MAX_ATTEMPTS_PER_MODEL,
+                                extra={"phase": self.phase_number},
+                            )
+                        else:
+                            logger.warning(
+                                "llm.permanent_error phase=%s model=%s — "
+                                "non-retryable, falling through to next model. err=%s",
+                                self.phase_number, fallback_model, str(e)[:200],
+                                extra={"phase": self.phase_number},
+                            )
+                        last_error = e
+                        break  # next model in chain
+                    except Exception as e:
+                        # Non-Anthropic exceptions (httpx errors, OpenAI SDK
+                        # rate limits via DeepSeek path, RuntimeError etc.).
+                        if _is_transient_error(e) and attempt_in_model < _RETRY_MAX_ATTEMPTS_PER_MODEL:
+                            backoff_s = _RETRY_BACKOFF_BASE_S * (
+                                _RETRY_BACKOFF_FACTOR ** (attempt_in_model - 1)
+                            )
+                            logger.warning(
+                                "llm.transient_error phase=%s model=%s attempt=%d/%d — "
+                                "sleeping %.1fs and retrying same model. err=%s",
+                                self.phase_number, fallback_model,
+                                attempt_in_model, _RETRY_MAX_ATTEMPTS_PER_MODEL,
+                                backoff_s, str(e)[:200],
+                                extra={"phase": self.phase_number, "model": fallback_model},
+                            )
+                            last_error = e
+                            await asyncio.sleep(backoff_s)
+                            continue
                         logger.warning(
-                            "llm.token_limit phase=%s model=%s — trying next",
-                            self.phase_number, fallback_model,
+                            "llm.error phase=%s model=%s: %s — trying next",
+                            self.phase_number, fallback_model, e,
                             extra={"phase": self.phase_number},
                         )
                         last_error = e
-                    else:
-                        span.record_exception(e)
-                        raise
-                except Exception as e:
-                    logger.warning(
-                        "llm.error phase=%s model=%s: %s — trying next",
-                        self.phase_number, fallback_model, e,
-                        extra={"phase": self.phase_number},
-                    )
-                    last_error = e
+                        break  # next model in chain
 
             err = RuntimeError(
                 f"All models in fallback chain failed. Last error: {last_error}"

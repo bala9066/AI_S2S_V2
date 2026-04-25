@@ -197,13 +197,22 @@ class TestLLMFallback:
     """Test LLM fallback chain behavior."""
 
     @pytest.mark.asyncio
-    async def test_fallback_on_rate_limit(self, mock_env_vars):
-        """Fallback chain: primary hits rate limit → next model succeeds.
+    async def test_fallback_on_rate_limit(self, mock_env_vars, monkeypatch):
+        """Fallback chain: primary hits rate limit (429) → retried 3x on
+        the same model → all 3 fail → falls through to next model → success.
 
-        The production chain has 4 entries (primary, fast, fallback, last
-        resort). We force a short chain on the agent so the test doesn't
-        depend on which default chain `settings` is producing.
+        P26 (2026-04-25) UPDATED SEMANTICS: previously the chain fell
+        through to the next model on the FIRST 429. Now we retry the
+        SAME model up to 3 times with exponential backoff before giving
+        up — this catches transient GLM rate-limits where waiting a few
+        seconds clears the throttle, instead of immediately failing
+        through to a sibling model on the same account that's also
+        rate-limited.
         """
+        # Patch the backoff to 0 so the test doesn't actually sleep.
+        import agents.base_agent as _ba
+        monkeypatch.setattr(_ba, "_RETRY_BACKOFF_BASE_S", 0.0)
+
         agent = DummyAgent(phase_number="1", phase_name="Test")
         agent.fallback_chain = [agent.model, "claude-haiku-4-5-20251001"]
 
@@ -222,13 +231,113 @@ class TestLLMFallback:
             body={"error": {"message": "Rate limit exceeded"}},
         )
 
-        # First call raises RateLimitError, second succeeds
-        with patch.object(agent, "_call_model", side_effect=[rate_error, success_result]):
+        # Primary model: 3x rate_error (exhaust retries) → fall through.
+        # Fallback model: success on first try.
+        with patch.object(
+            agent, "_call_model",
+            side_effect=[rate_error, rate_error, rate_error, success_result],
+        ):
             result = await agent.call_llm(
                 messages=[{"role": "user", "content": "Test"}],
             )
 
         assert result["content"] == "Fallback response"
+
+    @pytest.mark.asyncio
+    async def test_retry_same_model_recovers_from_transient_429(self, mock_env_vars, monkeypatch):
+        """P26 (2026-04-25) regression test: a transient 429 that clears
+        on the second attempt MUST recover via same-model retry — NOT
+        fall through to a (potentially also rate-limited) next model.
+
+        Real failing scenario from project djd:
+            DAG fires P3+P6+P8a+P7+P8b+P8c in parallel; HRS internally
+            fires 8 sub-section calls in parallel. GLM rate-limiter
+            throws a few 429s. Old code fell through to glm-4.7 (same
+            Z.AI account, same rate limit) → also 429 → chain exhausted.
+            New code: glm-5.1 attempt 1 → 429 → sleep + retry → success.
+        """
+        import agents.base_agent as _ba
+        monkeypatch.setattr(_ba, "_RETRY_BACKOFF_BASE_S", 0.0)
+
+        agent = DummyAgent(phase_number="1", phase_name="Test")
+        agent.fallback_chain = [agent.model, "claude-haiku-4-5-20251001"]
+
+        success_result = {
+            "content": "Recovered on retry",
+            "tool_calls": [],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 10},
+        }
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        rate_error = anthropic.RateLimitError(
+            message="Rate limited", response=mock_response, body={"error": {}},
+        )
+
+        # Primary: 1x 429 → retry → success on attempt 2.
+        with patch.object(
+            agent, "_call_model",
+            side_effect=[rate_error, success_result],
+        ) as mock_call:
+            result = await agent.call_llm(
+                messages=[{"role": "user", "content": "Test"}],
+            )
+
+        assert result["content"] == "Recovered on retry"
+        assert result["model_used"] == agent.model, (
+            "should have recovered on the SAME model (primary), not "
+            f"fallen through. Got model_used={result.get('model_used')!r}"
+        )
+        # Verify _call_model was called exactly twice — both with the
+        # primary model id.
+        assert mock_call.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_permanent_error_does_not_retry(self, mock_env_vars, monkeypatch):
+        """P26 (2026-04-25) — permanent errors (auth 401, insufficient
+        balance 402, model-not-found 404) must NOT trigger same-model
+        retry — those errors don't change on retry. They should fall
+        through to the next model immediately so we don't waste time
+        sleeping. Real failing scenario: DeepSeek API balance exhausted
+        (402). Retrying the SAME DeepSeek call 3 times with backoff
+        would just delay the failure by 35 seconds before giving up."""
+        import agents.base_agent as _ba
+        monkeypatch.setattr(_ba, "_RETRY_BACKOFF_BASE_S", 0.0)
+
+        agent = DummyAgent(phase_number="1", phase_name="Test")
+        agent.fallback_chain = [agent.model, "claude-haiku-4-5-20251001"]
+
+        success_result = {
+            "content": "ok from fallback",
+            "tool_calls": [],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 10},
+        }
+        mock_response = MagicMock()
+        mock_response.status_code = 402
+        auth_error = anthropic.APIStatusError(
+            message="Insufficient Balance",
+            response=mock_response,
+            body={"error": {"message": "Insufficient Balance"}},
+        )
+
+        # Primary: ONE 402 → no retry → fall through immediately.
+        # Fallback: success.
+        with patch.object(
+            agent, "_call_model",
+            side_effect=[auth_error, success_result],
+        ) as mock_call:
+            result = await agent.call_llm(
+                messages=[{"role": "user", "content": "Test"}],
+            )
+
+        assert result["content"] == "ok from fallback"
+        assert result["model_used"] != agent.model
+        # Exactly 2 calls — 1 to primary (which 402'd), 1 to fallback (success).
+        assert mock_call.call_count == 2, (
+            f"permanent error should NOT trigger retry on same model — "
+            f"expected 2 _call_model invocations, got {mock_call.call_count}"
+        )
 
     @pytest.mark.asyncio
     async def test_all_models_fail_raises_error(self, mock_env_vars):
