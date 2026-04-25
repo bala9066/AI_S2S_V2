@@ -62,65 +62,121 @@ def _nets(schematic: dict) -> list[dict]:
     return out
 
 
-# --- Sheet-assignment tests -------------------------------------------------
+# --- Role-band placement tests ---------------------------------------------
+#
+# P26 #5 (2026-04-25): the schematic now collapses to a SINGLE page with
+# all components on one sheet titled "Schematic". The previous per-sheet
+# split (RF / ADC+Digital / Clock / Power) is gone, but components are
+# still ordered LEFT→RIGHT, TOP→BOTTOM by role-band (connectors at top,
+# RF chain below, ADC/FPGA below that, clock, then power at bottom).
+# These tests verify the role-band Y-coordinate placement instead of
+# the (now-defunct) sheet title.
 
-def test_limiter_goes_to_rf_sheet_not_adc():
+# Y-coords for each band (matches `_band_y_base` in `_synthesize_schematic`).
+# These are MINIMUMS — actual y depends on band-size accumulation, but
+# the ORDERING (RF y < ADC y < Power y) is what we verify here.
+
+
+def _y_of(schematic: dict, ref: str) -> float | None:
+    c = _comp(schematic, ref)
+    return c["y"] if c else None
+
+
+def test_single_page_collapse():
+    """P26 #5: all components on ONE sheet titled 'Schematic'."""
     agent = _make_agent()
     s = _run_schematic(agent, [
         {"instance_id": "U1", "reference_designator": "U1",
          "component_name": "PIN Diode Limiter", "part_number": "CLA4603-000"},
+        {"instance_id": "U2", "reference_designator": "U2",
+         "component_name": "JESD204B ADC", "part_number": "AD9625"},
     ])
-    title = _sheet_of(s, "U1")
-    assert title is not None
-    assert "RF" in title or "Front" in title, \
-        f"Limiter must be on RF sheet, got '{title}'"
-    assert "Digit" not in title, \
-        f"Limiter must NOT be on ADC sheet, got '{title}'"
+    assert len(s["sheets"]) == 1, (
+        f"single-page mode must produce exactly 1 sheet, got {len(s['sheets'])}"
+    )
+    assert s["sheets"][0]["title"] == "Schematic"
+    # Both components on the same sheet:
+    assert _comp(s, "U1") is not None
+    assert _comp(s, "U2") is not None
 
 
-def test_bias_tee_goes_to_rf_sheet_not_adc():
+def test_limiter_above_adc_in_single_page_layout():
+    """P26 #5: RF passives (limiter) must be in a HIGHER row band than
+    ADCs. Replaces the old `RF sheet` placement test."""
+    agent = _make_agent()
+    s = _run_schematic(agent, [
+        {"instance_id": "U1", "reference_designator": "U1",
+         "component_name": "PIN Diode Limiter", "part_number": "CLA4603-000"},
+        {"instance_id": "U2", "reference_designator": "U2",
+         "component_name": "JESD204B ADC", "part_number": "AD9625"},
+    ])
+    y_limiter = _y_of(s, "U1")
+    y_adc = _y_of(s, "U2")
+    assert y_limiter is not None and y_adc is not None
+    assert y_limiter < y_adc, (
+        f"limiter (RF band) must be ABOVE ADC (digital band) in single-"
+        f"page layout — got y_limiter={y_limiter}, y_adc={y_adc}"
+    )
+
+
+def test_bias_tee_above_adc():
+    """P26 #5: bias-tee is RF-band → above ADC-band."""
     agent = _make_agent()
     s = _run_schematic(agent, [
         {"instance_id": "U1", "reference_designator": "U1",
          "component_name": "Bias-Tee DC Injection", "part_number": "PE1604"},
+        {"instance_id": "U2", "reference_designator": "U2",
+         "component_name": "JESD204B ADC", "part_number": "AD9625"},
     ])
-    title = _sheet_of(s, "U1")
-    assert "RF" in title or "Front" in title, \
-        f"Bias-tee must be on RF sheet, got '{title}'"
+    assert _y_of(s, "U1") < _y_of(s, "U2")
 
 
-def test_splitter_goes_to_rf_sheet_not_adc():
+def test_splitter_above_adc():
+    """P26 #5: splitter is RF-band → above ADC-band."""
     agent = _make_agent()
     s = _run_schematic(agent, [
         {"instance_id": "U1", "reference_designator": "U1",
          "component_name": "4-Way Wilkinson Splitter", "part_number": "MPD4-0108CSP2"},
+        {"instance_id": "U2", "reference_designator": "U2",
+         "component_name": "JESD204B ADC", "part_number": "AD9625"},
     ])
-    title = _sheet_of(s, "U1")
-    assert "RF" in title or "Front" in title, \
-        f"Splitter must be on RF sheet, got '{title}'"
+    assert _y_of(s, "U1") < _y_of(s, "U2")
 
 
-def test_attenuator_and_isolator_on_rf_sheet():
+def test_attenuator_and_isolator_above_adc():
+    """P26 #5: attenuator + isolator are RF-band → above ADC-band."""
     agent = _make_agent()
     s = _run_schematic(agent, [
         {"instance_id": "U1", "reference_designator": "U1",
          "component_name": "Fixed Attenuator Pad", "part_number": "YAT-6+"},
         {"instance_id": "U2", "reference_designator": "U2",
          "component_name": "Isolator", "part_number": "ABC-ISO"},
+        {"instance_id": "U3", "reference_designator": "U3",
+         "component_name": "JESD204B ADC", "part_number": "AD9625"},
     ])
+    y_adc = _y_of(s, "U3")
     for ref in ("U1", "U2"):
-        t = _sheet_of(s, ref)
-        assert t and ("RF" in t or "Front" in t), f"{ref} on wrong sheet: {t}"
+        assert _y_of(s, ref) < y_adc, f"{ref} should be above ADC"
 
 
-def test_real_adc_still_goes_to_adc_sheet():
+def test_real_adc_in_digital_band():
+    """P26 #5: ADC's y-coord falls in the digital-band range (above
+    clock/power, below RF/connector)."""
     agent = _make_agent()
     s = _run_schematic(agent, [
         {"instance_id": "U1", "reference_designator": "U1",
+         "component_name": "PIN Diode Limiter", "part_number": "CLA4603-000"},
+        {"instance_id": "U2", "reference_designator": "U2",
          "component_name": "JESD204B ADC", "part_number": "AD9625"},
+        {"instance_id": "U3", "reference_designator": "U3",
+         "component_name": "LDO Regulator", "part_number": "TPS7A4501"},
     ])
-    t = _sheet_of(s, "U1")
-    assert t and "Digit" in t, f"ADC must be on ADC/Digitisation sheet, got '{t}'"
+    # ADC must be BELOW limiter (RF band) and ABOVE LDO (power band).
+    y_adc = _y_of(s, "U2")
+    assert _y_of(s, "U1") < y_adc < _y_of(s, "U3"), (
+        f"ADC y-coord {y_adc} should be between limiter and LDO — "
+        f"limiter={_y_of(s, 'U1')}, LDO={_y_of(s, 'U3')}"
+    )
 
 
 # --- Pin-model tests --------------------------------------------------------
@@ -453,3 +509,94 @@ def test_no_vcc_symbol_emitted_when_sheet_is_all_passive():
     vcc_syms = [c for c in _all_comps(s) if c.get("type") == "vcc"]
     assert vcc_syms == [], \
         f"all-passive sheet must emit no VCC symbol, got {vcc_syms}"
+
+
+# --- P26 #5 single-page layout regression tests ----------------------------
+
+
+def test_no_ic_overlap_with_many_components():
+    """P26 #5: 60+ ICs across all role-bands must produce ZERO overlapping
+    IC positions. The pre-fix multi-sheet code stacked all closure
+    components (pull-down resistors, GND symbols, test points) at the
+    SAME (cx, cy) per IC, and the role bands collided when one band
+    wrapped past 6 columns into the next band's y-range."""
+    agent = _make_agent()
+    nodes = []
+    # 12 RF amps, 12 ADCs, 12 power regs, 12 connectors, 12 clocks
+    for n in range(12):
+        nodes.append({"instance_id": f"U{n}",
+                      "reference_designator": f"U{n}",
+                      "component_name": f"LNA #{n}",
+                      "part_number": f"HMC{8410+n}"})
+        nodes.append({"instance_id": f"U{n+100}",
+                      "reference_designator": f"U{n+100}",
+                      "component_name": f"ADC #{n}",
+                      "part_number": f"AD{9625+n}"})
+        nodes.append({"instance_id": f"U{n+200}",
+                      "reference_designator": f"U{n+200}",
+                      "component_name": f"LDO Regulator #{n}",
+                      "part_number": f"TPS{7400+n}"})
+        nodes.append({"instance_id": f"J{n}",
+                      "reference_designator": f"J{n}",
+                      "component_name": f"SMA Connector #{n}",
+                      "part_number": "SMA-F-RF"})
+        nodes.append({"instance_id": f"U{n+300}",
+                      "reference_designator": f"U{n+300}",
+                      "component_name": f"PLL Clock Synth #{n}",
+                      "part_number": f"LMX{2572+n}"})
+    s = _run_schematic(agent, nodes)
+    # Single sheet:
+    assert len(s["sheets"]) == 1
+    # No two ICs at the same (x, y):
+    from collections import Counter
+    ic_xys = [(round(c["x"], 1), round(c["y"], 1))
+              for c in s["sheets"][0]["components"]
+              if c.get("type") == "ic"]
+    overlaps = [(k, v) for k, v in Counter(ic_xys).items() if v > 1]
+    assert not overlaps, (
+        f"ICs overlapping at same (x, y): {overlaps[:5]} — "
+        f"the cumulative-band y-base allocation was supposed to "
+        f"prevent this."
+    )
+
+
+def test_floating_pin_closure_distributes_by_pin_index():
+    """P26 #5: pull-down resistors / test points / AC-caps for a multi-
+    pin IC must FAN OUT vertically (one per pin index), not stack at
+    the same (cx, cy). Pre-fix code placed every primary closure
+    component at `cy = c["y"] + 1` regardless of pin position, producing
+    visual overlap of 5+ symbols on top of each other.
+
+    We ONLY check the PRIMARY closure components here (resistor + cap +
+    test-point) — their paired GND/VCC symbols sit at `ry+2` / `ry-2`
+    by design, which intentionally re-uses y-rows of the next pin's
+    primary closure (R for pin 1 lives at y=8; GND for that R at y=10;
+    R for pin 2 also at y=10 if pin_offset=1). That y-sharing of R+GND
+    pairs is expected and the renderer handles it cleanly."""
+    agent = _make_agent()
+    s = _run_schematic(agent, [
+        {"instance_id": "U1", "reference_designator": "U1",
+         "component_name": "FPGA / Zynq UltraScale+",
+         "part_number": "XCZU4CG"},
+    ])
+    # PRIMARY closure components only (R for pull-up/pull-down,
+    # capacitor for AC-coupling, connector for test-point). Skip the
+    # paired GND / VCC symbols — they're decorative anchors, not the
+    # core closure component.
+    primary = [c for c in _all_comps(s)
+               if c.get("ref", "").startswith(("R", "TP_"))
+               or (c.get("type") == "capacitor"
+                   and c.get("ref", "").startswith("C"))]
+    # Group by x — primary closures for one IC side share an x.
+    from collections import defaultdict
+    by_x = defaultdict(list)
+    for c in primary:
+        by_x[round(c["x"], 0)].append(round(c["y"], 1))
+    if by_x:
+        # Find the column with the most primary closures — that's
+        # one side of U1. No two should share a y.
+        biggest_col = max(by_x.values(), key=len)
+        assert len(set(biggest_col)) == len(biggest_col), (
+            f"primary closure components in column overlap on y: "
+            f"{sorted(biggest_col)}"
+        )

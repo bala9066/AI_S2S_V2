@@ -1563,13 +1563,22 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
         }
 
         # ── Group refs by sheet ───────────────────────────────────────────
+        # P26 #5 (2026-04-25): the schematic now collapses to a SINGLE
+        # page. Previously we split into 4 sheets (RF / ADC+Digital /
+        # Clock / Power) with cross-sheet off-page connectors (OPCs)
+        # bridging them. User feedback ("can we update netlist to single
+        # page? instead of multi page?") — single page reads at a glance
+        # in the browser viewer (zoom + pan), and avoids the OPC clutter
+        # that doubled the visible component count for cross-domain nets.
+        #
+        # The bucketing dict is kept ONLY so the per-role layout pass
+        # below can still order components left-to-right by domain
+        # (signal flow: connectors → RF chain → mixers → ADCs → FPGA →
+        # power → clock at side). Cross-sheet OPC creation is bypassed
+        # entirely on the single-page path.
         sheet_map = {
             "rf": [], "power": [], "adc_dig": [], "clock": [],
         }
-        # RF passives (limiter / bias_tee / splitter / attenuator /
-        # isolator) belong with the active RF components. Chip resistors
-        # and capacitors follow the nearest active sheet — default to RF
-        # if no active IC was classified, else adc_dig.
         _has_rf_active = any(
             r in ("rf_amp", "filter", "rf_mixer", "connector", "limiter",
                   "bias_tee", "splitter", "attenuator", "isolator")
@@ -1581,7 +1590,6 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                         "isolator"):
                 sheet_map["rf"].append(ref)
             elif role in ("chip_resistor", "chip_capacitor"):
-                # Passives follow the majority-active-sheet convention.
                 if _has_rf_active:
                     sheet_map["rf"].append(ref)
                 else:
@@ -1595,18 +1603,26 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             else:
                 sheet_map["adc_dig"].append(ref)
 
-        # Merge small clock into adc_dig
-        if len(sheet_map["clock"]) <= 1:
-            sheet_map["adc_dig"].extend(sheet_map["clock"])
-            sheet_map["clock"] = []
-
+        # P26 #5 — single-page mode: emit ONE sheet per project.
+        # SHEET_ORDER also defines the LEFT→RIGHT visual order on the page.
         SHEET_TITLES = {
+            "single": "Schematic",
             "rf": "RF Front-End",
             "power": "Power Distribution",
             "adc_dig": "ADC & Digitisation",
             "clock": "Clock Generation & SPI Control",
         }
-        SHEET_ORDER = ["rf", "adc_dig", "clock", "power"]
+        SHEET_ORDER = ["single"]
+        # Combine all role buckets into one ordered list. The order
+        # mirrors the natural signal flow so the layout grid below places
+        # related components near each other:
+        #   connectors / RF chain → ADC / FPGA → clock → power.
+        sheet_map["single"] = (
+            sheet_map["rf"]
+            + sheet_map["adc_dig"]
+            + sheet_map["clock"]
+            + sheet_map["power"]
+        )
 
         # ── Build sheets ──────────────────────────────────────────────────
         sheets = []
@@ -1643,18 +1659,69 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             nets: list = []
             placed: set = set()
 
-            # Place components left→right, 9-unit spacing, wrap after 3
-            # cols. 9-unit pitch guarantees the 8-unit minimum column gap
-            # the geometry test enforces. x no longer clamps to 24 — when
-            # >3 ICs land on a sheet, wrapping to a new row preserves the
-            # pitch instead of collapsing columns on top of each other.
+            # P26 #5 (2026-04-25) — single-page layout with role-aware
+            # row clustering. Previously a 3-col modulo grid placed
+            # components in pure ref order, mixing RF + power + clock
+            # ICs into the same row and producing visual chaos with 60+
+            # IC schematics. Now we lay out by role-band:
+            #   row band 0 — connectors (left edge)
+            #   row band 1 — RF chain (LNA / filter / mixer / etc.)
+            #   row band 2 — ADC / FPGA / digital interfaces
+            #   row band 3 — Clock / LO / synth
+            #   row band 4 — Power regulators
+            # Within a band, components are placed left→right at 12-unit
+            # horizontal pitch (was 9). Vertical pitch between bands is
+            # 9 units (was 7). 6 columns per row instead of 3 — gives
+            # ~72-unit-wide canvas (was 27) which matches the actual
+            # area we have on a single 30×20 grid scaled up to 90×60.
+            _band_for_role = {
+                "connector": 0,
+                "rf_amp": 1, "filter": 1, "rf_mixer": 1, "limiter": 1,
+                "bias_tee": 1, "splitter": 1, "attenuator": 1,
+                "isolator": 1,
+                "adc": 2, "fpga": 2, "interface": 2, "signal": 2,
+                "clock": 3, "lo_synth": 3,
+                "power": 4,
+                "chip_resistor": 1, "chip_capacitor": 1,
+            }
+            # Pre-compute band index per ref so we can group + count
+            # within bands for left→right placement.
+            _ref_band = {r: _band_for_role.get(ref_role.get(r, "signal"), 2)
+                         for r in refs}
+            # Pre-compute band sizes so we know how many rows each band
+            # actually needs. Then offset each band's y-base by the
+            # CUMULATIVE rows of bands above it — no fixed `band * Y_PITCH * 2`
+            # collision when one band wraps into the next.
+            from collections import Counter as _C
+            _band_sizes = _C(_ref_band.values())
+            COLS_PER_BAND = 8        # was 6 — wider canvas, fewer wraps
+            X_PITCH = 12             # was 9 — same horizontal pitch
+            Y_PITCH = 9              # was 7 — extra room for decap stack
+            X_BASE = 4
+            Y_BASE = 5
+            BAND_GAP = Y_PITCH * 2   # blank vertical gutter between bands
+            # Y-offset for each band = sum of rows used by all earlier
+            # bands * Y_PITCH + BAND_GAP per band boundary. Guarantees
+            # zero overlap even when a band has 50+ components.
+            _band_y_base: dict = {}
+            _y_cursor = Y_BASE
+            for _b in sorted(_band_sizes):
+                _band_y_base[_b] = _y_cursor
+                _rows_in_band = max(
+                    1, (_band_sizes[_b] + COLS_PER_BAND - 1) // COLS_PER_BAND
+                )
+                _y_cursor += _rows_in_band * Y_PITCH + BAND_GAP
+            _band_cursor: dict = {}  # band → next col index
             for idx, ref in enumerate(refs):
                 node = ref_node.get(ref, {})
                 role = ref_role.get(ref, "signal")
-                col = idx % 3
-                row = idx // 3
-                x = 4 + col * 9
-                y = 5 + row * 7
+                band = _ref_band.get(ref, 2)
+                band_pos = _band_cursor.get(band, 0)
+                _band_cursor[band] = band_pos + 1
+                col = band_pos % COLS_PER_BAND
+                row_in_band = band_pos // COLS_PER_BAND
+                x = X_BASE + col * X_PITCH
+                y = _band_y_base.get(band, Y_BASE) + row_in_band * Y_PITCH
 
                 # Native passive symbols (chip R / chip C) — render as
                 # 2-pin parts with no `pins` list, matching the TS schem
@@ -1791,7 +1858,10 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                     for _pn in ("RF_OUT_2", "RF_OUT_3", "RF_OUT_4"):
                         g_res += 1
                         rref = f"R{g_res}"
-                        rx = min(x + 5, 28)
+                        # P26 #5: removed hardcoded `min(x+5, 28)` clamp
+                        # left over from the old 30-col grid. Single-page
+                        # canvas is now ~80 cols wide.
+                        rx = x + 5
                         ry = max(y + 1 + (g_res % 3), 1)
                         comps.append({"ref": rref, "type": "resistor",
                                       "value": "50R",
@@ -2023,7 +2093,21 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             for c in comps:
                 if c["type"] != "ic" or "pins" not in c:
                     continue
-                for p in c.get("pins", []):
+                # P26 #5 (2026-04-25) — distribute closure components by
+                # pin index. Pre-fix: every pull-down R + GND symbol for a
+                # given IC was placed at the SAME (cx, cy) coordinates,
+                # producing visual overlap (5+ symbols stacked at one
+                # point). Now each closure component is offset by the
+                # pin's position index along its side, so the closure
+                # forms a vertical column of resistors / caps / GND
+                # symbols that flanks the IC instead of stacking on
+                # itself.
+                _ic_pins = c.get("pins", [])
+                _left_idx = {pp["name"]: i for i, pp in
+                             enumerate(p2 for p2 in _ic_pins if p2.get("side") == "left")}
+                _right_idx = {pp["name"]: i for i, pp in
+                              enumerate(p2 for p2 in _ic_pins if p2.get("side") == "right")}
+                for p in _ic_pins:
                     if (c["ref"], p["name"]) in connected_pins:
                         continue
                     pn = p["name"].upper()
@@ -2032,6 +2116,15 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                     if pn in ("GND", "AGND", "DGND") or pn.startswith(
                             ("VCC", "VDD", "AVDD", "DVDD", "VBAT", "VIN")):
                         continue
+
+                    # Per-pin offset: how far along the IC's side is this
+                    # pin? Used to spread closure components vertically.
+                    if side == "left":
+                        _pin_offset = _left_idx.get(p["name"], 0)
+                    elif side == "right":
+                        _pin_offset = _right_idx.get(p["name"], 0)
+                    else:
+                        _pin_offset = 0
 
                     # 1. Differential _N / _2 inputs → AC-cap to GND
                     is_diff_n = (
@@ -2042,7 +2135,7 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                         g_cap += 1
                         ac_ref = f"C{g_cap}"
                         cx = max(c["x"] - 3, 1)
-                        cy = c["y"] + 1
+                        cy = c["y"] + 1 + _pin_offset * 2
                         comps.append({"ref": ac_ref, "type": "capacitor",
                                       "value": "100nF",
                                       "x": cx, "y": cy, "rot": 0})
@@ -2076,8 +2169,8 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                         comps.append({
                             "ref": tp_ref, "type": "connector",
                             "value": f"TP_{pn}",
-                            "x": min(c["x"] + 5, 28),
-                            "y": min(c["y"] + 1, 18), "rot": 0,
+                            "x": c["x"] + 5,
+                            "y": c["y"] + 1 + _pin_offset * 2, "rot": 0,
                             "pins": [{"name": "1", "num": "1",
                                       "side": "left"}],
                         })
@@ -2096,7 +2189,9 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                         g_res += 1
                         rref = f"R{g_res}"
                         rx = max(c["x"] - 3, 1)
-                        ry = max(c["y"] - 1, 1)
+                        # Distribute by pin index so each IC's pull-ups
+                        # form a vertical column instead of stacking.
+                        ry = max(c["y"] + _pin_offset * 2, 1)
                         comps.append({"ref": rref, "type": "resistor",
                                       "value": "10k",
                                       "x": rx, "y": ry, "rot": 90})
@@ -2131,7 +2226,9 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                         g_res += 1
                         rref = f"R{g_res}"
                         rx = max(c["x"] - 3, 1)
-                        ry = c["y"] + 1
+                        # Vertical offset by pin index so multiple
+                        # pull-downs for one IC form a column.
+                        ry = c["y"] + 1 + _pin_offset * 2
                         comps.append({"ref": rref, "type": "resistor",
                                       "value": "10k",
                                       "x": rx, "y": ry, "rot": 90})
@@ -2165,8 +2262,8 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                         comps.append({
                             "ref": tp_ref, "type": "connector",
                             "value": f"TP_{pn}",
-                            "x": min(c["x"] + 5, 28),
-                            "y": min(c["y"] + 1, 18), "rot": 0,
+                            "x": c["x"] + 5,
+                            "y": c["y"] + 1 + _pin_offset * 2, "rot": 0,
                             "pins": [{"name": "1", "num": "1",
                                       "side": "left"}],
                         })
@@ -2206,8 +2303,9 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                              "VCC_1V8" if "1.8" in pn_lower or "1v8" in pn_lower else \
                              "VCC_5V" if "5v" in pn_lower or "5.0" in pn_lower else \
                              f"VOUT_{pr}"
+                # P26 #5: removed `min(pr_x + 5, 28)` clamp.
                 comps.append({"ref": vout_ref, "type": "vcc", "value": rail_label,
-                              "x": min(pr_x + 5, 28), "y": pr_y, "rot": 0})
+                              "x": pr_x + 5, "y": pr_y, "rot": 0})
                 nets.append({"name": rail_label, "type": "power",
                              "endpoints": [{"ref": pr, "pin": "VOUT"},
                                            {"ref": vout_ref, "pin": "1"}]})
@@ -2218,12 +2316,13 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                 # Output decoupling cap
                 g_cap += 1
                 cout_ref = f"C{g_cap}"
+                # P26 #5: removed `min(.., 28/18/20)` clamps.
                 comps.append({"ref": cout_ref, "type": "capacitor", "value": "10uF",
-                              "x": min(pr_x + 4, 28), "y": min(pr_y + 2, 18), "rot": 90})
+                              "x": pr_x + 4, "y": pr_y + 2, "rot": 90})
                 g_gnd += 1
                 gnd_cout = f"GND_C{g_cap}"
                 comps.append({"ref": gnd_cout, "type": "ground", "value": "GND",
-                              "x": min(pr_x + 4, 28), "y": min(pr_y + 4, 20), "rot": 0})
+                              "x": pr_x + 4, "y": pr_y + 4, "rot": 0})
                 nets.append({"name": rail_label, "type": "power",
                              "endpoints": [{"ref": pr, "pin": "VOUT"},
                                            {"ref": cout_ref, "pin": "1"}]})
@@ -2268,41 +2367,56 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
             for adc in all_adcs:
                 mx_si = ref_sheet.get(mx)
                 adc_si = ref_sheet.get(adc)
-                if mx_si is not None and adc_si is not None:
-                    # Off-page connector on mixer sheet (IF output) —
-                    # 2-pin: pin 1 = IF_OUT_P, pin 2 = IF_OUT_N.
-                    g_pwr += 1
-                    opc1 = f"OPC_{g_pwr}"
-                    sheets[mx_si]["components"].append(
-                        {"ref": opc1, "type": "connector",
-                         "value": f"→ Sheet {adc_si + 1} (IF diff)",
-                         "x": 28, "y": 8, "rot": 0,
-                         "pins": [dict(p) for p in diff_opc_pins]})
+                if mx_si is None or adc_si is None:
+                    continue
+                if mx_si == adc_si:
+                    # P26 #5 — single-page mode: direct connection
+                    # without OPC clutter. Pre-fix code created TWO
+                    # off-page connectors PER mixer×adc pair regardless
+                    # of whether they were on the same sheet, which on
+                    # single-page mode added 4 visual connectors per
+                    # mixer (2 IF_OUT + 2 receive) for no purpose.
                     sheets[mx_si]["nets"].append(
                         {"name": f"IF_OUT_P_{mx}", "type": "analog",
                          "endpoints": [{"ref": mx, "pin": "IF_OUT_P"},
-                                       {"ref": opc1, "pin": "1"}]})
+                                       {"ref": adc, "pin": "AIN_P"}]})
                     sheets[mx_si]["nets"].append(
                         {"name": f"IF_OUT_N_{mx}", "type": "analog",
                          "endpoints": [{"ref": mx, "pin": "IF_OUT_N"},
-                                       {"ref": opc1, "pin": "2"}]})
-                    # Off-page connector on ADC sheet (AIN input) —
-                    # mirrors the mixer-side mapping.
-                    g_pwr += 1
-                    opc2 = f"OPC_{g_pwr}"
-                    sheets[adc_si]["components"].append(
-                        {"ref": opc2, "type": "connector",
-                         "value": f"← Sheet {mx_si + 1} (IF diff)",
-                         "x": 1, "y": 5, "rot": 0,
-                         "pins": [dict(p) for p in diff_opc_pins_in]})
-                    sheets[adc_si]["nets"].append(
-                        {"name": f"IF_OUT_P_{mx}", "type": "analog",
-                         "endpoints": [{"ref": opc2, "pin": "1"},
-                                       {"ref": adc, "pin": "AIN_P"}]})
-                    sheets[adc_si]["nets"].append(
-                        {"name": f"IF_OUT_N_{mx}", "type": "analog",
-                         "endpoints": [{"ref": opc2, "pin": "2"},
                                        {"ref": adc, "pin": "AIN_N"}]})
+                    continue
+                # Cross-sheet path (only triggered when multi-page is
+                # explicitly re-enabled in the future).
+                g_pwr += 1
+                opc1 = f"OPC_{g_pwr}"
+                sheets[mx_si]["components"].append(
+                    {"ref": opc1, "type": "connector",
+                     "value": f"→ Sheet {adc_si + 1} (IF diff)",
+                     "x": 28, "y": 8, "rot": 0,
+                     "pins": [dict(p) for p in diff_opc_pins]})
+                sheets[mx_si]["nets"].append(
+                    {"name": f"IF_OUT_P_{mx}", "type": "analog",
+                     "endpoints": [{"ref": mx, "pin": "IF_OUT_P"},
+                                   {"ref": opc1, "pin": "1"}]})
+                sheets[mx_si]["nets"].append(
+                    {"name": f"IF_OUT_N_{mx}", "type": "analog",
+                     "endpoints": [{"ref": mx, "pin": "IF_OUT_N"},
+                                   {"ref": opc1, "pin": "2"}]})
+                g_pwr += 1
+                opc2 = f"OPC_{g_pwr}"
+                sheets[adc_si]["components"].append(
+                    {"ref": opc2, "type": "connector",
+                     "value": f"← Sheet {mx_si + 1} (IF diff)",
+                     "x": 1, "y": 5, "rot": 0,
+                     "pins": [dict(p) for p in diff_opc_pins_in]})
+                sheets[adc_si]["nets"].append(
+                    {"name": f"IF_OUT_P_{mx}", "type": "analog",
+                     "endpoints": [{"ref": opc2, "pin": "1"},
+                                   {"ref": adc, "pin": "AIN_P"}]})
+                sheets[adc_si]["nets"].append(
+                    {"name": f"IF_OUT_N_{mx}", "type": "analog",
+                     "endpoints": [{"ref": opc2, "pin": "2"},
+                                   {"ref": adc, "pin": "AIN_N"}]})
 
         # LO synth → mixer LO (cross-sheet)
         all_lo = [r for r, rl in ref_role.items() if rl == "lo_synth"]
