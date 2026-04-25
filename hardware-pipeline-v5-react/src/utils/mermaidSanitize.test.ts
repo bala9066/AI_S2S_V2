@@ -150,6 +150,80 @@ describe('HTML entity decoding', () => {
     expect(out).toMatch(/LVDS_OUT\[\/LVDS Output<br>To Signal Processor\/\]/);
   });
 
+  it('subroutine [[..]] preserved (not mangled into [..]]) — P26 #3', () => {
+    // Real failing input from project fyfu (architecture.md line 3):
+    //   BUCK[["Buck / LT1107CS8-5#PBF / 12V to 5V"]]
+    // The single-bracket rect regex used to capture `["Buck...V` (the
+    // unbalanced opening `[` was captured INTO the inner), then strip
+    // the `[` and `"`, producing:
+    //   BUCK[Buck / LT1107CS8-5 PBF / 12V to 5V]]
+    // — single open, double close. Mermaid: "Parse error on line 3:
+    // ...12V to 5V]] LDO_5..."
+    const raw = (
+      'flowchart TB\n' +
+      '    BUCK[["Buck / LT1107CS8-5#PBF / 12V to 5V"]]\n' +
+      '    LDO_5[["LDO 5V / SPX3819M5"]]\n' +
+      '    BUCK --> LDO_5\n'
+    );
+    const out = san(raw);
+    // Subroutine brackets must remain matched [[..]].
+    expect(out).toMatch(/BUCK\[\[Buck \/ LT1107CS8-5 PBF \/ 12V to 5V\]\]/);
+    expect(out).toMatch(/LDO_5\[\[LDO 5V \/ SPX3819M5\]\]/);
+    // No mangled single-open/double-close patterns.
+    expect(out).not.toMatch(/BUCK\[[^[][^\]]*\]\]/);
+    expect(out).not.toMatch(/LDO_5\[[^[][^\]]*\]\]/);
+  });
+
+  it('hexagon {{..}} and circle ((..)) preserved — P26 #3', () => {
+    const raw = (
+      'flowchart TD\n' +
+      '    BPF{{"Custom Cavity / IL1.5"}}\n' +
+      '    OSC(("10 MHz Reference"))\n'
+    );
+    const out = san(raw);
+    expect(out).toMatch(/BPF\{\{Custom Cavity \/ IL1\.5\}\}/);
+    expect(out).toMatch(/OSC\(\(10 MHz Reference\)\)/);
+  });
+
+  it('mixed-slash trapezoid [/..\\] preserved — P26 #3', () => {
+    // Real failing input from project fyfu (block_diagram.md):
+    //   LIM1[/"Lim / CLA4602-000 / IL0.2 P+33max"\]
+    const raw = (
+      'flowchart TD\n' +
+      '    LIM1[/"Lim / CLA4602-000 / IL0.2 P+33max"\\]\n' +
+      '    LIM1 --> X[Done]\n'
+    );
+    const out = san(raw);
+    // Trapezoid delimiters intact (forward open, backward close).
+    expect(out).toMatch(/LIM1\[\/Lim \/ CLA4602-000 \/ IL0\.2 P\+33max\\\]/);
+  });
+
+  it('literal < inside label does NOT collapse multiple lines — P26 #3', () => {
+    // Real failing input from project fyfu: `ANT1>"Ant1<br/>< 2 GHz"]`.
+    // The literal `<` (less-than sign for "< 2 GHz") combined with the
+    // `>` of the next-many-lines-down `>...]` flag node would cause
+    // the strip-HTML regex `<[^>]+>` to match across newlines and
+    // collapse all the intermediate node defs into a single mangled
+    // line. Fix: regex now uses `[^>\\n]+` so it can't cross newlines.
+    const raw = (
+      'flowchart TD\n' +
+      '    ANT1>"Ant1<br/>< 2 GHz"]\n' +
+      '    ANT2>"Ant2<br/>< 2 GHz"]\n' +
+      '    SMA1[/"SMA-F"/]\n' +
+      '    LNA1>"LNA1 amp"]\n' +
+      '    ANT1 --> SMA1\n'
+    );
+    const out = san(raw);
+    // Each node def survives on its own line.
+    const lines = out.split('\n').map(l => l.trim()).filter(Boolean);
+    expect(lines.some(l => l.startsWith('ANT1>'))).toBe(true);
+    expect(lines.some(l => l.startsWith('ANT2>'))).toBe(true);
+    expect(lines.some(l => l.startsWith('SMA1'))).toBe(true);
+    expect(lines.some(l => l.startsWith('LNA1>'))).toBe(true);
+    // No line should contain BOTH ANT1 and LNA1 (would mean they got merged).
+    expect(lines.every(l => !(l.includes('ANT1') && l.includes('LNA1')))).toBe(true);
+  });
+
   it('does not insert --> between bare identifiers in subgraph body (P26)', () => {
     // Subgraph membership lists must NOT be auto-arrowed:
     //     subgraph POWER["Power Distribution"]

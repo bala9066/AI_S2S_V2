@@ -181,6 +181,51 @@ def _step_normalise_shape_quotes(text: str) -> tuple[str, Optional[str]]:
         lambda m: f'[\\\\{m.group(1).strip()}\\\\]',
         text,
     )
+    # P26 (2026-04-25, third pass) — additional shape variants caught from
+    # project fyfu (block_diagram.md):
+    #   LIM1[/"Lim / CLA4602-000"\]    mixed-slash trapezoid
+    #   ADC1[\"ADC / AD9643"/]         mixed-slash trapezoid_alt
+    #   BUCK[["Buck / LT1107"]]        subroutine (double-bracket)
+    #   BPF{{"Custom Cavity"}}         hexagon
+    #   OSC(("10 MHz Reference"))      circle
+    #   BAY(["RF Chain"])              stadium
+    #   DB[("Database / SPI Flash")]   cylinder
+    # Mermaid does NOT accept quotes inside any of these — strip them.
+    text = re.sub(
+        r'\[/\s*"([^"]*)"\s*\\\]',
+        lambda m: f'[/{m.group(1).strip()}\\]',
+        text,
+    )
+    text = re.sub(
+        r'\[\\\s*"([^"]*)"\s*/\]',
+        lambda m: f'[\\{m.group(1).strip()}/]',
+        text,
+    )
+    text = re.sub(
+        r'\[\[\s*"([^"]*)"\s*\]\]',
+        lambda m: f'[[{m.group(1).strip()}]]',
+        text,
+    )
+    text = re.sub(
+        r'\{\{\s*"([^"]*)"\s*\}\}',
+        lambda m: f'{{{{{m.group(1).strip()}}}}}',
+        text,
+    )
+    text = re.sub(
+        r'\(\(\s*"([^"]*)"\s*\)\)',
+        lambda m: f'(({m.group(1).strip()}))',
+        text,
+    )
+    text = re.sub(
+        r'\(\[\s*"([^"]*)"\s*\]\)',
+        lambda m: f'([{m.group(1).strip()}])',
+        text,
+    )
+    text = re.sub(
+        r'\[\(\s*"([^"]*)"\s*\)\]',
+        lambda m: f'[({m.group(1).strip()})]',
+        text,
+    )
     if text != original:
         return text, "normalise_shape_quotes"
     return text, None
@@ -404,16 +449,29 @@ def _step_flatten_brace_hell(text: str) -> tuple[str, Optional[str]]:
         if not suspicious:
             continue
         # P26 (2026-04-25) — don't fire on lines that are already a
-        # well-formed trapezoid `[\..\]`, parallelogram `[/.../]`, or
-        # inverted parallelogram `[\\..\\]` shape. The `\` and `/` chars
-        # in those shapes look like "escape brackets" to the heuristic
-        # above but are actually mermaid's SHAPE delimiters. The earlier
-        # `_step_normalise_shape_quotes` already stripped any redundant
-        # inner quotes from these forms, so the line that reaches us here
-        # is parseable mermaid.
+        # well-formed trapezoid `[\..\]`, parallelogram `[/.../]`, mixed-
+        # slash trapezoid `[/...\]` / `[\.../]`, inverted parallelogram
+        # `[\\..\\]`, OR double-bracket subroutine `[[..]]`. The `\` and
+        # `/` chars in those shapes look like "escape brackets" to the
+        # heuristic above but are actually mermaid's SHAPE delimiters.
+        # The earlier `_step_normalise_shape_quotes` already stripped
+        # any redundant inner quotes from these forms, so the line that
+        # reaches us here is parseable mermaid.
+        #
+        # P26 #3 (2026-04-25, project fyfu): added mixed-slash trapezoid
+        # variants `[/...\]` and `[\.../]` — mermaid accepts these, the
+        # LLM emits them, and `flatten_brace_hell` was mangling them to
+        # `["..."]` because `\]` matched `has_esc_brackets`.
         if re.search(
             r"\b\w+\s*"
-            r"(?:\[\\[^\\\]]*\\\]|\[/[^/\]]*/\]|\[\\\\[^\\\]]*\\\\\])",
+            r"(?:"
+            r"\[\\[^\\\]]*\\\]"     # trapezoid    [\..\]
+            r"|\[/[^/\]]*/\]"        # parallelogram [/.../]
+            r"|\[\\\\[^\\\]]*\\\\\]" # inv. parallelo [\\..\\]
+            r"|\[/[^\\\]]*\\\]"      # mixed trapezoid [/..\]
+            r"|\[\\[^/\]]*/\]"       # mixed trapezoid [\..]/
+            r"|\[\[[^\[\]]*\]\]"     # subroutine   [[..]]
+            r")",
             stripped,
         ):
             continue

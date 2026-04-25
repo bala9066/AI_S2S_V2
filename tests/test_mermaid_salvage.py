@@ -706,3 +706,89 @@ class TestP26HtmlBreakAndShapeDelims:
         assert r'<br>"' not in cleaned
         # The parser's `Parse error on line 13` was caused by these
         # mangled shapes; with them clean, mermaid will accept the diagram.
+
+
+# ---------------------------------------------------------------------------
+# P26 third pass (2026-04-25, project fyfu) — additional shape variants
+# the LLM emits that the prior salvage didn't cover:
+#   [["..."]]    subroutine
+#   {{"..."}}    hexagon
+#   (("..."))    circle
+#   (["..."])    stadium
+#   [("...")]    cylinder
+#   [/"..."\]    mixed-slash trapezoid
+#   [\"..."/]    mixed-slash trapezoid_alt
+# ---------------------------------------------------------------------------
+
+
+class TestP26ShapeVariants:
+    """Regression for the 'BUCK[["Buck / LT1107..."]]' family of bugs from
+    project fyfu. Mermaid parse error: `Parse error on line 3: ...12V to
+    5V]] LDO_5...`."""
+
+    def test_subroutine_quotes_stripped(self):
+        """`[["..."]]` → `[[...]]` (subroutine, redundant inner quotes)."""
+        raw = (
+            "flowchart TB\n"
+            '    BUCK[["Buck / LT1107CS8-5"]]\n'
+            "    BUCK --> X\n"
+        )
+        cleaned, fixes = salvage(raw)
+        assert "[[Buck / LT1107CS8-5]]" in cleaned, (
+            f"subroutine quotes not stripped — got:\n{cleaned}"
+        )
+
+    def test_hexagon_quotes_stripped(self):
+        """`{{"..."}}` → `{{...}}` (hexagon)."""
+        raw = (
+            "flowchart TD\n"
+            '    BPF{{"Custom Cavity / IL1.5"}}\n'
+        )
+        cleaned, _ = salvage(raw)
+        assert "{{Custom Cavity / IL1.5}}" in cleaned
+
+    def test_circle_quotes_stripped(self):
+        """`(("..."))` → `((...))` (circle, NOT collapsed to round)."""
+        raw = (
+            "flowchart TD\n"
+            '    OSC(("10 MHz Reference"))\n'
+        )
+        cleaned, _ = salvage(raw)
+        assert "((10 MHz Reference))" in cleaned
+
+    def test_mixed_slash_trapezoid_quotes_stripped(self):
+        """`[/"..."\\]` → `[/...\\]` (mixed-slash trapezoid, real fyfu input)."""
+        raw = (
+            "flowchart TD\n"
+            r'    LIM1[/"Lim / CLA4602-000 / IL0.2 P+33max"\]' + "\n"
+        )
+        cleaned, _ = salvage(raw)
+        assert r"[/Lim / CLA4602-000 / IL0.2 P+33max\]" in cleaned, (
+            f"mixed-slash trapezoid quotes not stripped — got:\n{cleaned}"
+        )
+
+    def test_full_fyfu_architecture_renders_cleanly(self):
+        """End-to-end: project fyfu's architecture.md must survive salvage
+        with all subroutine/parallelogram/round shapes intact."""
+        raw = (
+            "flowchart TB\n"
+            '    PWR_IN[/"+12V DC Input"/]\n'
+            '    BUCK[["Buck / LT1107CS8-5#PBF / 12V to 5V"]]\n'
+            '    LDO_5[["LDO 5V / SPX3819M5-L-5-0/TR"]]\n'
+            '    RAIL_5V["+5V Rail"]\n'
+            '    REF_OSC("TCXO 10 MHz Ref")\n'
+            '    RF_CH1(["RF Chain 1 (Ant1 to ADC1)"])\n'
+            '    PWR_IN == "+12V" ==> RAIL_5V\n'
+            "    RAIL_5V --> LDO_5\n"
+        )
+        cleaned, _ = salvage(raw)
+        # Each shape must be intact (matched delimiters):
+        assert "[/+12V DC Input/]" in cleaned
+        # BUCK has `#` in label — `_step_quote_dangerous_labels` may
+        # re-add quotes around the label. Either form is valid mermaid.
+        assert ("[[Buck / LT1107CS8-5#PBF / 12V to 5V]]" in cleaned
+                or '[["Buck / LT1107CS8-5#PBF / 12V to 5V"]]' in cleaned)
+        assert "[[LDO 5V / SPX3819M5-L-5-0/TR]]" in cleaned
+        # No mangled forms (single-open + double-close, etc.):
+        assert "BUCK[Buck" not in cleaned   # single-open mangle
+        assert "5V]]]" not in cleaned       # triple close

@@ -51,8 +51,10 @@ export function sanitizeMermaid(raw: string): string {
     '\u00B1': '+-', '\u2192': '-->', '\u2190': '<--',
   };
   code = code.replace(/[^\x00-\x7F]/g, ch => uMap[ch] || '');
-  // Fix double-paren nodes ((label)) → (label)
-  code = code.replace(/\(\(([^)]*)\)\)/g, '($1)');
+  // P26 (2026-04-25): REMOVED the legacy `((label))` → `(label)` collapse.
+  // Mermaid's `((..))` is a VALID circle shape — collapsing it to a round
+  // `(..)` lost the visual distinction. The downstream double-paren
+  // sanitiser (later in this function) now handles `((..))` correctly.
   // Round-bracket nodes with quoted labels containing nested parens break
   // the paren-label sanitiser below — its regex `/\(([^)]*)\)/g` captures up
   // to the *first* `)`, so `S11("VGA (AGC)…")` is parsed as a node whose
@@ -148,7 +150,16 @@ export function sanitizeMermaid(raw: string): string {
   // can rely on a single canonical form.
   code = code.replace(/<br\s*\/>/gi, '<br>');
   // Strip HTML tags EXCEPT <br> (mermaid uses it for line breaks).
-  code = code.replace(/<(?!br\b)[^>]+>/gi, ' ');
+  // P26 (2026-04-25, fyfu fix): the `[^>]+` body MUST exclude newlines.
+  // Without `\n` in the negation, a literal `<` inside a label (e.g.
+  // `ANT1>"Ant1<br/>< 2 GHz"]` — the `< 2` is just less-than-sign +
+  // digit, NOT an HTML tag) would be paired with a `>` MANY LINES
+  // LATER (e.g. the `>` of the next `>...]` flag node), and the strip
+  // would replace dozens of lines with a single space — collapsing
+  // the diagram into one mangled line. The literal `<` survives this
+  // step unchanged; sanitizeLabel below maps it to a space inside the
+  // label sanitisation pass.
+  code = code.replace(/<(?!br\b)[^>\n]+>/gi, ' ');
 
   // P26 (2026-04-25, second pass): trapezoid `[\..\]` and parallelogram
   // `[/.../]` shapes — strip REDUNDANT internal quotes the LLM emits when
@@ -292,14 +303,57 @@ export function sanitizeMermaid(raw: string): string {
     // Restore the <br> tags after sanitisation.
     return cleaned.replace(new RegExp(_BR_PLACEHOLDER, 'g'), '<br>');
   };
-  // Rect `[..]` — but NOT trapezoid `[\..\]` or parallelogram `[/.../]`.
-  // Those use `[` and `]` as the OUTER delimiters of a different shape;
-  // the inner `\` and `/` chars confuse this regex, and running
-  // sanitizeLabel on `\label\` strips the shape delimiters and turns the
-  // shape into a broken rect with stray backslashes.
-  code = code.replace(/\[(?![\\/])([^\]]*)(?<![\\/])\]/g, (_m, inner: string) => `[${sanitizeLabel(inner)}]`);
-  code = code.replace(/\(([^)]*)\)/g, (_m, inner: string) => `(${sanitizeLabel(inner)})`);
-  code = code.replace(/\{([^}]*)\}/g, (_m, inner: string) => `{${sanitizeLabel(inner)}}`);
+  // P26 (2026-04-25, third pass) — sanitise the DOUBLE-BRACKET shapes
+  // FIRST so the single-bracket regex below doesn't mistake their inner
+  // bracket for its own match. Real failing input from project fyfu:
+  //     BUCK[["Buck / LT1107CS8-5#PBF / 12V to 5V"]]
+  // The single-bracket rect regex used to match the FIRST `[` and the
+  // FIRST `]`, capturing `["Buck...V` (note the unbalanced opening `[`
+  // captured INTO the inner). After sanitizeLabel stripped the `[` and
+  // `"`, the line became `BUCK[Buck / LT1107CS8-5 PBF / 12V to 5V]]`
+  // — single open bracket, double close bracket. Mermaid parser:
+  //     "Parse error on line 3: ...S8-5 PBF / 12V to 5V]] LDO_5..."
+  //
+  // Shape inventory the LLM emits (each must be handled as ONE unit):
+  //   [["..."]]    subroutine
+  //   {{"..."}}    hexagon
+  //   (("..."))    circle
+  //   (["..."])    stadium
+  //   [("...")]    cylinder
+  //   [/"..."/]    parallelogram          (already done above)
+  //   [\"..."\]    parallelogram_alt      (already done above)
+  //   [/"..."\]    trapezoid              NEW
+  //   [\"..."/]    trapezoid_alt          NEW
+  //   ["..."]      rect                   (single-bracket pass below)
+  //   ("...")      round                  (single-bracket pass below)
+  //   {"..."}      rhombus                (single-bracket pass below)
+  //   >"..."]      flag                   (single-bracket pass below)
+  //
+  // For each double-bracket shape, sanitise the INNER label as one unit,
+  // preserving the outer delimiters.
+  code = code.replace(/\[\[([^\[\]]*)\]\]/g, (_m, inner: string) => `[[${sanitizeLabel(inner)}]]`);
+  code = code.replace(/\{\{([^{}]*)\}\}/g, (_m, inner: string) => `{{${sanitizeLabel(inner)}}}`);
+  code = code.replace(/\(\(([^()]*)\)\)/g, (_m, inner: string) => `((${sanitizeLabel(inner)}))`);
+  code = code.replace(/\(\[([^\[\]]*)\]\)/g, (_m, inner: string) => `([${sanitizeLabel(inner)}])`);
+  code = code.replace(/\[\(([^()]*)\)\]/g, (_m, inner: string) => `[(${sanitizeLabel(inner)})]`);
+  // Mixed-slash trapezoids — strip inner quotes (mermaid doesn't accept
+  // quotes inside `[/.../]` family).
+  code = code.replace(/\[\/\s*"([^"]*)"\s*\\\]/g, (_m, inner: string) => `[/${inner.trim()}\\]`);
+  code = code.replace(/\[\\\s*"([^"]*)"\s*\/\]/g, (_m, inner: string) => `[\\${inner.trim()}/]`);
+
+  // Now the SINGLE-bracket shapes. Each regex now has BOTH a lookbehind
+  // (open `[` not preceded by `[`) AND a lookahead (close `]` not
+  // followed by `]`) so we don't slice into the inside of an already-
+  // sanitised double-bracket shape.
+  //
+  // Rect `[..]` — but NOT trapezoid `[\..\]`, parallelogram `[/.../]`,
+  // or subroutine `[[..]]`.
+  code = code.replace(/(?<![\[(])\[(?![\\/[(])([^\]]*)(?<![\\/])\](?![\])])/g, (_m, inner: string) => `[${sanitizeLabel(inner)}]`);
+  // Round `(..)` — but NOT circle `((..))` or stadium `(["..."])`.
+  code = code.replace(/(?<![(\[])\((?![(\[])([^)]*)(?<![\]])\)(?![)\]])/g, (_m, inner: string) => `(${sanitizeLabel(inner)})`);
+  // Rhombus `{..}` — but NOT hexagon `{{..}}`.
+  code = code.replace(/(?<!\{)\{(?!\{)([^}]*)\}(?!\})/g, (_m, inner: string) => `{${sanitizeLabel(inner)}}`);
+  // Bare quoted strings (e.g. inside subgraph titles, edge labels).
   code = code.replace(/"([^"]+)"/g, (_m, inner: string) => `"${sanitizeLabel(inner)}"`);
   // Edge labels: --> |label| node
   code = code.replace(/\|([^|]+)\|/g, (_m, inner: string) => `|${sanitizeLabel(inner)}|`);
