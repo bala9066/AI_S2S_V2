@@ -1178,7 +1178,12 @@ def _sanitize_mermaid_code(code: str) -> str:
 # pandoc args, fallback shape, etc.). Cached .docx files written under a
 # different version are ignored. P14 (2026-04-24): salvage() pass added in
 # front of `_sanitize_mermaid_code` to fix quoted edge labels.
-_DOCX_CACHE_VERSION = 2
+# P26 (2026-04-25): bumped to 3 — backend salvage now handles trapezoid
+# `[\\..\\]`, parallelogram `[/.../]`, `<br>` HTML breaks, and shape-
+# delimiter preservation. Existing cached `.docx` files were rendered
+# with the OLD salvage that mangled these shapes into placeholders. The
+# bump forces a re-render on next download so users see the real PNGs.
+_DOCX_CACHE_VERSION = 3
 
 
 def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:
