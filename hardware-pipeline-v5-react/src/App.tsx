@@ -4,7 +4,8 @@ import type { ChatMessage } from './views/ChatView';
 import { newMsgId } from './views/ChatView';
 import { PHASES, isUnlocked } from './data/phases';
 import { api } from './api';
-import LandingPage from './components/LandingPage';
+import LandingPage from './components/LandingPage'; // P18: kept as a rollback target — DashboardView is the new landing surface
+import DashboardView from './views/DashboardView';
 import LeftPanel from './components/LeftPanel';
 import MiniTopbar from './components/MiniTopbar';
 import PhaseHeader from './components/PhaseHeader';
@@ -83,14 +84,30 @@ export default function App() {
   const autoAdvancedToRef = useRef<string | null>(null);
 
   // ── F5 / reload persistence ─────────────────────────────────────────────────
-  // Restore last-used project from sessionStorage so F5 doesn't send the user
-  // back to the landing page.
+  // P18 (2026-04-26): URL param `?project=ID` takes priority over sessionStorage.
+  // This is what powers the "Dashboard opens project in new tab" flow — the
+  // new tab lands at /app?project=42 and auto-loads that project, never
+  // touching the dashboard tab's session. The sessionStorage path remains as
+  // the fallback for plain F5 in tabs without the URL param.
   useEffect(() => {
-    const saved = sessionStorage.getItem('hw-pipeline-project-id');
-    if (saved) {
-      api.getProject(parseInt(saved))
+    const params = new URLSearchParams(window.location.search);
+    const fromUrl = params.get('project');
+    const fromSession = sessionStorage.getItem('hw-pipeline-project-id');
+    const targetId = fromUrl ?? fromSession;
+    if (targetId && /^\d+$/.test(targetId)) {
+      api.getProject(parseInt(targetId, 10))
         .then(p => handleLoadProject(p))
-        .catch(() => sessionStorage.removeItem('hw-pipeline-project-id'));
+        .catch(() => {
+          if (fromUrl) {
+            // Bad URL param — strip it so we don't loop on F5.
+            try {
+              const url = new URL(window.location.href);
+              url.searchParams.delete('project');
+              window.history.replaceState({}, '', url.toString());
+            } catch { /* ignore */ }
+          }
+          sessionStorage.removeItem('hw-pipeline-project-id');
+        });
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -98,8 +115,25 @@ export default function App() {
   useEffect(() => {
     if (project) {
       sessionStorage.setItem('hw-pipeline-project-id', String(project.id));
+      // P18: keep the URL in sync so F5 reproduces the same view AND so the
+      // user can copy / bookmark a project URL. Use replaceState (no
+      // history entry) — back button still goes to wherever they came from.
+      try {
+        const url = new URL(window.location.href);
+        if (url.searchParams.get('project') !== String(project.id)) {
+          url.searchParams.set('project', String(project.id));
+          window.history.replaceState({}, '', url.toString());
+        }
+      } catch { /* ignore — URL API failures are non-fatal */ }
     } else {
       sessionStorage.removeItem('hw-pipeline-project-id');
+      try {
+        const url = new URL(window.location.href);
+        if (url.searchParams.has('project')) {
+          url.searchParams.delete('project');
+          window.history.replaceState({}, '', url.toString());
+        }
+      } catch { /* ignore */ }
     }
   }, [project]);
 
@@ -524,23 +558,23 @@ export default function App() {
   })();
 
   if (mode === 'landing') {
+    // P18 (2026-04-26): the holographic Dashboard replaces LandingPage as
+    // the project==null surface. LandingPage is kept imported above as a
+    // rollback target — flip the JSX back if Dashboard ever fails on demo.
+    // DashboardView's "open project" button calls handleLoadProject only
+    // as a last-resort fallback (when window.open is blocked); the normal
+    // path opens the project in a NEW tab via window.open('?project=ID').
+    // The Create CTA goes through the existing CreateProjectModal in the
+    // SAME tab — that's the user's deliberate "start fresh" path.
     return (
       <>
-        <LandingPage
+        <DashboardView
           onCreate={() => setModal('create')}
-          onLoad={() => setModal('load')}
-          theme={theme}
-          onToggleTheme={toggleTheme}
+          onLoadProject={handleLoadProject}
         />
         {modal === 'create' && (
           <CreateProjectModal
             onConfirm={handleCreateProject}
-            onCancel={() => setModal(null)}
-          />
-        )}
-        {modal === 'load' && (
-          <LoadProjectModal
-            onSelect={handleLoadProject}
             onCancel={() => setModal(null)}
           />
         )}
