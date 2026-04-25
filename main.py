@@ -1064,113 +1064,34 @@ def _render_mermaid_local(code: str, out_path: str) -> bool:
 
 
 def _sanitize_mermaid_code(code: str) -> str:
-    """
-    Sanitize mermaid code to fix common AI-generation errors.
-    This must match the frontend sanitization in DocumentsView.tsx and ChatView.tsx.
-    """
-    import re as _re
+    """P26 #6 (2026-04-25) — REDUCED TO NO-OP.
 
-    # Strip %%{ init }%% frontmatter and %% comments
-    code = _re.sub(r'^%%\{[\s\S]*?\}%%\s*', '', code, flags=_re.MULTILINE)
-    code = _re.sub(r'%%[^\n]*', '', code)
+    Historical context: this function used to be a 100-line legacy
+    sanitiser that ran AFTER tools.mermaid_salvage.salvage() in the
+    DOCX render pipeline. It had the SAME bugs that the canonical
+    salvage was already fixing, AND in some cases it UN-FIXED them:
 
-    # Arrow fixes: em-dash → --, ——> → -->
-    code = code.replace('\u2014\u2014>', '-->').replace('\u2014>', '-->')
-    code = code.replace('——>', '-->').replace('—>', '-->')
-    code = code.replace('==>', '-->')
-    code = _re.sub(r'(\w)\s*->\s*(\w)', r'\1 --> \2', code)
+      - Stripped quote chars from inside labels
+      - Stripped angle brackets (turned <br> into bare br)
+      - Stripped parens (turned ("Chain (Ant1)") into (Chain Ant1))
+      - The rect regex matched trapezoid shapes and mangled them
+      - The flag-shape regex lost the closing bracket
 
-    # Single dash between nodes → -->
-    code = _re.sub(r'(\b[\w\-]+\b)\s+-\s+(\b[\w\-]+[\s\[\(])', r'\1 --> \2', code)
+    Real-world failure (project cjfn, 2026-04-25): salvage produced
+    perfectly valid mermaid; mermaid.ink + mmdc both rendered it on
+    isolated test, but the server DOCX pipeline produced a placeholder
+    PNG every time because this legacy pass mangled the salvaged
+    source BEFORE the renderers saw it.
 
-    # Normalise graph → flowchart
-    code = _re.sub(r'^graph\s+(TD|LR|TB|RL|BT)', r'flowchart \1', code, flags=_re.IGNORECASE)
-    code = _re.sub(r'^(flowchart)\n(TD|LR|TB|RL|BT)\b', r'\1 \2', code, flags=_re.MULTILINE)
+    Salvage in tools/mermaid_salvage.py already handles every pattern
+    this function used to handle (frontmatter strip, ASCII conversion,
+    arrow normalisation, label quoting, shape preservation), and does
+    so without breaking valid input. So this becomes a no-op pass-
+    through. Keeping it as a no-op (vs. removing the call site)
+    preserves call-site back-compat and the public function symbol.
 
-    # Join multi-line labels
-    lines = code.split('\n')
-    joined = []
-    for line in lines:
-        if joined and _re.search(r'\[', joined[-1]) and not _re.search(r'\]', joined[-1]):
-            joined[-1] = joined[-1].rstrip() + ' ' + line.lstrip()
-        else:
-            joined.append(line)
-    code = '\n'.join(joined)
-
-    # Strip non-ASCII characters that break Mermaid (Ω, °, µ, etc.)
-    code = _re.sub(r'[^\x00-\x7F]', lambda m: {
-        '\u03a9': 'Ohm', '\u00b0': 'deg', '\u00b5': 'u', '\u2126': 'Ohm',
-        '\u2013': '-', '\u2014': '-', '\u2018': "'", '\u2019': "'",
-        '\u201c': '"', '\u201d': '"', '\u2264': '<=', '\u2265': '>=',
-    }.get(m.group(), ''), code)
-
-    # Sanitize node labels
-    def sanitize_label(inner: str) -> str:
-        s = inner
-        s = _re.sub(r'-->', ' ', s)
-        s = _re.sub(r'->', ' ', s)
-        s = s.replace('<', ' ').replace('>', ' ')
-        s = s.replace('(', ' ').replace(')', ' ')
-        s = s.replace('_', '-')
-        s = _re.sub(r'&(?!amp;|lt;|gt;|#)', 'and', s)
-        s = s.replace('"', ' ').replace("'", ' ')
-        s = s.replace('#', ' ')
-        s = s.replace('|', '/')
-        # IMPORTANT: Remove ALL dash sequences (2 or more)
-        s = _re.sub(r'-{2,}', ' ', s)
-        s = _re.sub(r'^[-—=]+|[—=-]+$', ' ', s)
-        s = _re.sub(r'\s{2,}', ' ', s)
-        return s.strip()
-
-    # Round-bracket nodes with quoted labels containing nested parens break
-    # the paren-label regex below — `r'\(([^)]*)\)'` captures up to the FIRST
-    # inner `)`, so `S11("VGA (AGC)<br/>HMC624LP4E")` is parsed as a node
-    # whose label ends at `(AGC)`, leaving the rest as syntactically-garbage
-    # tokens. All 3 render backends (mermaid.ink / mmdc / node) then fail and
-    # the DOCX falls back to the "(rendered in browser — source below)"
-    # placeholder with NO embedded image. Mirror the frontend fix:
-    # normalise `ID("…(…)…")` → `ID["…(…)…"]` so the bracket regex (which
-    # uses `[^\]]*` and can span inner `()`) finds the right boundary.
-    # Matches the frontend sanitiser in mermaidSanitize.ts.
-    code = _re.sub(
-        r'([\w\-]+)\("([^"]*[()][^"]*)"\)',
-        r'\1["\2"]',
-        code,
-    )
-
-    # Apply to square brackets, round parens, braces (node labels)
-    code = _re.sub(r'\[([^\]]*)\]', lambda m: f'[{sanitize_label(m.group(1))}]', code)
-    code = _re.sub(r'\(([^)]*)\)', lambda m: f'({sanitize_label(m.group(1))})', code)
-    code = _re.sub(r'\{([^}]*)\}', lambda m: f'{{{sanitize_label(m.group(1))}}}', code)
-
-    # Sanitize edge labels: -->|label text| — strip problematic chars inside pipes
-    def sanitize_edge_label(m):
-        arrow = m.group(1)
-        label = m.group(2)
-        label = label.replace('"', ' ').replace("'", ' ')
-        label = label.replace('(', ' ').replace(')', ' ')
-        label = label.replace('<', ' ').replace('>', ' ')
-        label = label.replace('#', ' ')
-        label = _re.sub(r'[^\x20-\x7E]', '', label)  # ASCII printable only
-        label = _re.sub(r'\s{2,}', ' ', label).strip()
-        return f'{arrow}|{label}|'
-    code = _re.sub(r'(-->|---|-\.-|==>)\|([^|]*)\|', sanitize_edge_label, code)
-
-    # Fix double-paren nodes like ((label)) — replace with single-paren (label)
-    # Mermaid ((...)) is stadium shape but AI often generates broken nested parens
-    code = _re.sub(r'\(\(([^)]*)\)\)', r'(\1)', code)
-
-    # Fix stray unmatched parens/brackets in node IDs (not inside labels)
-    # e.g. "A))" at end of line → "A"
-    lines = code.split('\n')
-    cleaned = []
-    for line in lines:
-        # Remove trailing )) or ]] not part of a label
-        if not _re.search(r'[\[\(\{]', line):
-            line = _re.sub(r'[)\]]+\s*$', '', line)
-        cleaned.append(line)
-    code = '\n'.join(cleaned)
-
+    DO NOT add salvage logic here. Add it to mermaid_salvage.py
+    instead so it is shared with the frontend sanitiser."""
     return code
 
 
@@ -1190,7 +1111,15 @@ def _sanitize_mermaid_code(code: str) -> str:
 # parallelogram quotes are stripped (those genuinely reject quotes);
 # all other shapes preserve them. v3 cached docx files were rendered
 # with the bad salvage and need re-rendering.
-_DOCX_CACHE_VERSION = 4
+# P26 #6 (2026-04-25, cjfn DOCX fix): bumped to 5 — the v4 docx render
+# path called the LEGACY `_sanitize_mermaid_code` AFTER salvage, which
+# UN-FIXED the salvage's work (stripped quotes, stripped <br>, stripped
+# parens). Mermaid then 400'd at mermaid.ink and the docx fell to the
+# placeholder PNG. `_sanitize_mermaid_code` is now a no-op; salvage
+# alone produces clean output that all 3 renderers accept. Bump
+# invalidates v4 cached docx files that were rendered with the
+# legacy sanitiser still corrupting the salvaged source.
+_DOCX_CACHE_VERSION = 5
 
 
 def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:
