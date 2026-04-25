@@ -573,7 +573,9 @@ def run_tx_cascade_audit(
         or design_parameters.get("project_type")
         or ""
     ).strip().lower()
-    if direction != "tx":
+    # P26 #13: transmitter + transceiver run TX-side audits (PA thermal /
+    # OIP3-PAE headroom). receiver, switch_matrix, power_supply skip.
+    if direction not in {"tx", "transmitter", "transceiver"}:
         return []
 
     try:
@@ -698,7 +700,9 @@ def run_pa_thermal_audit(
         or design_parameters.get("project_type")
         or ""
     ).strip().lower()
-    if direction != "tx":
+    # P26 #13: transmitter + transceiver run TX-side audits (PA thermal /
+    # OIP3-PAE headroom). receiver, switch_matrix, power_supply skip.
+    if direction not in {"tx", "transmitter", "transceiver"}:
         return []
 
     try:

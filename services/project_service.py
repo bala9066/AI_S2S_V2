@@ -47,6 +47,27 @@ log = logging.getLogger(__name__)
 
 VALID_DESIGN_SCOPES = {"full", "front-end", "downconversion", "dsp"}
 
+# Project-type catalogue. Each value drives:
+#   - which architecture set / tier-1 spec questions the wizard shows
+#     (`hardware-pipeline-v5-react/src/data/rfArchitect.ts`)
+#   - which direction `tools.rf_cascade.compute_cascade` runs in
+#     (rx | tx | bidirectional | passive | dc-dc)
+#   - which audit branch fires in `services.rf_audit`
+#
+# P26 #13 (2026-04-25): added transceiver, power_supply, switch_matrix
+# alongside receiver / transmitter. New types currently reuse the
+# transmitter cascade for the "active" direction (see
+# `tools.rf_cascade._direction_for_project_type`); a follow-up will
+# add bespoke math (DC-DC efficiency curves for power_supply,
+# routing-algebra IL/isolation for switch_matrix).
+VALID_PROJECT_TYPES = {
+    "receiver",
+    "transmitter",
+    "transceiver",
+    "power_supply",
+    "switch_matrix",
+}
+
 
 def _project_to_dict(p: ProjectDB) -> dict:
     return {
@@ -138,10 +159,10 @@ class ProjectService:
                 f"Must be one of: {sorted(VALID_DESIGN_SCOPES)}"
             )
         ptype = (project_type or "receiver").strip().lower()
-        if ptype not in ("receiver", "transmitter"):
+        if ptype not in VALID_PROJECT_TYPES:
             raise ValueError(
                 f"Invalid project_type '{project_type}'. "
-                "Must be 'receiver' or 'transmitter'."
+                f"Must be one of: {sorted(VALID_PROJECT_TYPES)}."
             )
         session = get_session()
         try:

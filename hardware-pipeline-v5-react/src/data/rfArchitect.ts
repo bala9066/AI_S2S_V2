@@ -28,10 +28,11 @@ export interface ProjectTypeDef {
 }
 
 export const PROJECT_TYPES: Record<string, ProjectTypeDef> = {
-  receiver:     { id: 'receiver',     name: 'Receiver',     desc: 'Antenna → signal capture + conditioning + (optional) digitisation.',   examples: 'Receiver 5-18 GHz wideband · X-band radar RX · Ku-band SATCOM downconverter', supported: true },
-  transmitter:  { id: 'transmitter',  name: 'Transmitter',  desc: 'Signal generation + amplification + spectral cleanup.',                examples: 'Transmitter 2-8 GHz PA chain · S-band radar TX · Ku-band uplink',             supported: true },
-  transceiver:  { id: 'transceiver',  name: 'Transceiver',  desc: 'Combined TX + RX — shared LO / antenna.',                              examples: 'SDR TRX 70 MHz-6 GHz · 5G NR front-end · Half-duplex comms link',             supported: false },
-  power_supply: { id: 'power_supply', name: 'Power Supply', desc: 'DC-DC conversion — buck / boost / LLC / flyback topology.',            examples: 'DC-DC 24V → 5V, 10A · Dual-rail ±12V / 3A · PoE-PD 30W',                      supported: false },
+  receiver:      { id: 'receiver',      name: 'Receiver',      desc: 'Antenna → signal capture + conditioning + (optional) digitisation.',   examples: 'Receiver 5-18 GHz wideband · X-band radar RX · Ku-band SATCOM downconverter', supported: true },
+  transmitter:   { id: 'transmitter',   name: 'Transmitter',   desc: 'Signal generation + amplification + spectral cleanup.',                examples: 'Transmitter 2-8 GHz PA chain · S-band radar TX · Ku-band uplink',             supported: true },
+  transceiver:   { id: 'transceiver',   name: 'Transceiver',   desc: 'Combined TX + RX — shared LO / antenna, T/R or duplex isolation.',     examples: 'SDR TRX 70 MHz-6 GHz · 5G NR front-end · Half-duplex tactical comms',         supported: true },
+  power_supply:  { id: 'power_supply',  name: 'Power Supply',  desc: 'DC-DC conversion — buck / boost / LLC / flyback / LDO topology.',      examples: 'DC-DC 24V → 5V, 10A · Dual-rail ±12V / 3A · PoE-PD 30W · Telecom 48V brick',  supported: true },
+  switch_matrix: { id: 'switch_matrix', name: 'Switch Matrix', desc: 'M×N RF routing fabric — blocking or non-blocking SP*T network.',       examples: '4×8 SPDT test matrix · 16×16 non-blocking ATE crossbar · 2×4 antenna selector', supported: true },
 };
 
 /* ================================================================
@@ -73,13 +74,25 @@ export interface ArchDef {
    *  - linear / detector  → receiver (baseline wiring)
    *  - tx_linear          → transmitter (linear PA chains — Class A/AB, Doherty, DPD)
    *  - tx_saturated       → transmitter (saturated PAs — Class C/E/F, radar pulse)
-   *  - tx_upconversion    → transmitter (IQ mod or mixer-based up-convert front-end) */
-  category: 'linear' | 'detector' | 'tx_linear' | 'tx_saturated' | 'tx_upconversion';
+   *  - tx_upconversion    → transmitter (IQ mod or mixer-based up-convert front-end)
+   *  - trx               → transceiver (TDD shared front-end / FDD duplexed)
+   *  - psu_dcdc          → DC-DC switching converter (buck / boost / LLC / flyback)
+   *  - psu_linear        → LDO / linear regulator topology
+   *  - swm_blocking      → blocking switch matrix (tree, broadcast)
+   *  - swm_nonblocking   → non-blocking crossbar matrix */
+  category:
+    | 'linear' | 'detector'
+    | 'tx_linear' | 'tx_saturated' | 'tx_upconversion'
+    | 'trx'
+    | 'psu_dcdc' | 'psu_linear'
+    | 'swm_blocking' | 'swm_nonblocking';
   apps_required?: string[];
   /** Which project_type this architecture is offered under. Defaults to
-   *  'receiver' for backward compatibility — only the new TX topologies
-   *  need to declare themselves. */
-  project_type?: 'receiver' | 'transmitter';
+   *  'receiver' for backward compatibility. The five values mirror
+   *  PROJECT_TYPES + the backend's VALID_PROJECT_TYPES enum. */
+  project_type?:
+    | 'receiver' | 'transmitter' | 'transceiver'
+    | 'power_supply' | 'switch_matrix';
 }
 
 export const ALL_ARCHITECTURES: ArchDef[] = [
@@ -129,6 +142,56 @@ export const ALL_ARCHITECTURES: ArchDef[] = [
   { id: 'tx_direct_dac',         name: 'Direct-DAC Synthesis → PA',               desc: 'RF DAC emits the signal directly, feeding driver → PA. Minimal analog.',     scopes: ['dsp','full'],       category: 'tx_upconversion', project_type: 'transmitter' },
 
   { id: 'tx_recommend',          name: 'Not sure — you recommend',                desc: 'Architect picks the TX topology from your specs + application.',               scopes: ['front-end','downconversion','dsp','full'], category: 'tx_linear', project_type: 'transmitter' },
+
+  /* ============================================================
+     TRANSCEIVER (TRX) ARCHITECTURES — combined TX + RX topologies.
+     Listed under project_type='transceiver' so the wizard's
+     `filterArchByScopeAndApp` can pick them up cleanly.
+     ============================================================ */
+  { id: 'trx_tdd_shared_fe',     name: 'TDD with Shared Front-End',                desc: 'Single antenna, T/R switch alternates between TX PA and RX LNA. Same band TX↔RX.', scopes: ['front-end','full'], category: 'trx', project_type: 'transceiver' },
+  { id: 'trx_fdd_duplexer',      name: 'FDD with Duplexer',                         desc: 'Single antenna + ceramic / cavity duplexer. Simultaneous TX+RX on offset bands.',  scopes: ['front-end','full'], category: 'trx', project_type: 'transceiver' },
+  { id: 'trx_separate_antennas', name: 'Separate TX / RX Antennas',                 desc: 'Independent TX + RX paths. Simplest isolation, biggest aperture footprint.',       scopes: ['front-end','full'], category: 'trx', project_type: 'transceiver' },
+  { id: 'trx_circulator',        name: 'Circulator-Isolated Single Antenna',        desc: 'Ferrite circulator routes TX→ant→RX. ~20 dB isolation, narrow band.',              scopes: ['front-end','full'], category: 'trx', project_type: 'transceiver' },
+  { id: 'trx_zero_if_quadrature',name: 'Zero-IF Quadrature TRX (SDR)',              desc: 'Shared LO drives both TX I/Q modulator and RX I/Q demodulator. Compact SDR.',      scopes: ['downconversion','full'], category: 'trx', project_type: 'transceiver' },
+  { id: 'trx_superhet_shared_lo',name: 'Superhet TRX with Shared LO',               desc: 'TX + RX share the LO synthesizer; separate IF chains. SATCOM uplink/downlink.',    scopes: ['downconversion','full'], category: 'trx', project_type: 'transceiver' },
+  { id: 'trx_direct_rf_sample',  name: 'Direct-RF Sample TRX',                      desc: 'RF DAC + RF ADC, both clocked from same source. Minimal analog. 5G NR / EW.',      scopes: ['dsp','full'], category: 'trx', project_type: 'transceiver' },
+  { id: 'trx_recommend',         name: 'Not sure — you recommend',                  desc: 'Architect picks based on duplex mode (TDD/FDD), isolation, and band plan.',         scopes: ['front-end','downconversion','dsp','full'], category: 'trx', project_type: 'transceiver' },
+
+  /* ============================================================
+     POWER SUPPLY ARCHITECTURES — DC-DC + linear topologies.
+     Scope mapping: psu_dcdc + psu_linear apply to 'full' scope only
+     (power supplies don't have RF front-end / downconversion / DSP
+     scope distinctions).
+     ============================================================ */
+  /* Switching DC-DC */
+  { id: 'psu_buck',              name: 'Buck Converter',                            desc: 'Step-down DC-DC. 80-95% efficient, simplest topology. Vin > Vout always.',         scopes: ['full'], category: 'psu_dcdc', project_type: 'power_supply' },
+  { id: 'psu_boost',             name: 'Boost Converter',                           desc: 'Step-up DC-DC. Vin < Vout. Battery-powered, PFC, LED drivers.',                    scopes: ['full'], category: 'psu_dcdc', project_type: 'power_supply' },
+  { id: 'psu_buck_boost',        name: 'Buck-Boost (4-switch)',                     desc: 'Vin can be above OR below Vout. Wide-input rail (battery 2.5-5.5V → 3.3V).',       scopes: ['full'], category: 'psu_dcdc', project_type: 'power_supply' },
+  { id: 'psu_sepic',             name: 'SEPIC Converter',                           desc: 'Non-inverting buck-boost with isolation cap. Wide Vin range, audio / auto.',       scopes: ['full'], category: 'psu_dcdc', project_type: 'power_supply' },
+  { id: 'psu_flyback_isolated',  name: 'Flyback (Isolated)',                        desc: 'Single-switch isolated converter. < 100 W, multi-output. Telecom AUX, USB-PD.',    scopes: ['full'], category: 'psu_dcdc', project_type: 'power_supply' },
+  { id: 'psu_llc_resonant',      name: 'LLC Resonant Half-Bridge',                  desc: 'ZVS resonant topology, 95%+ efficient. 100W-3kW server / telecom bricks.',         scopes: ['full'], category: 'psu_dcdc', project_type: 'power_supply' },
+  { id: 'psu_phase_shifted_fb',  name: 'Phase-Shifted Full-Bridge',                 desc: 'ZVS full-bridge for kW-class isolated rails. EV charging, large telecom.',         scopes: ['full'], category: 'psu_dcdc', project_type: 'power_supply' },
+  { id: 'psu_pfc_boost',         name: 'PFC + Boost (AC-DC front-end)',             desc: 'Active power-factor-correction stage feeding bulk DC. AC-DC bricks > 75 W.',       scopes: ['full'], category: 'psu_dcdc', project_type: 'power_supply' },
+  /* Linear regulators */
+  { id: 'psu_ldo_chain',         name: 'LDO Cascade (low-noise rails)',             desc: 'Buck pre-reg → LDO post-reg for clean RF / ADC supplies. < 30 µV noise.',          scopes: ['full'], category: 'psu_linear', project_type: 'power_supply' },
+  { id: 'psu_dual_ldo',          name: 'Dual-Output LDO (±rail)',                   desc: 'Positive + negative LDOs from a single bipolar source. Op-amp / sensor rails.',    scopes: ['full'], category: 'psu_linear', project_type: 'power_supply' },
+  { id: 'psu_recommend',         name: 'Not sure — you recommend',                  desc: 'Architect picks topology from Vin/Vout, current, isolation, and noise budget.',    scopes: ['full'], category: 'psu_dcdc', project_type: 'power_supply' },
+
+  /* ============================================================
+     SWITCH MATRIX ARCHITECTURES — M×N RF routing fabrics.
+     Two main families: blocking (cheaper, restricted routes) and
+     non-blocking (full crossbar, any-input → any-output).
+     ============================================================ */
+  /* Blocking topologies */
+  { id: 'swm_tree_spdt',         name: 'Tree of SPDT Switches',                     desc: 'Cascaded SP2T stages, log2(N) deep. Cheapest 1×N selector. Blocks on conflict.',   scopes: ['front-end','full'], category: 'swm_blocking', project_type: 'switch_matrix' },
+  { id: 'swm_broadcast_spnt',    name: 'Broadcast SPNT',                            desc: 'Single SPNT switch, 1 input → N outputs (or N → 1). Antenna selectors, ATE.',     scopes: ['front-end','full'], category: 'swm_blocking', project_type: 'switch_matrix' },
+  { id: 'swm_blocking_matrix',   name: 'Blocking M×N Matrix',                       desc: 'Tree-of-trees. Lower switch count than crossbar but some routes block.',           scopes: ['front-end','full'], category: 'swm_blocking', project_type: 'switch_matrix' },
+  /* Non-blocking topologies */
+  { id: 'swm_full_crossbar',     name: 'Full M×N Crossbar (Non-Blocking)',          desc: 'M×N independent SPDT cells. Any input → any output simultaneously. Telecom / ATE.', scopes: ['front-end','full'], category: 'swm_nonblocking', project_type: 'switch_matrix' },
+  { id: 'swm_clos',              name: 'Clos Network (3-stage non-blocking)',       desc: 'Middle-stage expansion lets large M×N matrices be non-blocking with fewer switches.', scopes: ['front-end','full'], category: 'swm_nonblocking', project_type: 'switch_matrix' },
+  { id: 'swm_mems_array',        name: 'MEMS Switch Array',                         desc: 'Mechanical contact relays, near-zero loss/distortion, slow (ms). Cal/test floor.',  scopes: ['front-end','full'], category: 'swm_nonblocking', project_type: 'switch_matrix' },
+  { id: 'swm_pin_diode_matrix',  name: 'PIN-Diode Matrix (high-power)',             desc: 'PIN-diode SP*T cells handle +30 dBm CW. Coarser but cheap.',                       scopes: ['front-end','full'], category: 'swm_blocking', project_type: 'switch_matrix' },
+  { id: 'swm_recommend',         name: 'Not sure — you recommend',                  desc: 'Architect picks blocking vs non-blocking from your simultaneity / isolation specs.', scopes: ['front-end','full'], category: 'swm_blocking', project_type: 'switch_matrix' },
 ];
 
 /* ================================================================
@@ -196,6 +259,87 @@ export const TX_SPECS: SpecDef[] = [
   { id: 'temp_class',     q: 'Operating temperature class?',                       drives: 'Component grade + thermals',               chips: ['Commercial 0 to 70 °C','Industrial -40 to 85 °C','Military -55 to 125 °C','Space / rad-hard','Other'], scopes: ['full','front-end','downconversion','dsp'] },
   { id: 'vibration',      q: 'Vibration / shock environment?',                     drives: 'Enclosure + connector',                    chips: ['Benign (lab)','MIL-STD-810 light','MIL-STD-810 heavy','Airborne','Naval','Other'], scopes: ['full','front-end','downconversion','dsp'] },
   { id: 'ip_rating',      q: 'Ingress protection?',                                drives: 'Seal + housing',                           chips: ['IP20 (lab)','IP54 (outdoor)','IP67 (rugged)','IP68','N/A'],   scopes: ['full','front-end','downconversion','dsp'] },
+];
+
+/* ================================================================
+   TRANSCEIVER TIER-1 SPECS — superset of RX + TX, organized so the
+   user enters duplex mode + isolation budget first, then the
+   familiar RF-performance questions for each direction.
+   ================================================================ */
+export const TRX_SPECS: SpecDef[] = [
+  /* Duplex / band plan */
+  { id: 'duplex_mode',    q: 'Duplex mode?',                                       drives: 'Antenna sharing + isolation strategy',     chips: ['TDD (time-shared)','FDD (frequency-offset)','HDX half-duplex','Simplex (separate)'], scopes: ['full','front-end','downconversion','dsp'] },
+  { id: 'tx_freq_range',  q: 'TX frequency range?',                                drives: 'PA + filter band',                          chips: ['< 1 GHz','1-3 GHz','3-6 GHz','6-18 GHz','> 18 GHz','Other'], scopes: ['full','front-end','downconversion'] },
+  { id: 'rx_freq_range',  q: 'RX frequency range?',                                drives: 'LNA + filter band',                          chips: ['< 1 GHz','1-3 GHz','3-6 GHz','6-18 GHz','> 18 GHz','Same as TX','Other'], scopes: ['full','front-end','downconversion'] },
+  { id: 'tx_rx_isolation',q: 'Required TX→RX isolation (dB)?',                     drives: 'Duplexer / circulator / T-R switch',       chips: ['> 30 dB (TDD)','> 50 dB','> 70 dB (FDD)','> 90 dB (cellular base)','Other'], scopes: ['full','front-end'] },
+  /* TX-side performance */
+  { id: 'pout_dbm',       q: 'TX output power Pout (dBm)?',                        drives: 'PA device + supply',                        chips: ['+20 dBm','+30 dBm (1 W)','+37 dBm (5 W)','+40 dBm (10 W)','+47 dBm (50 W)','Other'], scopes: ['full','front-end'] },
+  { id: 'pae_pct',        q: 'TX PAE target?',                                     drives: 'PA class selection',                        chips: ['> 20% (linear AB)','> 35% (Doherty)','> 50% (saturated)','Other'], scopes: ['full','front-end'] },
+  /* RX-side performance */
+  { id: 'noise_figure',   q: 'RX system noise figure (dB)?',                       drives: 'LNA + cascade sensitivity',                 chips: ['< 2 dB','2-4 dB','4-6 dB','6-10 dB','Other'],                 scopes: ['full','front-end','downconversion'] },
+  { id: 'rx_iip3',        q: 'RX IIP3 (dBm) under TX leakage?',                    drives: 'LNA / mixer linearity for desensitization', chips: ['0 dBm','+10 dBm','+20 dBm','+30 dBm','Other'],                scopes: ['full','front-end','downconversion'] },
+  /* Switching / agility */
+  { id: 'tr_switch_time', q: 'T/R switching time (TDD)?',                          drives: 'Switch technology + control',                chips: ['< 100 ns','< 1 µs','< 10 µs','N/A (FDD)','Other'],            scopes: ['full','front-end'] },
+  /* Shared frame */
+  { id: 'modulation',     q: 'Modulation / waveform?',                             drives: 'Linearity + DPD requirement',                chips: ['CW','QPSK','16/64/256-QAM','OFDM','5G NR FR1/FR2','Pulsed','Other'], scopes: ['full','front-end','downconversion','dsp'] },
+  { id: 'supply_voltage', q: 'Primary supply rail?',                                drives: 'PA + LNA biasing',                           chips: ['+5 V','+12 V','+28 V','+48 V','Multi-rail','Other'],          scopes: ['full','front-end','downconversion','dsp'] },
+  { id: 'power_budget',   q: 'Total DC power budget (W)?',                          drives: 'Thermal + DC-DC topology',                   chips: ['< 10 W','10-50 W','50-200 W','> 200 W','Auto','Other'],       scopes: ['full','front-end','downconversion','dsp'] },
+  /* Environmental — shared */
+  { id: 'temp_class',     q: 'Operating temperature class?',                       drives: 'Component grade + thermals',               chips: ['Commercial 0 to 70 °C','Industrial -40 to 85 °C','Military -55 to 125 °C','Space / rad-hard','Other'], scopes: ['full','front-end','downconversion','dsp'] },
+  { id: 'vibration',      q: 'Vibration / shock environment?',                     drives: 'Enclosure + connector',                    chips: ['Benign (lab)','MIL-STD-810 light','MIL-STD-810 heavy','Airborne','Naval','Other'], scopes: ['full','front-end','downconversion','dsp'] },
+  { id: 'ip_rating',      q: 'Ingress protection?',                                drives: 'Seal + housing',                           chips: ['IP20 (lab)','IP54 (outdoor)','IP67 (rugged)','IP68','N/A'],   scopes: ['full','front-end','downconversion','dsp'] },
+];
+
+/* ================================================================
+   POWER-SUPPLY TIER-1 SPECS — DC-DC + LDO design (no RF questions).
+   `scopes: ['full']` for every entry — power supplies don't carve
+   into front-end / downconversion / dsp like RF chains do.
+   ================================================================ */
+export const PSU_SPECS: SpecDef[] = [
+  /* Input/output rails */
+  { id: 'vin_range',      q: 'Input voltage range (Vin)?',                         drives: 'Topology selection (buck vs buck-boost vs LLC)', chips: ['+5 V (USB)','+12 V','+24 V (industrial)','+28 V (avionics)','+48 V (telecom)','85-264 VAC','Other'], scopes: ['full'] },
+  { id: 'vout_primary',   q: 'Primary output voltage (Vout)?',                     drives: 'Buck/boost/LLC ratio',                       chips: ['+1.0 V (FPGA core)','+1.8 V','+3.3 V','+5 V','+12 V','+15 V','+24 V','Other'], scopes: ['full'] },
+  { id: 'iout_max',       q: 'Max output current (Iout)?',                          drives: 'MOSFET + inductor sizing',                   chips: ['< 1 A','1-3 A','3-10 A','10-30 A','30-100 A','> 100 A','Other'], scopes: ['full'] },
+  { id: 'pout_total',     q: 'Total output power?',                                 drives: 'Thermal envelope + topology',                chips: ['< 5 W','5-25 W','25-100 W','100 W-1 kW','> 1 kW','Other'],    scopes: ['full'] },
+  { id: 'multi_rail',     q: 'Number of output rails?',                             drives: 'Multi-output topology',                      chips: ['Single','Dual (±)','Triple','Quad+','Other'],                  scopes: ['full'] },
+  /* Performance */
+  { id: 'efficiency',     q: 'Target peak efficiency?',                             drives: 'Topology (LLC/PSFB > buck > flyback)',       chips: ['> 80%','> 90%','> 94% (LLC)','> 96% (GaN)','Other'],          scopes: ['full'] },
+  { id: 'load_regulation',q: 'Load regulation (%)?',                                drives: 'Compensation + feedback loop',                chips: ['± 5%','± 2%','± 1%','± 0.5%','± 0.1% (precision)','Other'],    scopes: ['full'] },
+  { id: 'output_ripple',  q: 'Output ripple (mV pp)?',                              drives: 'Output-cap ESR + post-LDO need',             chips: ['< 100 mV','< 50 mV','< 20 mV','< 10 mV','< 1 mV (RF rail)','Other'], scopes: ['full'] },
+  { id: 'transient_resp', q: 'Load-step transient (mV / µs)?',                      drives: 'Loop bandwidth + output cap',                 chips: ['100 mV / 50 µs','50 mV / 20 µs','25 mV / 10 µs','10 mV / 5 µs','Other'], scopes: ['full'] },
+  /* Isolation + safety */
+  { id: 'isolation',      q: 'Galvanic isolation required?',                        drives: 'Transformer-coupled topology (flyback/LLC/PSFB)', chips: ['No','Functional (1 kV)','Reinforced (2.5 kV)','Medical (5 kV BF)','Other'], scopes: ['full'] },
+  { id: 'switching_freq', q: 'Switching frequency?',                                drives: 'Magnetics size + EMI envelope',               chips: ['100-500 kHz','500 kHz - 1 MHz','1-3 MHz','> 3 MHz (GaN)','Other'], scopes: ['full'] },
+  /* Compliance */
+  { id: 'emi_class',      q: 'EMI compliance class?',                               drives: 'Input filter + spread-spectrum + shield',     chips: ['FCC Part 15 Class B','FCC Class A','CISPR 22 / EN 55022','MIL-STD-461','Auto CISPR 25','None','Other'], scopes: ['full'] },
+  { id: 'safety_std',     q: 'Safety standard?',                                    drives: 'Creepage / clearance / X-Y caps',             chips: ['IEC 62368-1 (ITE)','IEC 60601 (medical)','UL 1741 (grid-tied)','None','Other'], scopes: ['full'] },
+  /* Environmental */
+  { id: 'temp_class',     q: 'Operating temperature class?',                        drives: 'Component grade + derating',                  chips: ['Commercial 0 to 70 °C','Industrial -40 to 85 °C','Automotive AEC-Q100','Military -55 to 125 °C','Other'], scopes: ['full'] },
+  { id: 'cooling',        q: 'Cooling method?',                                     drives: 'Heatsink / fan / conduction',                 chips: ['Natural convection','Forced air','Conduction (cold-plate)','Liquid','Other'], scopes: ['full'] },
+];
+
+/* ================================================================
+   SWITCH-MATRIX TIER-1 SPECS — RF routing fabric specs.
+   ================================================================ */
+export const SWM_SPECS: SpecDef[] = [
+  /* Topology size */
+  { id: 'matrix_size',    q: 'Matrix size (M inputs × N outputs)?',                 drives: 'Switch count + topology selection',          chips: ['1×2','1×4','1×8','2×4','4×8','8×8','16×16','32×32','Other'], scopes: ['full','front-end'] },
+  { id: 'blocking',       q: 'Blocking or non-blocking?',                           drives: 'Topology — crossbar vs tree',                 chips: ['Blocking (cheaper)','Non-blocking (any-any)','Re-arrangeable','Other'], scopes: ['full','front-end'] },
+  /* RF performance */
+  { id: 'freq_range',     q: 'Operating frequency range?',                          drives: 'Switch device tech (FET / PIN / MEMS)',      chips: ['DC - 6 GHz','DC - 18 GHz','DC - 26.5 GHz','DC - 40 GHz','DC - 67 GHz','Other'], scopes: ['full','front-end'] },
+  { id: 'insertion_loss', q: 'Max insertion loss per path (dB)?',                   drives: 'Switch tech + cascade depth',                 chips: ['< 0.5 dB (MEMS)','< 1 dB','< 2 dB (GaAs FET)','< 3 dB','< 5 dB (PIN)','Other'], scopes: ['full','front-end'] },
+  { id: 'isolation_swm',  q: 'Port-to-port isolation (dB)?',                        drives: 'Driver + layout + shielding',                 chips: ['> 30 dB','> 50 dB','> 70 dB','> 90 dB','> 110 dB (cal-grade)','Other'], scopes: ['full','front-end'] },
+  { id: 'iip3_swm',       q: 'IIP3 / linearity (dBm)?',                              drives: 'Switch tech (PIN > FET > MEMS)',              chips: ['+30 dBm','+45 dBm','+55 dBm','+65 dBm (PIN)','> +70 dBm','Other'], scopes: ['full','front-end'] },
+  { id: 'p_handling',     q: 'Max input power (CW)?',                                drives: 'Switch tech + heatsinking',                  chips: ['+20 dBm','+30 dBm','+37 dBm','+43 dBm','+50 dBm (PIN)','> +50 dBm','Other'], scopes: ['full','front-end'] },
+  { id: 'switching_time', q: 'Switching time?',                                      drives: 'Switch tech (FET ns / PIN µs / MEMS ms)',    chips: ['< 100 ns (FET)','< 1 µs','< 10 µs (PIN)','< 1 ms','< 10 ms (MEMS)','Other'], scopes: ['full','front-end'] },
+  { id: 'hot_switch',     q: 'Hot-switching (RF on during transition)?',             drives: 'Switch durability rating',                   chips: ['Cold only (CW off)','Hot < +20 dBm','Hot < +30 dBm','Hot full power','Other'], scopes: ['full','front-end'] },
+  { id: 'vswr_swm',       q: 'Port VSWR target?',                                    drives: 'Match networks + termination',                chips: ['< 1.5:1','< 1.8:1','< 2.0:1','< 2.5:1','Other'],              scopes: ['full','front-end'] },
+  /* Control */
+  { id: 'control_iface',  q: 'Control interface?',                                   drives: 'Driver IC + MCU bridging',                    chips: ['Parallel TTL/CMOS','SPI','I2C','USB','Ethernet (SCPI)','Other'], scopes: ['full'] },
+  { id: 'supply_voltage', q: 'Supply rail?',                                         drives: 'Driver IC + bias network',                    chips: ['+3.3 V','+5 V','+12 V','-5 V (negative bias)','Multi-rail','Other'], scopes: ['full','front-end'] },
+  { id: 'power_budget',   q: 'Total DC power budget (W)?',                           drives: 'Driver dissipation + thermal',                chips: ['< 1 W','1-5 W','5-15 W','> 15 W','Other'],                   scopes: ['full','front-end'] },
+  /* Environmental */
+  { id: 'temp_class',     q: 'Operating temperature class?',                         drives: 'Component grade + thermals',                  chips: ['Commercial 0 to 70 °C','Industrial -40 to 85 °C','Military -55 to 125 °C','Space / rad-hard','Other'], scopes: ['full','front-end'] },
 ];
 
 /* ================================================================
@@ -619,10 +763,20 @@ export function filterSpecsByScope(
   mdsLockEnabled: boolean,
   projectType: string | null = 'receiver',
 ): { shown: SpecDef[]; hidden: SpecDef[] } {
-  // Switch to the TX spec catalogue when the project is a transmitter.
-  // TX_SPECS replaces the NF/MDS/SFDR questions with Pout/PAE/ACPR/OIP3
-  // — the receiver-flavoured questions are meaningless for a TX chain.
-  const source = projectType === 'transmitter' ? TX_SPECS : ALL_SPECS;
+  // Pick the right tier-1 spec catalogue per project type:
+  //   receiver       → ALL_SPECS  (NF, MDS, SFDR, gain, etc.)
+  //   transmitter    → TX_SPECS   (Pout, PAE, OIP3, ACPR, harmonics)
+  //   transceiver    → TRX_SPECS  (duplex mode, isolation, both TX+RX perf)
+  //   power_supply   → PSU_SPECS  (Vin/Vout/Iout, ripple, transient, EMI)
+  //   switch_matrix  → SWM_SPECS  (M×N size, IL, isolation, switching time)
+  let source: SpecDef[];
+  switch (projectType) {
+    case 'transmitter':   source = TX_SPECS;  break;
+    case 'transceiver':   source = TRX_SPECS; break;
+    case 'power_supply':  source = PSU_SPECS; break;
+    case 'switch_matrix': source = SWM_SPECS; break;
+    default:              source = ALL_SPECS;
+  }
   const shown = source.filter(c => {
     if (!c.scopes.includes(scope)) return false;
     if (c.advanced && !mdsLockEnabled) return false;
@@ -675,6 +829,37 @@ export function filterTxArchByScopeAndApp(scope: DesignScope, appId: string): {
   const app = APPLICATIONS.find(a => a.id === appId);
   const strong = app ? app.strong_for : [];
   return { linear_pa, saturated_pa, upconvert, hidden, strong };
+}
+
+/** Transceiver architectures — TRX is one logical group (no PA-vs-mixer
+ *  split like TX) so we return a flat list. Scope filtering still applies
+ *  ('full' shows everything, 'front-end' hides upconvert/zero-IF, etc.). */
+export function filterTrxArchByScope(scope: DesignScope): { trx: ArchDef[]; hidden: ArchDef[] } {
+  const all = ALL_ARCHITECTURES.filter(a => a.project_type === 'transceiver');
+  const trx    = all.filter(a => a.scopes.includes(scope));
+  const hidden = all.filter(a => !a.scopes.includes(scope));
+  return { trx, hidden };
+}
+
+/** Power-supply architectures — split into switching DC-DC vs linear LDO
+ *  so the wizard can render a "Switching topology / Linear regulator"
+ *  two-column picker. */
+export function filterPsuArch(): { dcdc: ArchDef[]; linear: ArchDef[] } {
+  const all = ALL_ARCHITECTURES.filter(a => a.project_type === 'power_supply');
+  return {
+    dcdc:   all.filter(a => a.category === 'psu_dcdc'),
+    linear: all.filter(a => a.category === 'psu_linear'),
+  };
+}
+
+/** Switch-matrix architectures — split by blocking vs non-blocking so the
+ *  wizard surfaces the topology trade-off (cheaper vs simultaneity). */
+export function filterSwmArch(): { blocking: ArchDef[]; nonblocking: ArchDef[] } {
+  const all = ALL_ARCHITECTURES.filter(a => a.project_type === 'switch_matrix');
+  return {
+    blocking:    all.filter(a => a.category === 'swm_blocking'),
+    nonblocking: all.filter(a => a.category === 'swm_nonblocking'),
+  };
 }
 
 export function resolveDeepDiveQs(state: WizardState): { dive: DeepDiveDef | null; qs: DeepDiveQ[] } {

@@ -211,6 +211,35 @@ def compute_cascade(
     passive coupling cap has no spec — you just assume 0 dB.
     """
     direction = (direction or "rx").lower()
+    # P26 #13: project_type aliases mapped to cascade direction.
+    # Receiver / Tx are explicit; transceiver runs as Tx (the louder side
+    # of the budget — Rx already passes if Tx headroom holds); switch
+    # matrix is a passive routing fabric — treat as Rx (insertion-loss +
+    # IIP3 cascade still applies); power_supply has no RF cascade so we
+    # short-circuit to an empty rollup so callers get a well-formed
+    # result instead of an exception.
+    _DIRECTION_ALIAS = {
+        "receiver": "rx",
+        "transmitter": "tx",
+        "transceiver": "tx",
+        "switch_matrix": "rx",
+        "power_supply": "none",
+    }
+    direction = _DIRECTION_ALIAS.get(direction, direction)
+    if direction == "none":
+        return {
+            "direction": "none",
+            "stages": [],
+            "totals": {},
+            "claims": {},
+            "verdict": {
+                "ok": True,
+                "notes": [
+                    "power_supply project — RF cascade not applicable; "
+                    "use efficiency / regulation budgets instead",
+                ],
+            },
+        }
     if direction not in ("rx", "tx"):
         direction = "rx"
 

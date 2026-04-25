@@ -16,14 +16,32 @@ function inferDesignType(name: string): string {
 }
 
 /**
- * Infer receiver vs transmitter from the project name so the user doesn't
- * have to pick explicitly. "tx", "transmit", "uplink", "pa", "power amp",
- * "driver" → transmitter; everything else → receiver.
+ * Infer the project's product class from its name. Tested in priority
+ * order — most specific first (so "switch matrix" matches before "matrix"
+ * could be hijacked by something else).
+ *
+ *  switch_matrix : "switch matrix", "crossbar", "spdt matrix", "ate matrix"
+ *  power_supply  : "psu", "dc-dc", "ldo", "buck", "boost", "flyback",
+ *                  "llc", "regulator", "power supply"
+ *  transceiver   : "transceiver", "trx", "sdr trx", "tdd", "fdd", "duplex"
+ *  transmitter   : "tx", "transmit", "uplink", " pa ", "pa chain",
+ *                  "power amp", "driver amp", "upconvert", "exciter"
+ *  receiver      : default
  */
 function inferProjectType(name: string): ProjectType {
   const t = name.toLowerCase();
-  const txKeywords = ['tx', 'transmit', 'uplink', ' pa ', 'pa chain', 'power amp',
-    'driver amp', 'driver amplifier', 'upconvert', 'exciter'];
+  if (['switch matrix','crossbar','spdt matrix','ate matrix','rf matrix',
+       'sp4t','sp6t','sp8t','sp16t']
+      .some(k => t.includes(k))) return 'switch_matrix';
+  if (['psu','dc-dc','dc dc','ldo','buck','boost','flyback','llc',
+       'regulator','power supply','smps','pfc','phase-shifted',
+       'sepic']
+      .some(k => t.includes(k))) return 'power_supply';
+  if (['transceiver','trx','sdr trx','tdd','fdd','duplex','duplexer',
+       'half-duplex','full-duplex']
+      .some(k => t.includes(k))) return 'transceiver';
+  const txKeywords = ['tx','transmit','uplink',' pa ','pa chain','power amp',
+    'driver amp','driver amplifier','upconvert','exciter'];
   if (txKeywords.some(k => t.includes(k))) return 'transmitter';
   return 'receiver';
 }
@@ -74,14 +92,14 @@ export default function CreateProjectModal({ onConfirm, onCancel }: Props) {
           <label style={labelStyle}>PROJECT NAME <span style={{ color: 'var(--teal)' }}>*</span></label>
           <input
             style={inputStyle}
-            placeholder="e.g. 6-18 GHz wideband receiver, 2.4 GHz 10 W PA chain…"
+            placeholder="e.g. 6-18 GHz receiver · 10 W PA chain · SDR TRX · 12V→3.3V DC-DC · 4×8 switch matrix"
             value={name}
             onChange={e => setName(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) handleSubmit(); }}
             autoFocus
           />
           <div style={{ fontSize: 10, color: 'var(--text4)', marginTop: 6, fontFamily: "'DM Mono', monospace" }}>
-            Receiver / transmitter and RF vs digital are inferred from the name
+            Project class (RX / TX / TRX / power supply / switch matrix) is inferred from the name
           </div>
         </div>
 

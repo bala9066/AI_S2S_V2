@@ -14,11 +14,13 @@ export interface Project {
   design_type?: string;
   /** Wizard-selected scope — authoritative on the backend (ProjectDB.design_scope). */
   design_scope?: DesignScope;
-  /** "receiver" (default) or "transmitter" — picked at project creation.
-   *  Drives wizard flow (which architecture catalogue to show), which
-   *  Round-1 questions the P1 agent asks, and which direction branch
-   *  of tools/rf_cascade.py computes the cascade. Authoritative on the
-   *  backend (ProjectDB.project_type). */
+  /** "receiver" (default), "transmitter", "transceiver", "power_supply"
+   *  or "switch_matrix" — picked at project creation. Drives wizard flow
+   *  (which architecture catalogue + tier-1 spec questions appear), which
+   *  Round-1 questions the P1 agent asks, and which direction branch of
+   *  tools/rf_cascade.py computes the cascade. Authoritative on the
+   *  backend (ProjectDB.project_type, validated against
+   *  services.project_service.VALID_PROJECT_TYPES). */
   project_type?: ProjectType;
   status?: string;
   output_dir?: string;
@@ -26,11 +28,19 @@ export interface Project {
   conversation_history?: unknown[];
 }
 
-export type ProjectType = 'receiver' | 'transmitter';
+export type ProjectType =
+  | 'receiver'
+  | 'transmitter'
+  | 'transceiver'
+  | 'power_supply'
+  | 'switch_matrix';
 
 export const PROJECT_TYPE_LABELS: Record<ProjectType, string> = {
-  'receiver':    'Receiver',
-  'transmitter': 'Transmitter',
+  'receiver':      'Receiver',
+  'transmitter':   'Transmitter',
+  'transceiver':   'Transceiver',
+  'power_supply':  'Power Supply',
+  'switch_matrix': 'Switch Matrix',
 };
 
 export type Statuses = Record<string, PhaseStatusValue>;

@@ -4098,7 +4098,10 @@ class RequirementsAgent(BaseAgent):
             dp = tool_input.get("design_parameters") or {}
             # Direction: RX (default) / TX. Derived in priority order:
             #   1. Explicit design_parameters.direction from wizard
-            #   2. project_type == "transmitter" (once wizard is wired)
+            #   2. project_type from wizard (`receiver`, `transmitter`,
+            #      `transceiver`, `power_supply`, `switch_matrix` —
+            #      `tools.rf_cascade.compute_cascade` aliases these to
+            #      its native `rx` / `tx` / `none` directions)
             #   3. Heuristic: any stage has pout_dbm or oip3_dbm → TX
             direction = str(
                 dp.get("direction")
@@ -4106,8 +4109,10 @@ class RequirementsAgent(BaseAgent):
                 or tool_input.get("project_type")
                 or ""
             ).strip().lower()
-            if direction not in ("rx", "tx"):
-                # Heuristic fallback
+            # Cascade module knows the alias map; we forward unmodified
+            # project_type strings. Only apply the heuristic when the
+            # field is genuinely empty.
+            if not direction:
                 comps = tool_input.get("component_recommendations") or []
                 has_tx_spec = any(
                     (c.get("key_specs") or {}).get("pout_dbm") is not None

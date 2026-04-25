@@ -11,10 +11,11 @@ import {
   SCOPE_DESC, APPLICATIONS, ALL_ARCHITECTURES,
   emptyWizardState, archById, specLabel,
   filterSpecsByScope, filterArchByScopeAndApp, filterTxArchByScopeAndApp,
+  filterTrxArchByScope, filterPsuArch, filterSwmArch,
   resolveDeepDiveQs, resolveAppQs, allInlineSuggestions,
   derivedMDS, firedCascadeMessages, archRationale,
   AUTO_SUGGESTIONS,
-  type WizardState, type SpecDef, type DeepDiveQ, type AppQDef,
+  type WizardState, type SpecDef, type DeepDiveQ, type AppQDef, type ArchDef,
 } from '../data/rfArchitect';
 
 export interface ChatMessage { role: 'user' | 'ai'; text: string; id: string; }
@@ -2253,22 +2254,38 @@ function WizardFrame(p: WizardFrameProps) {
     if (!wizard.scope || !wizard.application) {
       return <div style={{ padding: 20, color: 'var(--text3)' }}>Missing scope/application, go back.</div>;
     }
-    // TX projects use the transmitter architecture catalogue (9 options
-    // grouped into linear PA chains, saturated PAs, and upconversion
-    // front-ends) instead of the 14 receiver topologies.
-    const isTx = wizard.projectType === 'transmitter';
-    const { linear, detector, strong } = isTx
-      ? (() => {
-          const tx = filterTxArchByScopeAndApp(wizard.scope, wizard.application);
-          // Fold all TX categories into the existing "linear + detector" slots
-          // so the rendering code below doesn't need to fork.
-          return {
-            linear: [...tx.linear_pa, ...tx.upconvert],
-            detector: tx.saturated_pa,  // rendered as a separate group like RX detectors
-            strong: tx.strong,
-          };
-        })()
-      : filterArchByScopeAndApp(wizard.scope, wizard.application);
+    // Pick the architecture catalogue per project_type. We always end up
+    // with `linear` + `detector` lists so the existing render code below
+    // doesn't need to fork — each new type folds its categories into
+    // those two slots with descriptive section headings handled
+    // implicitly via grouping.
+    const ptype = wizard.projectType ?? 'receiver';
+    let linear: ArchDef[];
+    let detector: ArchDef[];
+    let strong: string[] = [];
+    if (ptype === 'transmitter') {
+      const tx = filterTxArchByScopeAndApp(wizard.scope, wizard.application);
+      linear = [...tx.linear_pa, ...tx.upconvert];
+      detector = tx.saturated_pa;
+      strong = tx.strong;
+    } else if (ptype === 'transceiver') {
+      const trx = filterTrxArchByScope(wizard.scope);
+      linear = trx.trx;
+      detector = [];
+    } else if (ptype === 'power_supply') {
+      const psu = filterPsuArch();
+      linear = psu.dcdc;          // switching DC-DC topologies
+      detector = psu.linear;      // LDO / linear regulators (rendered as 2nd group)
+    } else if (ptype === 'switch_matrix') {
+      const swm = filterSwmArch();
+      linear = swm.nonblocking;   // crossbar / Clos / MEMS
+      detector = swm.blocking;    // tree / broadcast / PIN-diode (rendered as 2nd group)
+    } else {
+      const rx = filterArchByScopeAndApp(wizard.scope, wizard.application);
+      linear = rx.linear;
+      detector = rx.detector;
+      strong = rx.strong;
+    }
     const archBlock = (arch: typeof linear[number]) => {
       const isSel = wizard.architecture === arch.id;
       const isStrong = strong.includes(arch.id);
@@ -2316,7 +2333,10 @@ function WizardFrame(p: WizardFrameProps) {
             <div style={{ fontSize: 10, color: 'var(--text4)', letterSpacing: '0.1em',
               textTransform: 'uppercase' as const, fontFamily: "'DM Mono',monospace",
               margin: '0 0 8px 2px' }}>
-              Linear topologies
+              {ptype === 'transceiver'   ? 'Transceiver topologies'
+              : ptype === 'power_supply' ? 'Switching DC-DC topologies'
+              : ptype === 'switch_matrix'? 'Non-blocking topologies'
+              : 'Linear topologies'}
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 18 }}>
               {linear.map(archBlock)}
@@ -2328,7 +2348,10 @@ function WizardFrame(p: WizardFrameProps) {
             <div style={{ fontSize: 10, color: 'var(--text4)', letterSpacing: '0.1em',
               textTransform: 'uppercase' as const, fontFamily: "'DM Mono',monospace",
               margin: '0 0 8px 2px' }}>
-              Detector topologies (special-purpose)
+              {ptype === 'power_supply'  ? 'Linear regulators (LDOs)'
+              : ptype === 'switch_matrix'? 'Blocking topologies (cheaper, restricted)'
+              : ptype === 'transmitter'  ? 'Saturated PA topologies'
+              : 'Detector topologies (special-purpose)'}
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 18 }}>
               {detector.map(archBlock)}

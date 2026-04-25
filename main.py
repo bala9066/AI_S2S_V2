@@ -325,8 +325,15 @@ async def create_project(body: dict):
         raise HTTPException(400, "name is required")
     design_scope = (body.get("design_scope") or "full").strip().lower()
     project_type = (body.get("project_type") or "receiver").strip().lower()
-    if project_type not in ("receiver", "transmitter"):
-        raise HTTPException(400, f"project_type must be 'receiver' or 'transmitter' (got '{project_type}')")
+    # Single source of truth lives in services.project_service so the
+    # API + service-level validation can't drift apart (P26 #13).
+    from services.project_service import VALID_PROJECT_TYPES
+    if project_type not in VALID_PROJECT_TYPES:
+        raise HTTPException(
+            400,
+            f"project_type must be one of {sorted(VALID_PROJECT_TYPES)} "
+            f"(got '{project_type}')",
+        )
     try:
         return _project_svc().create(
             name=name,
