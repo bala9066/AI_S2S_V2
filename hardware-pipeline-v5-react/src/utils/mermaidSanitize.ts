@@ -144,8 +144,25 @@ export function sanitizeMermaid(raw: string): string {
   //     unbalanced paren that confused the round-shape sanitiser.
   code = code.replace(/\\n/g, ' ');
   code = code.replace(/&amp;/g, 'and').replace(/&nbsp;/g, ' ');
-  // Strip HTML tags EXCEPT <br> and <br/> (mermaid uses these for line breaks).
-  code = code.replace(/<(?!br\b|\/br\b)[^>]+>/gi, ' ');
+  // Normalise self-closing `<br/>` → `<br>` so the rest of the pipeline
+  // can rely on a single canonical form.
+  code = code.replace(/<br\s*\/>/gi, '<br>');
+  // Strip HTML tags EXCEPT <br> (mermaid uses it for line breaks).
+  code = code.replace(/<(?!br\b)[^>]+>/gi, ' ');
+
+  // P26 (2026-04-25, second pass): trapezoid `[\..\]` and parallelogram
+  // `[/.../]` shapes — strip REDUNDANT internal quotes the LLM emits when
+  // it JSON-escapes its tool input:
+  //   ADC[\"label"\]    →  ADC[\label\]
+  //   OUT[/"label"/]    →  OUT[/label/]
+  // Mermaid does NOT accept quotes inside `[\..\]` or `[/.../]` — the
+  // inner `"` confuses the parser into looking for a quoted-label close
+  // that then doesn't match the shape's `\]` or `/]` close, and the
+  // diagram fails with "Parse error on line N: ... <unrelated content>"
+  // because parsing got out of sync. Mirror of the backend's
+  // `_step_normalise_shape_quotes` (`tools/mermaid_salvage.py`).
+  code = code.replace(/\[\\\s*"([^"]*)"\s*\\\]/g, (_m, inner: string) => `[\\${inner.trim()}\\]`);
+  code = code.replace(/\[\/\s*"([^"]*)"\s*\/\]/g, (_m, inner: string) => `[/${inner.trim()}/]`);
   // Ensure `end` (subgraph close) is always on its own line — trailing case
   code = code.split('\n').map(line => {
     if (/\bend\s*$/.test(line) && !/^\s*end\b/.test(line)) {

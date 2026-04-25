@@ -127,6 +127,29 @@ describe('HTML entity decoding', () => {
     expect(out).toMatch(/ADCBLOCK\s*-->\s*X/);
   });
 
+  it('strips redundant inner quotes from trapezoid [\\..\\] (P26 #2)', () => {
+    // Real failing input from project djd (2026-04-25, second occurrence):
+    //   `DIG_SEC[\\"Digitisation<br/>2x ISLA212P25 ADCs<br/>500Msps 12-bit"\\]`
+    // Mermaid parser: "Parse error on line 48: ... THERMAL end ..."
+    // — the trapezoid's inner `"` confused the parser into looking for a
+    // quoted-label close that didn't match the shape's `\\]`, and the
+    // diagram failed deep inside an unrelated subgraph because parsing
+    // got out of sync.
+    const raw = 'flowchart TB\n    DIG_SEC[\\"Digitisation<br/>500Msps 12-bit"\\]\n    DIG_SEC --> X[Done]';
+    const out = san(raw);
+    // No more inner `\"...\"\` artefacts.
+    expect(out).not.toMatch(/\[\\".*"\\\]/);
+    // Trapezoid shape preserved with bare label between `[\` and `\]`.
+    expect(out).toMatch(/DIG_SEC\[\\Digitisation<br>500Msps 12-bit\\\]/);
+  });
+
+  it('strips redundant inner quotes from parallelogram [/.../] (P26 #2)', () => {
+    const raw = 'flowchart TB\n    LVDS_OUT[/"LVDS Output<br/>To Signal Processor"/]';
+    const out = san(raw);
+    expect(out).not.toMatch(/\[\/".*"\//);
+    expect(out).toMatch(/LVDS_OUT\[\/LVDS Output<br>To Signal Processor\/\]/);
+  });
+
   it('does not insert --> between bare identifiers in subgraph body (P26)', () => {
     // Subgraph membership lists must NOT be auto-arrowed:
     //     subgraph POWER["Power Distribution"]
