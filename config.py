@@ -64,12 +64,13 @@ class Settings:
         # --- LLM Models ---
         # Priority (auto-detected from available API keys):
         #   GLM via Z.AI  → primary when GLM_API_KEY is set (cheapest, Anthropic-compatible API)
-        #   DeepSeek-V3   → fallback when DEEPSEEK_API_KEY is set
+        #   DeepSeek-V3   → ONLY when GLM is NOT set, or when the user
+        #                    explicitly opts in via INCLUDE_DEEPSEEK_FALLBACK=true
         #   Ollama local  → ONLY when no cloud key is set (true air-gap mode), or
         #                    when the user explicitly opts in via INCLUDE_OLLAMA_FALLBACK=true
         # Override any of these via PRIMARY_MODEL / FAST_MODEL env vars in .env.
         #
-        # IMPORTANT (2026-04-25 — fix for "Ollama 404 → P4 phase failed"):
+        # IMPORTANT (2026-04-25 #1 — fix for "Ollama 404 → P4 phase failed"):
         # Ollama is NOT included in the fallback chain by default when a cloud
         # LLM key is configured. Previously last_resort_model was always
         # `ollama/qwen2.5-coder:32b`, which produced a misleading
@@ -77,18 +78,32 @@ class Settings:
         # '404 Not Found' for url 'http://localhost:11434/api/chat'"
         # whenever Ollama was either offline or didn't have that specific
         # model installed — even though the cloud LLMs were working fine on
-        # subsequent retries. Air-gap users can still get Ollama by setting
-        # `INCLUDE_OLLAMA_FALLBACK=true` in .env, or by clearing all cloud
-        # API keys (auto-detected below).
+        # subsequent retries.
+        #
+        # IMPORTANT (2026-04-25 #2 — user request "dont use deepseek api use
+        # only glm"): DeepSeek is NOT included in the fallback chain by
+        # default when GLM is set. Same root cause as the Ollama fix: the
+        # user's DEEPSEEK_API_KEY may be exhausted ("Insufficient Balance"
+        # 402 error from project hxhc P7) and using it as a fallback just
+        # masks transient GLM errors with a permanent DeepSeek failure.
+        # User can opt back in with INCLUDE_DEEPSEEK_FALLBACK=true.
         _has_glm      = bool(_env("GLM_API_KEY", ""))
         _has_deepseek = bool(_env("DEEPSEEK_API_KEY", ""))
         _has_anthropic = bool(_env("ANTHROPIC_API_KEY", ""))
         _has_any_cloud = _has_glm or _has_deepseek or _has_anthropic
+
+        _include_deepseek = (
+            _env_bool("INCLUDE_DEEPSEEK_FALLBACK", False)
+            or (_has_deepseek and not _has_glm and not _has_anthropic)
+        )
+        _deepseek_default = "deepseek-chat" if _include_deepseek else ""
+
         _include_ollama = (
             _env_bool("INCLUDE_OLLAMA_FALLBACK", False)
             or not _has_any_cloud  # auto-include only in pure air-gap mode
         )
         _ollama_default = "ollama/qwen2.5-coder:32b" if _include_ollama else ""
+
         self.primary_model = _env("PRIMARY_MODEL",
             "glm-4.7"      if _has_glm      else
             "deepseek-chat" if _has_deepseek else
@@ -98,7 +113,7 @@ class Settings:
             "deepseek-chat" if _has_deepseek else
             "ollama/qwen2.5-coder:32b")
         self.fallback_model = _env("FALLBACK_MODEL",
-            "deepseek-chat" if (_has_glm and _has_deepseek) else
+            _deepseek_default if (_has_glm and _include_deepseek) else
             _ollama_default)
         self.last_resort_model = _env("LAST_RESORT_MODEL", _ollama_default)
 
