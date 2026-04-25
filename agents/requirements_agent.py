@@ -462,14 +462,21 @@ verified candidate MPNs you surfaced earlier this turn.
    digits or is all-uppercase.  `"Discrete thin-film 50 Ohm pad"` is NOT
    a part number — it's a description.  Omit the row rather than invent
    a descriptive string.
-5. **Diagrams MUST use the structured `block_diagram` / `architecture`
-   JSON fields** — NOT the raw `block_diagram_mermaid` / `architecture_mermaid`
-   string fields.  The backend renders structured JSON to guaranteed-valid
-   Mermaid; the raw-string fallback produces LLM-hallucinated syntax that
-   frequently fails to parse (nested braces, broken edge-labels, unclosed
-   brackets).  If you cannot express the topology in the structured
-   schema, emit the SIMPLEST valid structured spec (nodes + linear
-   edges) rather than falling back to raw string.
+5. **Diagrams: structured JSON ONLY. NEVER emit raw mermaid.**
+   - You MUST populate the structured `block_diagram` AND `architecture`
+     JSON fields (direction + nodes + edges + subgraphs).
+   - You MUST LEAVE `block_diagram_mermaid` AND `architecture_mermaid`
+     UNSET (omit them, OR pass empty string `""`).
+   - The backend's deterministic renderer turns the structured JSON
+     into guaranteed-valid Mermaid that renders cleanly in mermaid.js
+     (browser preview), mermaid.ink (DOCX export), and mmdc (CLI).
+   - Raw mermaid you emit AS A STRING is fragile — every fancy shape
+     variant (`[[..]]`, `{{..}}`, `((..))`, `[/..\\]`, `>label]<br/>`)
+     trips at least ONE downstream renderer. The user has reported
+     this bug FIVE+ times — stop emitting raw mermaid.
+   - If you genuinely think the structured schema can't express your
+     topology, emit the SIMPLEST possible structured spec (4-6 nodes
+     in a linear chain) rather than falling back to raw mermaid.
 
 ## MINIMAL PAYLOAD FIELDS YOU MUST FILL
 
@@ -478,10 +485,8 @@ verified candidate MPNs you surfaced earlier this turn.
 - `requirements` (10-20 entries with req_id, title, description, priority)
 - `component_recommendations` (6-15 BOM rows, each with verified MPN +
   manufacturer + description + primary_key_specs + datasheet_url)
-- `block_diagram` (structured — preferred) OR `block_diagram_mermaid`
-  (raw string — discouraged)
-- `architecture` (structured — preferred) OR `architecture_mermaid`
-  (raw string — discouraged)
+- `block_diagram` (structured JSON — REQUIRED, see rule 5)
+- `architecture` (structured JSON — REQUIRED, see rule 5)
 
 Call `generate_requirements` now.
 """
@@ -905,7 +910,7 @@ If any of these are missing from your tool call, you MUST add them before submit
 - Use MoSCoW prioritization (Must have, Should have, Could have, Won't have) and IEEE requirement IDs: REQ-HW-001, REQ-HW-002, etc.
 - Make smart engineering assumptions (e.g., if they say "motor controller" assume industrial temp range, common MCUs, standard interfaces)
 - Prioritize RoHS-compliant components with long lifecycle status.
-- **DIAGRAMS — use the structured `block_diagram` / `architecture` fields.** You emit JSON (direction + nodes + edges + subgraphs); the backend renders guaranteed-valid Mermaid. Do NOT write Mermaid syntax by hand unless the structured schema truly cannot express what you need — the legacy `block_diagram_mermaid` / `architecture_mermaid` string fields are retained only as a last-resort fallback and go through a salvager that produces lower-quality output.
+- **DIAGRAMS — STRUCTURED ONLY. NEVER emit raw Mermaid.** You MUST populate the structured `block_diagram` AND `architecture` JSON fields (direction + nodes + edges + subgraphs). LEAVE `block_diagram_mermaid` AND `architecture_mermaid` UNSET (omit them entirely, or set to empty string). The backend's deterministic renderer turns the structured JSON into guaranteed-valid Mermaid that renders cleanly in mermaid.js (browser), mermaid.ink (DOCX), and mmdc (CLI). Raw mermaid you emit AS A STRING is fragile — every fancy shape variant (`[[..]]` subroutine, `{{..}}` hexagon, `((..))` circle, `[/..\\]` mixed-slash trapezoid, `>label]` flag with `<br/>`, etc.) breaks at least ONE downstream renderer. The structured schema covers ALL the shapes you need; if you think it doesn't, file a feature request — DON'T fall back to raw mermaid.
 - **MANDATORY RETRIEVAL STEP — `find_candidate_parts` BEFORE `generate_requirements`:** For every signal-chain stage that ends up in `component_recommendations` (LNA, mixer, filter/preselector, limiter, ADC, DAC, PLL/VCO, LDO, MCU, FPGA, TCXO, etc.), call the `find_candidate_parts` tool FIRST with the canonical `stage` id and a short `spec_hint` (freq range / NF / package / resolution — ~10 words max). You may batch multiple `find_candidate_parts` calls in sequence before emitting `generate_requirements`. When selecting the MPN for each stage you MUST pick from the returned `candidates[].part_number` list and copy `datasheet_url`, `product_url`, `source`, and the source-specific `digikey_url` / `mouser_url` fields verbatim from the same candidate. If a stage has zero candidates, widen the hint and call again, or omit the stage — never invent an MPN. Picks that do not trace back to a `find_candidate_parts` result will fail the `not_from_candidate_pool` audit gate.
 - **ANTI-HALLUCINATION RULE**: Do NOT fabricate component part numbers. ONLY use part numbers you are CONFIDENT exist and are currently in production. If unsure, use the manufacturer family name + key specs (e.g., "Analog Devices HMC-series LNA, 2-18 GHz, 2 dB NF") instead of guessing a specific part number. NEVER write TBD, TBC, TBA, or "to be determined/confirmed" anywhere. Every spec value must come from a confirmed requirement or a real datasheet — NEVER invent performance numbers.
 - **LIFECYCLE GATE — NO STALE PARTS**: Every `component_recommendations` entry MUST be a part that is **currently in active production**. You MUST set `lifecycle_status` to "active" for every component; if you cannot confirm the part is in active production (e.g. manufacturer still lists it on its product page without "NRND" / "Not Recommended for New Designs" / "Last Time Buy" / "Obsolete" / "Discontinued" banners), DO NOT recommend it. If a classic part you would normally recommend is now NRND or EOL, pick its successor family instead. Explicitly banned stale parts (DO NOT use these under any circumstances): `HMC-C024`, `HMC-1040`, `HMC1040LP5CE`, `HMC1040LP4E`, `HMC1020LP4E`, `HMC516`, `HMC-C070`, `HMC-C072`, `HMC-ALH435`, `HMC-ALH508`, `MCR03ERTJ201` (Rohm chip resistor — DigiKey discontinued), any Hittite-branded MPNs that begin with `HMC-` followed by a three-digit number and end with the letter `C` (Analog Devices' Hittite acquisition parts from the 2008-2012 catalogue — most are now NRND). **Preferred currently-shipping alternatives (use these families):**
@@ -1055,10 +1060,20 @@ GENERATE_REQUIREMENTS_TOOL = {
             "block_diagram_mermaid": {
                 "type": "string",
                 "description": (
-                    "LEGACY FALLBACK — prefer the structured `block_diagram` "
-                    "field below. Only populate this if you truly cannot express "
-                    "the topology as structured JSON (e.g. the diagram needs a "
-                    "Mermaid feature not exposed by the structured schema).\n"
+                    "DEPRECATED — DO NOT USE. Emit `block_diagram` (structured "
+                    "JSON, defined below) INSTEAD. This raw-string field is kept "
+                    "ONLY for back-compat with legacy projects; new tool calls "
+                    "must leave this field UNSET (omit it, OR pass empty string). "
+                    "Reason: every fancy mermaid shape the LLM emits "
+                    "(`[[..]]`, `{{..}}`, `((..))`, `[/..\\]`, `>label]<br/>`, "
+                    "etc.) trips the parser in some downstream renderer "
+                    "(mermaid.js, mmdc, mermaid.ink — they each fail on "
+                    "different patterns). The structured `block_diagram` JSON "
+                    "is rendered by the backend's deterministic renderer that "
+                    "produces guaranteed-valid output for ALL shapes.\n"
+                    "\n"
+                    "If for some reason you MUST emit raw mermaid here, follow "
+                    "these strict rules to maximise the chance of clean render:\n"
                     "\n"
                     "RULES:\n"
                     "  - Start with `flowchart LR` on line 1.\n"
@@ -1264,9 +1279,12 @@ GENERATE_REQUIREMENTS_TOOL = {
             "architecture_mermaid": {
                 "type": "string",
                 "description": (
-                    "LEGACY FALLBACK — prefer the structured `architecture` "
-                    "field. Same topology rules as `block_diagram_mermaid`: "
-                    "N-antenna and M-channel fan-out must be explicit."
+                    "DEPRECATED — DO NOT USE. Emit `architecture` (structured "
+                    "JSON, defined below) INSTEAD. Same reasoning as "
+                    "`block_diagram_mermaid`: raw-mermaid output is fragile "
+                    "across renderers; the structured form is rendered "
+                    "deterministically. Leave this field UNSET (omit it OR "
+                    "pass empty string)."
                 ),
             },
             "architecture": {
