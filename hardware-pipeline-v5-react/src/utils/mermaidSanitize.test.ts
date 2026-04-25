@@ -96,10 +96,65 @@ describe('HTML entity decoding', () => {
     expect(out).toContain('and');
   });
 
-  it('strips raw HTML tags', () => {
+  it('strips raw HTML tags BUT preserves <br> and <br/>', () => {
+    // P26 (2026-04-25) — `<br>` and `<br/>` are mermaid's accepted
+    // line-break tokens inside quoted labels. Earlier this test asserted
+    // they were stripped, but stripping them mangles multi-line labels
+    // (e.g. `LODIST("LO Chain<br/>(OCXO-PLL-Splitter)")` lost the visible
+    // line break and ran the two halves together). Other HTML tags
+    // (script, style, span, etc.) are still stripped.
     const out = san('flowchart TD\nA[<br/>label]');
-    expect(out).not.toContain('<br');
-    expect(out).not.toContain('<');
+    // <br> survives:
+    expect(out).toContain('<br>');
+    // But other tags don't:
+    const out2 = san('flowchart TD\nA[<script>x</script>label]');
+    expect(out2).not.toContain('<script>');
+    expect(out2).not.toContain('</script>');
+  });
+
+  it('preserves <br> inside trapezoid shape (P26 regression)', () => {
+    // Real failing input: `ADCBLOCK[\\"ADC / AD9648BCPZ-125<br/>Dual 14b 125Msps"\\]`.
+    // The trapezoid was being mangled by the rect `[..]` sanitiser
+    // running on the inner content, AND the <br> was being stripped.
+    // Both fixes verified together.
+    const raw = 'flowchart TD\n    ADCBLOCK[\\"ADC<br/>Dual 14b 125Msps"\\]\n    ADCBLOCK --> X[Done]';
+    const out = san(raw);
+    // The trapezoid shape delimiters survived:
+    expect(out).toMatch(/ADCBLOCK\[\\.*ADC.*Dual 14b 125Msps.*\\\]/);
+    // The <br> survived (as <br>, possibly normalised from <br/>):
+    expect(out).toMatch(/<br\s*\/?>/);
+    // The edge line is intact:
+    expect(out).toMatch(/ADCBLOCK\s*-->\s*X/);
+  });
+
+  it('does not insert --> between bare identifiers in subgraph body (P26)', () => {
+    // Subgraph membership lists must NOT be auto-arrowed:
+    //     subgraph POWER["Power Distribution"]
+    //         PWR12V
+    //         BUCK5V       <-- "include in subgraph", NOT "PWR12V --> BUCK5V"
+    //         LDO33
+    //     end
+    const raw = (
+      'flowchart TD\n' +
+      '    PWR12V[12V Input]\n' +
+      '    BUCK5V[5V Buck]\n' +
+      '    LDO33[3.3V LDO]\n' +
+      '    PWR12V --> BUCK5V\n' +
+      '    BUCK5V --> LDO33\n' +
+      '    subgraph POWER["Power Distribution"]\n' +
+      '        PWR12V\n' +
+      '        BUCK5V\n' +
+      '        LDO33\n' +
+      '    end\n'
+    );
+    const out = san(raw);
+    // The KEY invariant: subgraph body's bare identifiers must NOT have
+    // been joined by `-->` (which would change subgraph membership into
+    // node connectivity). Title quotes may or may not survive — that's
+    // not the property under test here.
+    expect(out).toMatch(/subgraph POWER\[[^\]]+\]\s*\n\s+PWR12V\s*\n\s+BUCK5V\s*\n\s+LDO33\s*\n\s+end/);
+    // No `-->` arrows between subgraph members:
+    expect(out).not.toMatch(/PWR12V\s*-->\s*BUCK5V\s*\n\s*BUCK5V\s*-->\s*LDO33\s*\n\s*end/);
   });
 });
 

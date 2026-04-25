@@ -3,14 +3,37 @@
  * DocumentsView. Previously lived as a duplicated local function in each
  * view, which allowed the two copies to drift. Extract + test in one place.
  *
- * Fixes everything LLMs tend to mis-emit:
+ * P26 (2026-04-25) — IMPORTANT: the backend already runs an aggressive
+ * salvage (`tools/mermaid_salvage.py`) before writing diagrams to disk,
+ * so most of the input this function sees is already clean. The job here
+ * is to handle:
+ *   - Defensive cases where the backend salvage was bypassed.
+ *   - LLM-emitted chat draft text (no backend salvage on the chat path).
+ *
+ * Things this sanitiser used to do but DOES NOT anymore (P26):
+ *   - Strip ALL HTML tags (`<[^>]+>`). Mermaid USES `<br>` and `<br/>`
+ *     for label line breaks; stripping them concatenates words that
+ *     should have been on separate visual lines.
+ *   - Convert `&lt;` → `(` and `&gt;` → `)`. HTML entities can appear
+ *     inside legitimate labels (`<= 5V` rendered as `&lt;= 5V`); the
+ *     replacement corrupts the label.
+ *   - Sanitise the inner contents of trapezoid `[\..\]` and parallelogram
+ *     `[/.../]` shapes. Those use the same `[..]` outer bracket pair as
+ *     a rectangle, but the inner `\` and `/` chars confuse the rect
+ *     sanitiser's regex and turn the shape into garbage.
+ *   - Auto-insert `-->` between consecutive bare identifiers. Subgraph
+ *     bodies look like `\n    NODEA\n    NODEB\n    end` — auto-arrow
+ *     insertion would join NODEA and NODEB with `-->`, breaking the
+ *     subgraph membership semantics.
+ *
+ * Fixes still applied:
  *   - %% comments and %%{ init }%% frontmatter
  *   - non-ASCII glyphs (Ohm, °, µ, em-dashes, smart quotes, arrows)
  *   - `graph TD` → `flowchart TD`
- *   - `==>` / `->` / unicode arrows → `-->`
- *   - unclosed `[` brackets from multi-line labels
- *   - bad chars inside node labels (`<>()"'#|@` etc.)
- *   - missing arrows between bare identifiers
+ *   - bare `==>` / `->` / unicode arrows → `-->` (only when NOT followed
+ *     by `|` so we don't break thick-arrow pipe-form labels)
+ *   - quoted edge labels (`A -- "x" --> B` → `A -->|x| B`)
+ *   - unclosed `[` brackets at end of line → auto-close
  *   - `end` keyword collapsed onto the same line as content
  */
 
@@ -104,10 +127,25 @@ export function sanitizeMermaid(raw: string): string {
   const known = ['flowchart', 'sequencediagram', 'classdiagram', 'statediagram',
     'erdiagram', 'gantt', 'pie', 'gitgraph', 'mindmap', 'timeline'];
   if (!known.some(t => first.startsWith(t))) code = 'flowchart TD\n' + code;
-  // Literal \n → space; strip all HTML tags; decode HTML entities
+  // P26 (2026-04-25): preserve `<br>` and `<br/>` (mermaid's accepted
+  // line-break tokens inside quoted labels). The previous code stripped
+  // ALL HTML tags via `<[^>]+>/gi` which corrupted multi-line labels:
+  //   `LODIST("LO Chain<br/>(OCXO-PLL-Splitter)")`
+  //     →  `LODIST("LO Chain (OCXO-PLL-Splitter)")` — visible line break GONE.
+  // Worse, when combined with the whitespace-collapse step below, words
+  // from different visual lines got jammed together and the resulting
+  // label could exceed mermaid's per-shape character limit and be
+  // mis-attributed to the next statement.
+  //
+  // Also dropped the `&lt;` → `(` and `&gt;` → `)` replacements:
+  //   - HTML entities legitimately appear inside labels ("<= 5V" rendered
+  //     as `&lt;= 5V`).
+  //   - Replacing them with parens turned `&lt;= 5V` into `(= 5V` —
+  //     unbalanced paren that confused the round-shape sanitiser.
   code = code.replace(/\\n/g, ' ');
-  code = code.replace(/&lt;/g, '(').replace(/&gt;/g, ')').replace(/&amp;/g, 'and').replace(/&nbsp;/g, ' ');
-  code = code.replace(/<[^>]+>/gi, ' ');
+  code = code.replace(/&amp;/g, 'and').replace(/&nbsp;/g, ' ');
+  // Strip HTML tags EXCEPT <br> and <br/> (mermaid uses these for line breaks).
+  code = code.replace(/<(?!br\b|\/br\b)[^>]+>/gi, ' ');
   // Ensure `end` (subgraph close) is always on its own line — trailing case
   code = code.split('\n').map(line => {
     if (/\bend\s*$/.test(line) && !/^\s*end\b/.test(line)) {
@@ -135,31 +173,66 @@ export function sanitizeMermaid(raw: string): string {
       (_m, indent, n1, label, n2start) => `${indent}${n1} -->${label} ${n2start}`
     );
   }).join('\n');
-  // Fix two+ word-tokens on same line with NO arrow — handles both "NODEA NODEB[" and "A B C" (3+ bare IDs)
-  code = code.split('\n').map(line => {
-    const stripped = line.trim();
-    if (!stripped || /^\s*(subgraph|end|%%)/.test(line)) return line;
-    line = line.replace(
-      /^(\s*)([\w][\w\-]*)(\s+)([\w][\w\-]*[\[\(])/,
-      (_m, indent, n1, _sp, n2) => `${indent}${n1} --> ${n2}`
-    );
-    if (/-->|---/.test(line)) return line;
-    const indent = line.match(/^(\s*)/)?.[1] || '';
-    const tokens = stripped.split(/\s+/);
-    const seqKeywords = /^(participant|actor|activate|deactivate|Note|loop|alt|else|opt|par|rect|end|autonumber|title|as)\b/i;
-    if (tokens.length >= 3 && tokens.every(t => /^[\w][\w\-]*$/.test(t)) && !seqKeywords.test(stripped)) {
-      return indent + tokens.join(' --> ');
-    }
-    return line;
-  }).join('\n');
-  // Fix "NODEA[label] NODEB[label]" — bracket-delimited nodes without arrow between.
-  code = code.split('\n').map(line => {
-    if (/^\s*(subgraph|end|%%)/.test(line)) return line;
-    return line.replace(
-      /([\]\)\}])(\s+)([\w][\w\-]*)(\s*[\[\(\{])/g,
-      (_m, closer, _sp, n2, opener) => `${closer} --> ${n2}${opener}`
-    );
-  }).join('\n');
+  // Fix two+ word-tokens on same line with NO arrow — handles both
+  // "NODEA NODEB[" and "A B C" (3+ bare IDs).
+  //
+  // P26 (2026-04-25): track subgraph nesting so we DON'T insert `-->`
+  // arrows between bare identifiers that are members of a subgraph body.
+  // Subgraph syntax is:
+  //     subgraph Name["Title"]
+  //         NODE1
+  //         NODE2     <-- bare identifier; means "include in subgraph",
+  //         NODE3         NOT "draw an arrow from NODE2 to NODE3"
+  //     end
+  // The previous code joined NODE2 and NODE3 with `-->` whenever they
+  // appeared on the same VISUAL line (e.g. after the `<br>`-stripping
+  // step concatenated them), turning the subgraph into garbage.
+  {
+    let subgraphDepth = 0;
+    code = code.split('\n').map(line => {
+      const stripped = line.trim();
+      if (/^subgraph\b/i.test(stripped)) { subgraphDepth++; return line; }
+      if (/^end\b/i.test(stripped)) {
+        if (subgraphDepth > 0) subgraphDepth--;
+        return line;
+      }
+      // Inside a subgraph: only the membership list (no arrow auto-insert).
+      if (subgraphDepth > 0) return line;
+      if (!stripped || /^\s*(subgraph|end|%%)/.test(line)) return line;
+      line = line.replace(
+        /^(\s*)([\w][\w\-]*)(\s+)([\w][\w\-]*[\[\(])/,
+        (_m, indent, n1, _sp, n2) => `${indent}${n1} --> ${n2}`
+      );
+      if (/-->|---/.test(line)) return line;
+      const indent = line.match(/^(\s*)/)?.[1] || '';
+      const tokens = stripped.split(/\s+/);
+      const seqKeywords = /^(participant|actor|activate|deactivate|Note|loop|alt|else|opt|par|rect|end|autonumber|title|as)\b/i;
+      if (tokens.length >= 3 && tokens.every(t => /^[\w][\w\-]*$/.test(t)) && !seqKeywords.test(stripped)) {
+        return indent + tokens.join(' --> ');
+      }
+      return line;
+    }).join('\n');
+  }
+  // Fix "NODEA[label] NODEB[label]" — bracket-delimited nodes without
+  // arrow between. P26 (2026-04-25): also skip lines inside subgraphs
+  // (their bodies are bare identifiers, not connectivity).
+  {
+    let subgraphDepth2 = 0;
+    code = code.split('\n').map(line => {
+      const stripped = line.trim();
+      if (/^subgraph\b/i.test(stripped)) { subgraphDepth2++; return line; }
+      if (/^end\b/i.test(stripped)) {
+        if (subgraphDepth2 > 0) subgraphDepth2--;
+        return line;
+      }
+      if (subgraphDepth2 > 0) return line;
+      if (/^\s*(subgraph|end|%%)/.test(line)) return line;
+      return line.replace(
+        /([\]\)\}])(\s+)([\w][\w\-]*)(\s*[\[\(\{])/g,
+        (_m, closer, _sp, n2, opener) => `${closer} --> ${n2}${opener}`
+      );
+    }).join('\n');
+  }
   // Fix "NODEA] NODEID |label| NODEB" — pipe-label after a bare identifier that follows a closed node.
   code = code.split('\n').map(line => {
     if (/^\s*(subgraph|end|%%)/.test(line)) return line;
@@ -173,9 +246,18 @@ export function sanitizeMermaid(raw: string): string {
     if (/^\s*subgraph\b/.test(line)) return line.replace(/^(\s*subgraph\s+[\w-]+)\s+\[/, '$1[');
     return line.replace(/(\w)\s+\[/g, '$1[');
   }).join('\n');
-  // Sanitize node labels
-  const sanitizeLabel = (inner: string) =>
-    inner
+  // Sanitize node labels.
+  //
+  // P26 (2026-04-25): the label-sanitiser strips `<` and `>` (among
+  // other chars). PRESERVE `<br>` / `<br/>` by replacing them with a
+  // unique placeholder before sanitising and restoring after. Without
+  // this, every `<br>` inside a label was turned into a single space
+  // by the `<` and `>` strippers, eating multi-line labels.
+  const _BR_PLACEHOLDER = '\u0001BR\u0001';
+  const sanitizeLabel = (inner: string) => {
+    const protectedBr = inner
+      .replace(/<br\s*\/?>/gi, _BR_PLACEHOLDER);
+    const cleaned = protectedBr
       .replace(/-->/g, ' ').replace(/->/g, ' ')
       .replace(/</g, ' ').replace(/>/g, ' ')
       .replace(/\(/g, ' ').replace(/\)/g, ' ')
@@ -190,7 +272,15 @@ export function sanitizeMermaid(raw: string): string {
       .replace(/[\[\]]/g, ' ')
       .replace(/\s{2,}/g, ' ')
       .trim();
-  code = code.replace(/\[([^\]]*)\]/g, (_m, inner: string) => `[${sanitizeLabel(inner)}]`);
+    // Restore the <br> tags after sanitisation.
+    return cleaned.replace(new RegExp(_BR_PLACEHOLDER, 'g'), '<br>');
+  };
+  // Rect `[..]` — but NOT trapezoid `[\..\]` or parallelogram `[/.../]`.
+  // Those use `[` and `]` as the OUTER delimiters of a different shape;
+  // the inner `\` and `/` chars confuse this regex, and running
+  // sanitizeLabel on `\label\` strips the shape delimiters and turns the
+  // shape into a broken rect with stray backslashes.
+  code = code.replace(/\[(?![\\/])([^\]]*)(?<![\\/])\]/g, (_m, inner: string) => `[${sanitizeLabel(inner)}]`);
   code = code.replace(/\(([^)]*)\)/g, (_m, inner: string) => `(${sanitizeLabel(inner)})`);
   code = code.replace(/\{([^}]*)\}/g, (_m, inner: string) => `{${sanitizeLabel(inner)}}`);
   code = code.replace(/"([^"]+)"/g, (_m, inner: string) => `"${sanitizeLabel(inner)}"`);
