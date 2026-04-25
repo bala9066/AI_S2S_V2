@@ -180,12 +180,25 @@ async def test_netlist_phase_complete_when_llm_skips_tool_call(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_llm_success_path_still_gates_on_drc(tmp_path):
-    """The COMPLETED-on-auto-synth relaxation only applies to the
-    BOM-fallback. When the LLM successfully calls `generate_netlist`
-    with a real (non-auto-synthesized) netlist, DRC critical/high
-    violations MUST still gate phase_complete — otherwise we'd let
-    real shorts and unbound power rails slip through to PCB layout."""
+async def test_llm_success_path_completes_even_on_drc_failure(tmp_path):
+    """P26 #9 (2026-04-25, hgj cascade fix): UPDATED SEMANTICS.
+
+    Pre-fix: the LLM-success path required `drc_passed` for
+    phase_complete=True; DRC violations would set status=failed and
+    the DAG would fail-fast cascade ALL downstream phases (P3, P6,
+    P7, P7a, P8a, P8b, P8c) without running them.
+
+    Real-world failure (project hgj, 2026-04-25): P4 ran successfully
+    (LLM tool call, 7 output files written, ~5 min), but DRC reported
+    critical violations on a few unbound power pins. phase_complete
+    became False → status=failed → the DAG marked all downstream
+    phases failed without running them. User saw 8 red phases in the
+    UI even though the netlist was generated correctly.
+
+    New rule: phase_complete = (netlist.json exists). DRC summary stays
+    in response_text + persisted in netlist_drc.json so the operator
+    can review, but it doesn't halt the pipeline. PCB layout (P5) is
+    manual — DRC issues caught during layout review, not by gating P4."""
     from agents.netlist_agent import NetlistAgent
     agent = NetlistAgent()
 
@@ -208,9 +221,8 @@ async def test_llm_success_path_still_gates_on_drc(tmp_path):
         "prior_phase_outputs": {},
     }
 
-    # LLM emits a deliberately-broken netlist (1 node, 0 edges) — the
-    # power/ground binder will leave critical violations because there's
-    # no power rail at all.
+    # LLM emits a deliberately-broken netlist (1 node, 0 edges) → DRC
+    # will flag critical violations on the unbound power rails.
     bad_netlist = {
         "nodes": [
             {
@@ -234,17 +246,25 @@ async def test_llm_success_path_still_gates_on_drc(tmp_path):
                        new=AsyncMock(return_value=fake_response)):
         result = await agent.execute(project_context, user_input="")
 
-    # Must still produce SOMETHING (defensive), but phase_complete should
-    # reflect DRC failure since this is a real LLM-emitted netlist.
-    # We don't strictly require phase_complete=False (the binder might
-    # have rescued it), but if DRC summary shows critical/high, the
-    # response_text MUST mention "phase blocked" so the operator knows.
+    # netlist.json was generated → phase MUST be marked complete even
+    # though DRC failed. Downstream P3 / P6 / P8a will run.
+    assert result.get("outputs", {}).get("netlist.json"), (
+        "Netlist file must be generated even on DRC failure"
+    )
+    assert result.get("phase_complete") is True, (
+        "P26 #9: phase_complete must be True whenever netlist.json "
+        "exists, regardless of DRC violations. DRC is informational "
+        "only — operator handles violations during PCB layout review. "
+        f"Got phase_complete={result.get('phase_complete')!r}, "
+        f"response={result.get('response', '')[:200]!r}"
+    )
+    # DRC summary is still in response_text so the operator sees the
+    # warnings.
     response_text = result.get("response", "")
-    if not result.get("phase_complete"):
-        assert "phase blocked" in response_text or "DRC" in response_text, (
-            "LLM-success path with DRC fails should explain the gate in "
-            f"response_text — got: {response_text!r}"
-        )
+    assert "DRC" in response_text or "review" in response_text.lower(), (
+        f"DRC warnings should be communicated in response_text — "
+        f"got: {response_text!r}"
+    )
 
 
 @pytest.mark.asyncio

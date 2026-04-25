@@ -1119,7 +1119,7 @@ def _sanitize_mermaid_code(code: str) -> str:
 # alone produces clean output that all 3 renderers accept. Bump
 # invalidates v4 cached docx files that were rendered with the
 # legacy sanitiser still corrupting the salvaged source.
-_DOCX_CACHE_VERSION = 6
+_DOCX_CACHE_VERSION = 7
 
 
 def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:
@@ -1242,15 +1242,18 @@ def _render_mermaid_diagrams_sync(md_text: str, tmp_dir: str) -> str:
             # tall diagrams scale DOWN to fit on page 1 (loses some
             # readability but stays adjacent to its title).
             aspect = _png_aspect(path) or 1.0
+            # P26 #9 (2026-04-25): pandoc image attribute syntax requires
+            # NO space between `)` and `{`. Pre-fix had ` { height=7in }`
+            # which pandoc treated as literal text — the docx showed
+            # `![Diagram 1](C:/.../diagram_1.png) { height=7in }` as
+            # plain text instead of embedding the image.
             if aspect > 1.0:
-                # Tall diagram: cap height at 7 in (out of 9 in usable
-                # page 1 space after 2 in title block). Width auto-
-                # scales down from 6 in to maintain aspect.
-                attrs = " { height=7in }"
+                # Tall diagram: cap height at 7 in (page 1 has ~9 in
+                # usable, title takes ~2 in, leaving 7 in for image).
+                attrs = "{ height=7in }"
             else:
-                # Landscape / square: fix width at 6 in, let height
-                # follow the aspect (always fits on page 1).
-                attrs = " { width=6in }"
+                # Landscape / square: fix width at 6 in.
+                attrs = "{ width=6in }"
             replacement = (
                 f"\n\n**System Architecture Diagram {idx}**\n\n"
                 f"![Diagram {idx}]({img_path_md}){attrs}\n\n"

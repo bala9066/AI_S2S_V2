@@ -689,6 +689,30 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
         #
         # This matches the user's mental model: "if the schematic
         # rendered, the phase succeeded — DRC warnings are info."
+        # P26 #9 (2026-04-25, hgj cascade fix): UNIFIED phase_complete
+        # gate — completion is purely "did we produce a netlist.json".
+        # DRC failures NO LONGER block the phase.
+        #
+        # Why: in project hgj, P4 ran successfully (LLM called the tool,
+        # 7 output files written) but DRC reported critical violations.
+        # That set phase_complete=False → status=failed → DAG fail-fast
+        # cascaded P3 / P6 / P7 / P7a / P8a / P8b / P8c (all the
+        # downstream phases) as `failed` without even running them.
+        # User saw "everything failed after HRS" in the UI for a fresh
+        # project, even though the netlist had ALREADY been generated.
+        #
+        # The previous gate (LLM-success path requires drc_passed) was
+        # too strict — DRC catches real shorts but ALSO flags every
+        # auto-bound power rail as "critical" because the LLM didn't
+        # explicitly emit each VCC pin connection. False-positive
+        # critical count was always >0 on a real-world LLM netlist,
+        # which made the cascade kick in EVERY run.
+        #
+        # New rule: phase_complete = (netlist.json exists). DRC summary
+        # is still in response_text + persisted in netlist_drc.json so
+        # the operator sees the warnings, but they no longer halt the
+        # downstream pipeline. PCB layout (P5) is manual anyway — the
+        # operator catches DRC issues during layout review.
         response_text = response.get("content", "Netlist generated.")
         is_auto_synth = (
             netlist_data is None
@@ -705,17 +729,12 @@ Do NOT generate a minimal 2-component skeleton. The netlist must be COMPLETE.
                     )
                 else:
                     response_text += (
-                        " — phase blocked until critical/high violations clear."
+                        " — DRC reported violations; review netlist_drc.json "
+                        "and address before PCB layout."
                     )
-        # The phase is "complete" if EITHER:
-        #   (a) we ran the LLM-success path AND DRC passed, OR
-        #   (b) we ran the BOM-fallback AND produced a netlist.json.
-        # Empty `outputs` (no netlist at all) always fails.
         has_netlist = bool(outputs.get("netlist.json"))
-        if is_auto_synth:
-            phase_complete = has_netlist
-        else:
-            phase_complete = drc_passed and has_netlist
+        # Phase completes if netlist was produced — DRC is informational only.
+        phase_complete = has_netlist
         return {
             "response": response_text,
             "phase_complete": phase_complete,
