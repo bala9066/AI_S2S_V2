@@ -63,6 +63,70 @@ export const APPLICATIONS: AppDef[] = [
 ];
 
 /* ================================================================
+   POWER-SUPPLY APPLICATIONS — replaces APPLICATIONS when the user
+   picked project_type='power_supply' on Stage 0. Steers the chosen
+   topology + safety / EMI compliance class.
+   ================================================================ */
+export const PSU_APPLICATIONS: AppDef[] = [
+  { id: 'industrial', name: 'Industrial / Automation',   desc: '24V or 48V bus, robust, conducted-EMI compliant.',       strong_for: ['psu_buck','psu_buck_boost','psu_flyback_isolated','psu_pfc_boost'] },
+  { id: 'telecom',    name: 'Telecom / Server',          desc: '48V bus DC-DC bricks, hot-swap, > 90% efficient.',       strong_for: ['psu_llc_resonant','psu_phase_shifted_fb','psu_buck'] },
+  { id: 'automotive', name: 'Automotive (AEC-Q100)',     desc: '12V / 48V bus, AEC-Q100 grade, AEC CISPR 25 EMI.',       strong_for: ['psu_buck','psu_buck_boost','psu_sepic'] },
+  { id: 'medical',    name: 'Medical (IEC 60601)',       desc: '5 kV BF isolation, low-leakage, BF / CF certified.',     strong_for: ['psu_flyback_isolated','psu_llc_resonant','psu_phase_shifted_fb'] },
+  { id: 'rf_clean',   name: 'RF / ADC clean rails',      desc: 'Buck pre-reg + LDO post-reg, < 1 mV ripple.',            strong_for: ['psu_ldo_chain','psu_dual_ldo','psu_buck'] },
+  { id: 'consumer',   name: 'Consumer / USB-PD',         desc: 'Compact AC-DC < 100W, single output, EnergyStar.',       strong_for: ['psu_flyback_isolated','psu_buck'] },
+  { id: 'aerospace',  name: 'Aerospace / MIL',           desc: '+28V MIL-STD-704, MIL-STD-461 EMI, wide temp.',          strong_for: ['psu_buck','psu_buck_boost','psu_sepic','psu_ldo_chain'] },
+  { id: 'custom',     name: 'Custom / Other',            desc: 'Tell me in free text after the flow.',                   strong_for: [] },
+];
+
+/* ================================================================
+   SWITCH-MATRIX APPLICATIONS — replaces APPLICATIONS when
+   project_type='switch_matrix'. Used to pick blocking vs non-
+   blocking topology + driver IC family.
+   ================================================================ */
+export const SWM_APPLICATIONS: AppDef[] = [
+  { id: 'ate',           name: 'ATE / Production Test',    desc: 'Bench-of-DUTs, full M×N, calibration ports, SCPI ctrl.',  strong_for: ['swm_full_crossbar','swm_clos','swm_mems_array','swm_blocking_matrix'] },
+  { id: 'antenna_sel',   name: 'Antenna Selector',         desc: 'Pick 1-of-N antennas for a single radio chain.',          strong_for: ['swm_broadcast_spnt','swm_tree_spdt','swm_pin_diode_matrix'] },
+  { id: 'beam_steering', name: 'Phased-Array Beam Steer',  desc: 'Per-element TR / amplitude switching for steering.',      strong_for: ['swm_full_crossbar','swm_pin_diode_matrix'] },
+  { id: 'cal_floor',     name: 'Calibration Floor',        desc: 'Lab-grade IL/return loss; MEMS preferred for accuracy.',  strong_for: ['swm_mems_array','swm_full_crossbar'] },
+  { id: 'rf_test_bench', name: 'RF Lab Bench',             desc: 'Switch between sources / loads / VNA ports.',             strong_for: ['swm_tree_spdt','swm_broadcast_spnt','swm_blocking_matrix'] },
+  { id: 'satcom_route',  name: 'SATCOM Routing',           desc: 'Channel routing in transponder / GW.',                    strong_for: ['swm_clos','swm_full_crossbar'] },
+  { id: 'custom',        name: 'Custom / Other',           desc: 'Tell me in free text after the flow.',                    strong_for: [] },
+];
+
+/* ================================================================
+   TRANSCEIVER APPLICATIONS — same set as RX (radar/ew/comms/...
+   all apply to TRX too) but published as its own constant so the
+   wizard's resolver can be keyed cleanly per project_type.
+   ================================================================ */
+export const TRX_APPLICATIONS: AppDef[] = APPLICATIONS;
+
+/** Pick the right APPLICATIONS catalogue for the given project_type. */
+export function applicationsForProjectType(ptype: string | null): AppDef[] {
+  switch (ptype) {
+    case 'power_supply':  return PSU_APPLICATIONS;
+    case 'switch_matrix': return SWM_APPLICATIONS;
+    case 'transceiver':   return TRX_APPLICATIONS;
+    case 'transmitter':   return APPLICATIONS;  // TX shares the RX app set
+    default:              return APPLICATIONS;
+  }
+}
+
+/* ================================================================
+   SCOPES per project type — power supplies + switch matrices don't
+   carve into front-end / downconversion / dsp like an RF chain.
+   - receiver / transmitter / transceiver: all 4 scopes apply
+   - switch_matrix:                          full + front-end only
+   - power_supply:                           full only
+   ================================================================ */
+export function scopesForProjectType(ptype: string | null): DesignScope[] {
+  switch (ptype) {
+    case 'power_supply':  return ['full'];
+    case 'switch_matrix': return ['full', 'front-end'];
+    default:              return ['full', 'front-end', 'downconversion', 'dsp'];
+  }
+}
+
+/* ================================================================
    STAGE 3 — ARCHITECTURES — scope + app-gated.
    ================================================================ */
 export interface ArchDef {
@@ -537,6 +601,126 @@ export const TX_DEEP_DIVES: Record<DesignScope, DeepDiveDef> = {
 };
 
 /* ================================================================
+   TRANSCEIVER DEEP DIVES — TRX needs duplex/calibration questions
+   on top of TX + RX questions; we keep this set focused on the
+   TRX-specific concerns (isolation, calibration, half-duplex
+   timing) and assume Stage 4 has already captured RF performance.
+   ================================================================ */
+export const TRX_DEEP_DIVES: Record<DesignScope, DeepDiveDef> = {
+  'front-end': {
+    title: 'Transceiver front-end deep-dive',
+    note: 'Front-end isolation + T/R timing dictate whether the receiver desensitises during TX bursts. Specs here drive duplexer / circulator / switch choice.',
+    qs: [
+      { id: 'duplex_topology',  q: 'Front-end duplex topology?',                  chips: ['T/R switch (TDD)','Duplexer (FDD)','Circulator','Separate Tx/Rx antennas','Other'] },
+      { id: 'switch_tech',      q: 'T/R switch technology?',                       chips: ['PIN diode','GaAs FET','RF MEMS','SOI CMOS','Other'], show_if: s => s.details?.duplex_topology === 'T/R switch (TDD)' },
+      { id: 'tr_recovery',      q: 'RX recovery time after TX shutdown?',          chips: ['< 100 ns','< 1 µs','< 10 µs','> 10 µs','Other'], show_if: s => s.details?.duplex_topology === 'T/R switch (TDD)' },
+      { id: 'lo_sharing',       q: 'LO sharing strategy?',                         chips: ['Shared LO (TX = RX)','Independent LOs','Offset PLL','Auto'] },
+      { id: 'cal_strategy',     q: 'TX/RX calibration strategy?',                  chips: ['Internal cal-tone loopback','External golden-unit cal','Hot-cold load','None','Auto'] },
+      { id: 'antenna_iface',    q: 'Antenna interface?',                           chips: ['Single-ended 50Ω','Differential 100Ω','Active antenna w/ bias-tee','Phased array element','Other'] },
+    ],
+  },
+  'downconversion': {
+    title: 'Transceiver baseband / IF deep-dive',
+    note: 'Shared LO drives both TX upconverter and RX downconverter — phase noise + frequency stability budgets are common to both directions.',
+    qs: [
+      { id: 'baseband_iface',   q: 'Baseband interface to FPGA / SoC?',            chips: ['JESD204B','JESD204C','LVDS parallel','CMOS parallel','Other'] },
+      { id: 'iq_imbalance',     q: 'I/Q imbalance correction?',                    chips: ['Hardware (analog trim)','Digital (DSP)','Both','None','Auto'] },
+      { id: 'lo_phase_noise',   q: 'LO phase-noise budget?',                       chips: ['-90 dBc/Hz @ 10 kHz','-100 dBc/Hz','-120 dBc/Hz (radar-grade)','Other'] },
+      { id: 'tuning_speed',     q: 'Tuning / frequency-hop speed?',                chips: ['< 1 µs','< 10 µs','< 100 µs','> 100 µs','Static'] },
+    ],
+  },
+  'dsp': {
+    title: 'Transceiver DSP deep-dive',
+    note: 'Both TX and RX hit the same FPGA / DSP fabric — IO planning + DPD compute budget are the design pinch-points.',
+    qs: [
+      { id: 'fpga_family',      q: 'FPGA family for digital baseband?',            chips: ['Xilinx Zynq UltraScale+','Xilinx Versal','Intel Stratix 10','Microchip PolarFire SoC','Other'] },
+      { id: 'dpd_compute',      q: 'DPD compute requirement?',                     chips: ['None','Static (lookup)','Memory polynomial','Volterra','GAN-DPD','Other'] },
+      { id: 'sample_clock',     q: 'Sample clock distribution?',                   chips: ['Common ref to ADC + DAC','Independent (cal-corrected)','JESD SYSREF','Other'] },
+    ],
+  },
+  'full': {
+    title: 'Full transceiver deep-dive',
+    note: 'Full TRX inherits all front-end, downconversion, and DSP questions. Pick the highest-priority isolation + LO-sharing decision first.',
+    qs: [
+      { id: 'duplex_mode_full', q: 'Operational duplex mode?',                     chips: ['TDD','FDD','HDX (turn-around)','Simplex (separate)','Other'] },
+      { id: 'tx_rx_isolation',  q: 'TX→RX isolation budget?',                      chips: ['> 30 dB','> 50 dB','> 70 dB','> 90 dB','Other'] },
+      { id: 'cal_strategy',     q: 'Self-calibration support?',                    chips: ['Yes (tone loopback)','Yes (full path)','No','Auto'] },
+      { id: 'lo_sharing',       q: 'LO sharing?',                                  chips: ['Shared','Independent','Offset PLL','Auto'] },
+    ],
+  },
+};
+
+/* ================================================================
+   POWER-SUPPLY DEEP DIVES — only the 'full' scope is offered for
+   power supplies (no front-end / downconversion / dsp distinction
+   makes sense), so the other three entries are intentional empty
+   stubs that simply say "proceed to confirm".
+   ================================================================ */
+const PSU_NA_STUB: DeepDiveDef = {
+  title: 'Not applicable',
+  note: 'Power-supply designs use the "full" scope — pick that on the previous step.',
+  qs: [],
+};
+export const PSU_DEEP_DIVES: Record<DesignScope, DeepDiveDef> = {
+  'front-end': PSU_NA_STUB,
+  'downconversion': PSU_NA_STUB,
+  'dsp': PSU_NA_STUB,
+  'full': {
+    title: 'Power-supply deep-dive',
+    note: 'These pick the magnetics + control-loop topology that satisfy your transient + EMI envelope.',
+    qs: [
+      { id: 'control_mode',     q: 'Control-loop mode?',                            chips: ['Voltage mode','Current mode (peak)','Current mode (avg)','Hysteretic','Constant on-time','Auto'] },
+      { id: 'mosfet_tech',      q: 'Switching device technology?',                  chips: ['Si MOSFET','GaN HEMT','SiC MOSFET','BJT (legacy)','Auto'] },
+      { id: 'inductor_choice',  q: 'Magnetics topology?',                           chips: ['Discrete inductor','Integrated coupled inductor','Planar transformer','Wirewound transformer','Auto'] },
+      { id: 'output_cap',       q: 'Output capacitor mix?',                         chips: ['MLCC only','Polymer + MLCC','Aluminium electrolytic','OS-CON','Tantalum','Auto'] },
+      { id: 'fb_compensation',  q: 'Loop compensation type?',                       chips: ['Type-II (peak current mode)','Type-III (voltage mode)','Auto-tuned','Digital','Auto'] },
+      { id: 'inrush_limit',     q: 'Inrush-current limiting?',                      chips: ['Soft-start built-in','NTC thermistor','MOSFET pre-charge','None (low-cap load)','Auto'] },
+      { id: 'protection',       q: 'Protection features required?',                 chips: ['OVP only','OVP + OCP','OVP + OCP + OTP','Full (OVP/OCP/OTP/UVLO/SCP)','Auto'] },
+      { id: 'pgood_seq',        q: 'Power-good / sequencing?',                      chips: ['No','PGood per rail','Sequenced (delay)','Tracking (slope)','Auto'] },
+      { id: 'connector_pwr',    q: 'Output connector / form factor?',               chips: ['Screw terminals','Pluggable header','Edge connector','Bus bar','Auto'] },
+      { id: 'monitoring',       q: 'Telemetry / digital interface?',                chips: ['None','PMBus','I2C','SPI','Analog telemetry','Auto'] },
+    ],
+  },
+};
+
+/* ================================================================
+   SWITCH-MATRIX DEEP DIVES — front-end + full scopes only.
+   ================================================================ */
+const SWM_NA_STUB: DeepDiveDef = {
+  title: 'Not applicable',
+  note: 'Switch matrices use the "full" or "front-end" scope.',
+  qs: [],
+};
+export const SWM_DEEP_DIVES: Record<DesignScope, DeepDiveDef> = {
+  'downconversion': SWM_NA_STUB,
+  'dsp': SWM_NA_STUB,
+  'front-end': {
+    title: 'Switch-matrix front-end deep-dive',
+    note: 'Topology + driver IC selection determine isolation, switching speed, and routing flexibility.',
+    qs: [
+      { id: 'switch_device',    q: 'Per-cell switch device?',                       chips: ['GaAs SPDT','SOI CMOS SPDT','PIN diode','RF MEMS','Mechanical relay','Auto'] },
+      { id: 'driver_ic',        q: 'Switch driver / level-shift IC?',                chips: ['HMC347 family','SKY13xxx','ADRF series','Discrete level-shifter','MCU GPIO','Auto'] },
+      { id: 'simultaneity',     q: 'Simultaneous-route requirement?',                chips: ['Single path at a time (blocking)','Up to 2 paths','Up to 4 paths','Full M×N (non-blocking)','Auto'] },
+      { id: 'cal_path',         q: 'Built-in cal / through path?',                   chips: ['Yes (cal port)','Yes (through-thru-line)','No','Auto'] },
+      { id: 'control_iface',    q: 'Control plane?',                                chips: ['Direct GPIO','SPI','I2C','USB-bridge','SCPI / VXI','Auto'] },
+      { id: 'rf_layout',        q: 'RF layout substrate?',                           chips: ['FR-4 (< 6 GHz)','RO4350B','RO3003','PTFE','LTCC','Auto'] },
+    ],
+  },
+  'full': {
+    title: 'Full switch-matrix deep-dive',
+    note: 'Adds enclosure + connectorisation choices on top of the front-end deep-dive.',
+    qs: [
+      { id: 'switch_device',    q: 'Per-cell switch device?',                       chips: ['GaAs SPDT','SOI CMOS SPDT','PIN diode','RF MEMS','Mechanical relay','Auto'] },
+      { id: 'simultaneity',     q: 'Simultaneous-route requirement?',                chips: ['Single path (blocking)','Up to 2','Up to 4','Full M×N (non-blocking)','Auto'] },
+      { id: 'control_iface',    q: 'Control plane?',                                chips: ['Direct GPIO','SPI','I2C','USB-bridge','SCPI / VXI','Auto'] },
+      { id: 'connectorisation', q: 'Front-panel connectors?',                       chips: ['SMA (× ports)','N-type','TNC','MMCX','Edge launch','Auto'] },
+      { id: 'enclosure',        q: 'Enclosure / EMI shielding?',                    chips: ['Open PCB (lab)','Cast aluminium','Sheet-metal shielded','Modular (3U/6U)','19" rackmount','Auto'] },
+      { id: 'cal_strategy',     q: 'Calibration strategy?',                         chips: ['Through-line cal','S-parameter file per route','Software de-embed','None','Auto'] },
+    ],
+  },
+};
+
+/* ================================================================
    APPLICATION ADDENDUMS — scope-aware.
    ================================================================ */
 export interface AppQDef {
@@ -864,11 +1048,20 @@ export function filterSwmArch(): { blocking: ArchDef[]; nonblocking: ArchDef[] }
 
 export function resolveDeepDiveQs(state: WizardState): { dive: DeepDiveDef | null; qs: DeepDiveQ[] } {
   if (!state.scope) return { dive: null, qs: [] };
-  // Transmitter projects get the TX_DEEP_DIVES catalogue — the RX
-  // questions (LNA tech, image rejection, ADC ENOB) are dropped entirely
-  // so the wizard Stage-5 card set is focused on PA/driver/upconvert
-  // parameters instead.
-  const source = state.projectType === 'transmitter' ? TX_DEEP_DIVES : DEEP_DIVES;
+  // Pick the right deep-dive catalogue per project_type (P26 #13):
+  //   receiver       → DEEP_DIVES        (LNA tech, image rejection, ADC ENOB)
+  //   transmitter    → TX_DEEP_DIVES     (PA topology, harmonic filter, biasing)
+  //   transceiver    → TRX_DEEP_DIVES    (T/R isolation, LO sharing, calibration)
+  //   power_supply   → PSU_DEEP_DIVES    (control mode, magnetics, protection)
+  //   switch_matrix  → SWM_DEEP_DIVES    (cell device, driver IC, simultaneity)
+  let source: Record<DesignScope, DeepDiveDef>;
+  switch (state.projectType) {
+    case 'transmitter':   source = TX_DEEP_DIVES; break;
+    case 'transceiver':   source = TRX_DEEP_DIVES; break;
+    case 'power_supply':  source = PSU_DEEP_DIVES; break;
+    case 'switch_matrix': source = SWM_DEEP_DIVES; break;
+    default:              source = DEEP_DIVES;
+  }
   const dive = source[state.scope];
   if (!dive) return { dive: null, qs: [] };
   const qs = dive.qs.filter(q => !q.show_if || q.show_if(state));

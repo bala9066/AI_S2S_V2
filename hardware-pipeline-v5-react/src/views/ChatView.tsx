@@ -12,6 +12,7 @@ import {
   emptyWizardState, archById, specLabel,
   filterSpecsByScope, filterArchByScopeAndApp, filterTxArchByScopeAndApp,
   filterTrxArchByScope, filterPsuArch, filterSwmArch,
+  applicationsForProjectType, scopesForProjectType,
   resolveDeepDiveQs, resolveAppQs, allInlineSuggestions,
   derivedMDS, firedCascadeMessages, archRationale,
   AUTO_SUGGESTIONS,
@@ -2118,7 +2119,7 @@ function WizardFrame(p: WizardFrameProps) {
             What are we building?
           </div>
           <div style={{ fontSize: 12, color: 'var(--text3)', lineHeight: 1.55, fontFamily: "'DM Mono',monospace" }}>
-            Pick the top-level block. Only Receiver is wired in v21 — others land in later releases.
+            Pick the top-level block — drives architectures, specs, and deep-dive questions.
           </div>
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, maxWidth: 620, margin: '0 auto' }}>
@@ -2165,12 +2166,18 @@ function WizardFrame(p: WizardFrameProps) {
 
   // ── Stage 1 — SCOPE ──────────────────────────────────────────────────
   if (stage === 1) {
-    const SCOPE_CARDS: Array<{ id: DesignScope; title: string; oneLiner: string; covers: string; icon: string }> = [
-      { id: 'full',           title: 'Full Receiver System',   oneLiner: SCOPE_DESC['full'].desc,           covers: SCOPE_DESC['full'].covers,           icon: '\u25C9' },
+    // P26 #13: per project_type the available scopes differ:
+    //   power_supply  -> only 'full' (no RF scope distinctions)
+    //   switch_matrix -> 'full' + 'front-end'
+    //   receiver / transmitter / transceiver -> all 4
+    const allowedScopes = scopesForProjectType(wizard.projectType);
+    const SCOPE_CARDS_ALL: Array<{ id: DesignScope; title: string; oneLiner: string; covers: string; icon: string }> = [
+      { id: 'full',           title: 'Full System',   oneLiner: SCOPE_DESC['full'].desc,           covers: SCOPE_DESC['full'].covers,           icon: '\u25C9' },
       { id: 'front-end',      title: 'RF Front-End Only',      oneLiner: SCOPE_DESC['front-end'].desc,      covers: SCOPE_DESC['front-end'].covers,      icon: '\u25E7' },
       { id: 'downconversion', title: 'Downconversion / IF',    oneLiner: SCOPE_DESC['downconversion'].desc, covers: SCOPE_DESC['downconversion'].covers, icon: '\u25D2' },
       { id: 'dsp',            title: 'Baseband / DSP Only',    oneLiner: SCOPE_DESC['dsp'].desc,            covers: SCOPE_DESC['dsp'].covers,            icon: '\u25E8' },
     ];
+    const SCOPE_CARDS = SCOPE_CARDS_ALL.filter(c => allowedScopes.includes(c.id));
     return (
       <div style={{ padding: '4px 4px 24px' }}>
         <StageRail />
@@ -2228,7 +2235,7 @@ function WizardFrame(p: WizardFrameProps) {
           </div>
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, maxWidth: 620, margin: '0 auto' }}>
-          {APPLICATIONS.map(a => (
+          {applicationsForProjectType(wizard.projectType).map(a => (
             <button key={a.id} onClick={() => p.onApp(a.id)}
               style={{ display: 'flex', flexDirection: 'column', gap: 6,
                 padding: '12px 14px', textAlign: 'left' as const,
@@ -2555,7 +2562,7 @@ function WizardFrame(p: WizardFrameProps) {
     const mds = derivedMDS(wizard);
     const cascade = firedCascadeMessages(wizard);
     const suggestions = allInlineSuggestions(wizard);
-    const app = APPLICATIONS.find(a => a.id === wizard.application);
+    const app = applicationsForProjectType(wizard.projectType).find(a => a.id === wizard.application);
     const rationale = arch && wizard.application ? archRationale(arch.id, wizard.application) : '';
     return (
       <div style={{ padding: '4px 4px 24px', maxWidth: 820, margin: '0 auto' }}>
@@ -3353,11 +3360,25 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
   };
 
   // ── v21 — Wizard stage handlers ─────────────────────────────────────────
-  /** Stage 0 → 1: project type picked. Only 'receiver' is wired. */
+  /** Stage 0 → 1: project type picked. P26 #13: also reset scope/app/arch
+   *  if they're no longer compatible with the new type's allowed lists.
+   *  Without this, a user who picked 'dsp' scope as a receiver and then
+   *  switches to power_supply would carry an invalid scope into Stage 1. */
   const handleWizardType = (typeId: string) => {
     const t = PROJECT_TYPES[typeId];
     if (!t || !t.supported) return;
-    setWizard(w => ({ ...w, projectType: typeId }));
+    setWizard(w => {
+      const allowed = scopesForProjectType(typeId);
+      const apps = applicationsForProjectType(typeId).map(a => a.id);
+      return {
+        ...w,
+        projectType: typeId,
+        scope: w.scope && allowed.includes(w.scope) ? w.scope : null,
+        application: w.application && apps.includes(w.application) ? w.application : null,
+        // Architecture is keyed off scope + app; a type swap invalidates it.
+        architecture: null,
+      };
+    });
     setWizardStage(1);
   };
   /** Stage 1 → 2: scope picked. Also fires parent onScopeChange for sidebar. */
@@ -3405,7 +3426,7 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
     const parts: string[] = [];
     if (s.projectType) parts.push(`[Project type: ${PROJECT_TYPES[s.projectType]?.name || s.projectType}]`);
     if (s.scope) parts.push(`[Design scope: ${SCOPE_LABELS[s.scope]}]`);
-    const app = APPLICATIONS.find(a => a.id === s.application);
+    const app = applicationsForProjectType(s.projectType).find(a => a.id === s.application);
     if (app) parts.push(`[Application: ${app.name}]`);
     const arch = archById(s.architecture);
     if (arch) parts.push(`[Architecture: ${arch.name}]`);
