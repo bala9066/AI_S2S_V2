@@ -128,16 +128,20 @@ class PipelineService:
     # frontend polls phase status every 3s, but `_serialised_flip` writes
     # P3=completed → nudges P4=in_progress → P4 work was already done so
     # P4=completed within microseconds → P6=in_progress... all between
-    # two UI polls. User saw P3=completed then P6=in_progress with P4
-    # entirely missed. The interlude WAITS after each flip so the next
-    # phase's `in_progress` state survives at least one poll cycle. Set
-    # to 4s = one poll (3s) + buffer (1s) so polls reliably catch each
-    # in_progress state. Total overhead = 9 phases × 4s = ~36s.
+    # two UI polls.
+    #
+    # P26 #20 (2026-04-26): bumped 4s → 8s after the user reported
+    # P8c (took ~5s wall time) showed up linked-to-P8b with no visible
+    # elapsed counter. With 4s interlude + 2-3s poll, fast-completing
+    # phases still slipped through. 8s gives 3-4 poll opportunities
+    # so the in_progress state is reliably seen + the elapsed counter
+    # has time to start ticking. Total overhead = 9 phases × 8s = ~72s
+    # — still acceptable demo cost for visible per-phase progress.
     #
     # `_STATUS_FLIP_DELAY_S` is unused now; kept for back-compat with
     # test fixtures that set both. Set to 0 to skip.
     _STATUS_FLIP_DELAY_S = 0.0
-    _STATUS_FLIP_INTERLUDE_S = 4.0
+    _STATUS_FLIP_INTERLUDE_S = 8.0
 
     def __init__(
         self,

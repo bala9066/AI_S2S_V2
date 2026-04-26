@@ -3,6 +3,12 @@ export type PhaseStatusValue = 'pending' | 'in_progress' | 'completed' | 'failed
 export interface PhaseStatusEntry {
   status: PhaseStatusValue;
   updated_at?: string; // ISO string from backend
+  /** Real wall-clock seconds the phase took to run. Set by
+   *  `pipeline_service._serialised_flip` via the `extra` dict. Used by
+   *  DocumentsView's elapsed counter to display the truth for fast
+   *  phases (P8c often completes in 5-30 s) where the frontend timer
+   *  may not have started before the phase already finished. */
+  duration_seconds?: number;
 }
 
 export type StatusesRaw = Record<string, PhaseStatusEntry>;

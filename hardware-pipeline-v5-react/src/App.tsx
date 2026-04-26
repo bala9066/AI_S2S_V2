@@ -4,7 +4,6 @@ import type { ChatMessage } from './views/ChatView';
 import { newMsgId } from './views/ChatView';
 import { PHASES, isUnlocked } from './data/phases';
 import { api } from './api';
-import LandingPage from './components/LandingPage'; // P18: kept as a rollback target — DashboardView is the new landing surface
 import DashboardView from './views/DashboardView';
 import LeftPanel from './components/LeftPanel';
 import MiniTopbar from './components/MiniTopbar';
@@ -109,11 +108,11 @@ export default function App() {
           }
           sessionStorage.removeItem('hw-pipeline-project-id');
         });
-    } else if (action === 'create') {
-      // Opened from the dashboard's "Start new run" button in a new tab.
-      // Pop the create modal immediately and strip the param so F5 doesn't
-      // re-pop it. mode is already 'landing' by default.
-      setModal('create');
+    } else if (action === 'create' || action === 'load') {
+      // Opened from a dashboard nav action in a new tab. Pop the matching
+      // modal immediately and strip the param so F5 doesn't re-pop it.
+      // mode is already 'landing' by default.
+      setModal(action);
       try {
         const url = new URL(window.location.href);
         url.searchParams.delete('action');
@@ -168,11 +167,12 @@ export default function App() {
           s[key] = val as Statuses[string];
           raw[key] = { status: val as StatusesRaw[string]['status'] };
         } else if (val && typeof val === 'object' && 'status' in (val as object)) {
-          const entry = val as { status: string; updated_at?: string };
+          const entry = val as { status: string; updated_at?: string; duration_seconds?: number };
           s[key] = entry.status as Statuses[string];
           raw[key] = {
             status: entry.status as StatusesRaw[string]['status'],
             updated_at: entry.updated_at,
+            duration_seconds: entry.duration_seconds,
           };
         } else {
           s[key] = 'pending';
@@ -595,10 +595,17 @@ export default function App() {
             }
           }}
           onLoadProject={handleLoadProject}
+          onShowLoadModal={() => setModal('load')}
         />
         {modal === 'create' && (
           <CreateProjectModal
             onConfirm={handleCreateProject}
+            onCancel={() => setModal(null)}
+          />
+        )}
+        {modal === 'load' && (
+          <LoadProjectModal
+            onSelect={handleLoadProject}
             onCancel={() => setModal(null)}
           />
         )}
@@ -667,6 +674,7 @@ export default function App() {
               ([k, v]) => k !== 'P1' && (v === 'completed' || v === 'in_progress' || v === 'failed')
             )}
             scope={scope}
+            durationSeconds={statusesRaw[selectedPhase?.id]?.duration_seconds}
           />
           </div>
           <div style={{ padding: '0 26px 26px' }}>

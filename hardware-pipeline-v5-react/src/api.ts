@@ -87,10 +87,11 @@ export const api = {
       if (typeof val === 'string') {
         result[key] = { status: val as StatusesRaw[string]['status'] };
       } else if (val && typeof val === 'object' && 'status' in val) {
-        const entry = val as { status: string; updated_at?: string };
+        const entry = val as { status: string; updated_at?: string; duration_seconds?: number };
         result[key] = {
           status: entry.status as StatusesRaw[string]['status'],
           updated_at: entry.updated_at,
+          duration_seconds: entry.duration_seconds,
         };
       }
     }

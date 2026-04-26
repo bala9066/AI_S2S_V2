@@ -17,9 +17,15 @@ interface Props {
   /** Wizard-selected design scope — when the phase is not applicable for this
    *  scope we suppress the Execute button and show a NOT APPLICABLE badge. */
   scope?: DesignScope | null;
+  /** Real wall-clock seconds the phase took. Pulled from the backend's
+   *  `phase_statuses[id].duration_seconds` field. Shown next to the
+   *  status pill so the user always sees the elapsed time — even when
+   *  a fast phase (P8c often 5-30 s) completes before the frontend
+   *  elapsed counter has a chance to start. (P26 #20, 2026-04-26.) */
+  durationSeconds?: number;
 }
 
-export default function PhaseHeader({ phase, status, tab, onTabChange, onExecute, pipelineRunning, isStale = false, pipelineStarted = false, scope }: Props) {
+export default function PhaseHeader({ phase, status, tab, onTabChange, onExecute, pipelineRunning, isStale = false, pipelineStarted = false, scope, durationSeconds }: Props) {
   const isComplete = status === 'completed';
   const isRunning = status === 'in_progress';
   const isFailed = status === 'failed';
@@ -111,12 +117,19 @@ export default function PhaseHeader({ phase, status, tab, onTabChange, onExecute
                 {phase.manual ? 'EXTERNAL' : '⚡ AUTOMATED'}
               </span>
 
-              {/* Time estimate */}
+              {/* Time estimate (replaced by REAL elapsed once the phase
+                  is completed and the backend has reported a duration). */}
               <span style={{
-                fontSize: 11, color: 'var(--text4)',
+                fontSize: 11, color: isComplete && durationSeconds ? phase.color : 'var(--text4)',
                 fontFamily: "'DM Mono', monospace",
               }}>
-                {phase.time}
+                {isComplete && durationSeconds
+                  ? `✓ ran in ${
+                      durationSeconds < 60
+                        ? `${Math.round(durationSeconds)}s`
+                        : `${Math.floor(durationSeconds / 60)}m ${Math.round(durationSeconds % 60)}s`
+                    }`
+                  : phase.time}
               </span>
 
               {/* Not-applicable badge — phase falls outside the project's scope */}

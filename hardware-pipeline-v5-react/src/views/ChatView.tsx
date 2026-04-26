@@ -1993,16 +1993,23 @@ interface WizardFrameProps {
 function WizardFrame(p: WizardFrameProps) {
   const { stage, wizard, color } = p;
 
-  /** Shared chip-row renderer with "Other" free-text fallback. */
+  /** Shared chip-row renderer with "Other" free-text fallback.
+   *  P26 #20 (2026-04-26): the rfArchitect.ts data lists `'Other'` as
+   *  the LAST chip in many spec/question entries. The renderer also
+   *  appends a separate `✏ Other` button (the free-text fallback). The
+   *  user reported seeing "two Other options" — strip any literal
+   *  `Other` (case-insensitive trim) from the data chips so only the
+   *  pencil-prefixed free-text button remains. */
   const ChipRow = ({ qid, chips, selected, onPick, qColor }: {
     qid: string; chips: string[]; selected?: string;
     onPick: (v: string) => void; qColor: string;
   }) => {
+    const visibleChips = chips.filter(c => c.trim().toLowerCase() !== 'other');
     const isOtherActive = p.otherActiveId === qid;
-    const isOtherValue = selected !== undefined && !chips.includes(selected);
+    const isOtherValue = selected !== undefined && !visibleChips.includes(selected);
     return (
       <div style={{ display: 'flex', flexWrap: 'wrap' as const, gap: 7 }}>
-        {chips.map(opt => {
+        {visibleChips.map(opt => {
           const isSel = selected === opt;
           return (
             <button key={opt} onClick={() => { onPick(opt); p.onOtherActive(null); }}
@@ -2929,8 +2936,16 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
               reject(new Error(t.error || 'Finalize task failed on the server'));
             }
           } catch (pollErr) {
-            // Network blip — keep polling. Only abort if the task
-            // itself reports failed (handled above).
+            // 404 = task is gone (backend restarted, TTL expired). This is
+            // permanent, not a network blip — stop polling and surface to
+            // user. Anything else (502, network) is treated as transient.
+            const msg = pollErr instanceof Error ? pollErr.message : '';
+            if (msg.includes('HTTP 404')) {
+              clearInterval(handle);
+              clearInterval(tickHandle);
+              reject(new Error('Task expired or backend restarted. Please retry.'));
+              return;
+            }
             console.warn('[finalize] poll error (will retry):', pollErr);
           }
         }, POLL_MS);
@@ -3024,6 +3039,14 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
             reject(new Error(t.error || 'Async chat task failed'));
           }
         } catch (pollErr) {
+          // 404 = task is gone (backend restarted / TTL expired). Permanent.
+          const msg = pollErr instanceof Error ? pollErr.message : '';
+          if (msg.includes('HTTP 404')) {
+            clearInterval(handle);
+            clearInterval(tickHandle);
+            reject(new Error('Task expired or backend restarted. Please retry.'));
+            return;
+          }
           console.warn('[runAsyncChat] poll error (will retry):', pollErr);
         }
       }, POLL_MS);
@@ -3469,6 +3492,21 @@ export default function ChatView({ project, phase, phaseStatus, pipelineStarted,
       parts.push('');
       parts.push('ARCHITECT NOTES (deterministic cascade checks):');
       cascade.forEach(c => parts.push(`• [${c.level.toUpperCase()}] ${c.msg}`));
+    }
+    // P26 #20 (2026-04-26): the architect auto-suggestions shown on the
+    // confirm screen (e.g. "interferer_env = Low → IIP3 can be relaxed,
+    // pick lowest-NF LNA that meets gain target") used to be display-only.
+    // The user asked: "is the suggestion implemented or only for our
+    // reference shown?" — answer was display-only. Now we forward them
+    // to the LLM so the BOM picker can actually act on them (e.g. choose
+    // a lower-IIP3, lower-NF LNA when the interferer environment is low).
+    const autoSuggestions = allInlineSuggestions(s);
+    if (autoSuggestions.length > 0) {
+      parts.push('');
+      parts.push('ARCHITECT AUTO-SUGGESTIONS (apply when picking parts — not just advisory):');
+      autoSuggestions.forEach(sug => {
+        parts.push(`• Trigger ${sug.qid} = ${sug.value} → ${sug.msg}`);
+      });
     }
     parts.push('');
     parts.push('Please generate the Round-1 requirements spec + BOM against the above. Do NOT re-ask these questions.');

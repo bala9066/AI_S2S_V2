@@ -65,7 +65,28 @@ const VIEWABLE = new Set(['md', 'txt', 'json', 'html', 'csv', 'net', 'xdc', 'py'
 // again ufff"). Now both views import the same function.
 const sanitizeMermaidCode = sanitizeMermaid;
 // ── Marked setup (marked v17 — use marked.use() not deprecated setOptions) ───
-marked.use({ gfm: true, breaks: false });
+// P26 #20 (2026-04-26): every external link rendered into the docs view
+// gets `target="_blank"` + `rel="noopener noreferrer"` so clicking a
+// datasheet / DigiKey / Mouser URL opens in a new tab and doesn't navigate
+// away from the running pipeline. In-page anchors (`href="#section"`) and
+// relative links keep their default behaviour.
+marked.use({
+  gfm: true,
+  breaks: false,
+  renderer: {
+    link(token: { href: string; title?: string | null; text: string }) {
+      const href = token.href || '';
+      const title = token.title || '';
+      const text = token.text || '';
+      const isExternal = /^(https?:)?\/\//i.test(href) || href.startsWith('mailto:');
+      const titleAttr = title ? ` title="${title.replace(/"/g, '&quot;')}"` : '';
+      if (isExternal) {
+        return `<a href="${href}" target="_blank" rel="noopener noreferrer"${titleAttr}>${text}</a>`;
+      }
+      return `<a href="${href}"${titleAttr}>${text}</a>`;
+    },
+  },
+});
 
 // ── MermaidBlock component ────────────────────────────────────────────────────
 
@@ -80,7 +101,7 @@ function patchSvg(raw: string, accentColor: string): string {
 
   // Append our CSS overrides before </style> (or inject a new <style> block)
   const overrideCss = `
-    /* Hardware Pipeline — Mermaid visual overrides */
+    /* Silicon to Software (S2S) — Mermaid visual overrides */
     svg { background: #0a0f1a !important; }
     .node rect, .node circle, .node ellipse, .node polygon, .node path {
       fill: #142030 !important;

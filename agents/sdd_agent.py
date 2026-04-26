@@ -1330,6 +1330,18 @@ class SDDAgent(BaseAgent):
                 "10. NEVER use TBD/TBC/TBA — use actual values or explicit engineering assumptions"
             )
 
+            # P26 #20 (2026-04-26): wall-time budget for the legacy
+            # continuation loop. Pre-fix the loop could fire 5 sequential
+            # ~90-120 s continuation passes (10+ min total) and then
+            # STILL fall through to the template fallback when content
+            # didn't reach 800 chars. The user reported a 12-15 min
+            # phase that produced only the generic template — wasted
+            # API calls + wasted wall time. Now we abort the loop early
+            # if we've already spent more than this many seconds.
+            import time as _time
+            _legacy_t0 = _time.monotonic()
+            _LEGACY_BUDGET_S = 300.0  # 5 min hard cap on legacy fallback
+
             try:
                 response = await self.call_llm(
                     messages=[{"role": "user", "content": user_message}],
@@ -1372,6 +1384,20 @@ class SDDAgent(BaseAgent):
 
                 for _pass_idx, _cont_prompt in enumerate(_SDD_CONT_PROMPTS, start=1):
                     if response.get("stop_reason") != "max_tokens":
+                        break
+                    # P26 #20: stop firing continuations if we've already
+                    # blown the 5-minute wall-time budget. Better to ship
+                    # whatever's accumulated than burn another 90-120 s
+                    # only to hit the 800-char fallback gate.
+                    elapsed = _time.monotonic() - _legacy_t0
+                    if elapsed >= _LEGACY_BUDGET_S:
+                        self.log(
+                            f"SDD legacy continuation budget exhausted "
+                            f"({elapsed:.0f}s >= {_LEGACY_BUDGET_S:.0f}s) "
+                            f"after pass {_pass_idx-1}/5 — shipping what "
+                            f"we have ({len(sdd_content)} chars)",
+                            "warning",
+                        )
                         break
                     self.log(f"SDD truncated — continuation pass {_pass_idx}/5...")
                     _cont = await self.call_llm(
