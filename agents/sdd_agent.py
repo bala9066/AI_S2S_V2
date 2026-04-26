@@ -2,8 +2,22 @@
 Phase 8b: SDD (Software Design Document) Agent - IEEE 1016 Compliant
 
 Generates software architecture from SRS with Mermaid diagrams.
+
+P26 #16 (2026-04-26): parallelised the 60+ page SDD into 1 metadata-lock
+call + 5 parallel section calls (mirrors the FPGA agent's pattern from
+P26 #8). Total wall time: ~10 min sequential continuation passes →
+~90-120 s parallel.
+
+The metadata call locks the design contract that ALL 5 section
+generators must use (module names, struct names, register addresses,
+file layout, naming conventions). Each section call sees the SAME
+metadata JSON in its context and is told to use those names verbatim
+— this is what prevents "drift" between sections (one section calling
+the driver `uart_drv.c` and another calling it `uart_driver.c`).
 """
 
+import asyncio
+import json
 import logging
 from pathlib import Path
 
@@ -12,6 +26,321 @@ from config import settings
 from generators.sdd_generator import SDDGenerator
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions for the parallel SDD pipeline.
+#
+# Step 1: `lock_sdd_design` emits the JSON contract that all section
+# generators share. This is the no-drift mechanism — each section sees
+# the same metadata in its prompt and is forbidden from inventing new
+# names.
+#
+# Step 2: 5 parallel section tools (run via `asyncio.gather`):
+#   - generate_sdd_intro_overview      (sections 1.x + 2.1)
+#   - generate_sdd_architecture        (sections 2.2-2.5)
+#   - generate_sdd_modules_detail      (section 2.6 — full module specs)
+#   - generate_sdd_runtime_design      (sections 2.7-2.10)
+#   - generate_sdd_traceability        (section 3 + appendices)
+#
+# Each section tool returns a markdown blob; we concatenate in
+# document order to produce the final SDD.
+# ---------------------------------------------------------------------------
+
+LOCK_SDD_DESIGN_TOOL = {
+    "name": "lock_sdd_design",
+    "description": (
+        "Step 1 of SDD generation: emit ONLY the structural design "
+        "contract that the 5 parallel section generators will share. "
+        "Module names, struct names, file paths, register addresses, "
+        "task/ISR names — once locked here they MUST be used VERBATIM "
+        "by every downstream section. NO inventing new names later. "
+        "Be specific to the actual project (derive from the SRS / GLR / "
+        "HRS context provided), not generic boilerplate."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "modules": {
+                "type": "array",
+                "description": (
+                    "Every software module. Each entry locks file name, "
+                    "responsibility, and the public function prototype list. "
+                    "Subsequent section calls MUST use these names exactly."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":            {"type": "string"},
+                        "file":            {"type": "string"},
+                        "header":          {"type": "string"},
+                        "responsibility":  {"type": "string"},
+                        "public_api":      {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["name", "file", "header", "responsibility"],
+                },
+            },
+            "structs": {
+                "type": "array",
+                "description": "C structs shared across modules. Lock once, use everywhere.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":   {"type": "string"},
+                        "fields": {"type": "array", "items": {"type": "string"}},
+                        "purpose": {"type": "string"},
+                    },
+                    "required": ["name", "fields"],
+                },
+            },
+            "enums": {
+                "type": "array",
+                "description": "C enums (state machines + error codes + modes).",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":   {"type": "string"},
+                        "values": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["name", "values"],
+                },
+            },
+            "tasks": {
+                "type": "array",
+                "description": (
+                    "RTOS tasks / superloop tasks. Each entry pins the "
+                    "scheduling characteristics so the Resource Viewpoint "
+                    "section computes a consistent schedule."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":     {"type": "string"},
+                        "priority": {"type": "string"},
+                        "period_ms": {"type": "number"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["name", "description"],
+                },
+            },
+            "isrs": {
+                "type": "array",
+                "description": "Interrupt service routines + their latency budgets.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":               {"type": "string"},
+                        "vector":             {"type": "string"},
+                        "latency_target_us":  {"type": "number"},
+                        "trigger":            {"type": "string"},
+                    },
+                    "required": ["name", "trigger"],
+                },
+            },
+            "interfaces": {
+                "type": "array",
+                "description": "External + internal interfaces (UART, SPI, I2C, GPIO, IPC).",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":  {"type": "string"},
+                        "kind":  {"type": "string"},
+                        "peer":  {"type": "string"},
+                    },
+                    "required": ["name", "kind"],
+                },
+            },
+            "register_map": {
+                "type": "array",
+                "description": (
+                    "FPGA register map referenced by the SDD. Fields: "
+                    "address, name, R/W, reset value. Pulled from GLR — "
+                    "MUST match what the firmware code references."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "address":  {"type": "string"},
+                        "name":     {"type": "string"},
+                        "access":   {"type": "string"},
+                        "reset":    {"type": "string"},
+                        "purpose":  {"type": "string"},
+                    },
+                    "required": ["address", "name", "access"],
+                },
+            },
+            "file_layout": {
+                "type": "array",
+                "description": "Directory + file structure (drivers/, app/, tests/, etc.)",
+                "items": {"type": "string"},
+            },
+            "naming_conventions": {
+                "type": "object",
+                "description": (
+                    "Naming + coding-standard prefixes used throughout the SDD."
+                ),
+                "properties": {
+                    "function_prefix":  {"type": "string"},
+                    "type_suffix":      {"type": "string"},
+                    "constant_style":   {"type": "string"},
+                    "macro_style":      {"type": "string"},
+                },
+            },
+            "target_platform": {
+                "type": "object",
+                "description": "FPGA family + MCU family + RTOS choice.",
+                "properties": {
+                    "fpga":     {"type": "string"},
+                    "mcu":      {"type": "string"},
+                    "rtos":     {"type": "string"},
+                    "language": {"type": "string"},
+                    "toolchain": {"type": "string"},
+                },
+            },
+        },
+        "required": ["modules", "tasks", "interfaces", "target_platform"],
+    },
+}
+
+# --- Section 1: intro + context (sections 1.x + 2.1) ---
+GENERATE_SDD_INTRO_OVERVIEW_TOOL = {
+    "name": "generate_sdd_intro_overview",
+    "description": (
+        "Step 2a: emit the SDD Introduction (sections 1.1-1.4) AND the "
+        "Context Viewpoint (section 2.1). Use the metadata's "
+        "interfaces[] for the context diagram and the target_platform "
+        "for the platform paragraph. MUST include the IEEE 1016 "
+        "document-control table at the top + a Mermaid `graph TD` "
+        "context diagram in 2.1."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "intro_overview_md": {
+                "type": "string",
+                "description": (
+                    "Markdown for sections 1.1 through 2.1. ~3000-5000 words."
+                ),
+            },
+        },
+        "required": ["intro_overview_md"],
+    },
+}
+
+# --- Section 2: architecture (sections 2.2-2.5) ---
+GENERATE_SDD_ARCHITECTURE_TOOL = {
+    "name": "generate_sdd_architecture",
+    "description": (
+        "Step 2b: emit the SDD Architecture sections — 2.2 Composition "
+        "(layered architecture diagram + module list), 2.3 Logical "
+        "(class diagram), 2.4 Information (data structures from "
+        "metadata.structs[]), 2.5 Interface (function prototypes from "
+        "metadata.modules[].public_api). MUST include at least 3 "
+        "Mermaid diagrams. Use the LOCKED module + struct names "
+        "verbatim — do NOT rename them."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "architecture_md": {
+                "type": "string",
+                "description": (
+                    "Markdown for sections 2.2-2.5. ~5000-8000 words "
+                    "with full struct definitions + function prototypes."
+                ),
+            },
+        },
+        "required": ["architecture_md"],
+    },
+}
+
+# --- Section 3: full module detail (section 2.6) ---
+GENERATE_SDD_MODULES_DETAIL_TOOL = {
+    "name": "generate_sdd_modules_detail",
+    "description": (
+        "Step 2c: emit section 2.6 Module Details. For EVERY module in "
+        "metadata.modules[] write: full file name + header file, "
+        "responsibility paragraph, complete C function prototypes, "
+        "internal state variables, configuration constants, plus a "
+        "Mermaid sequence or state diagram of the module's main flow. "
+        "Use the LOCKED public_api function names — do NOT rename."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "modules_detail_md": {
+                "type": "string",
+                "description": (
+                    "Markdown for section 2.6 — one subsection per "
+                    "module. ~6000-10000 words for a typical project."
+                ),
+            },
+        },
+        "required": ["modules_detail_md"],
+    },
+}
+
+# --- Section 4: runtime / dynamics / resource / build (sections 2.7-2.10) ---
+GENERATE_SDD_RUNTIME_DESIGN_TOOL = {
+    "name": "generate_sdd_runtime_design",
+    "description": (
+        "Step 2d: emit sections 2.7 State Dynamics (state machines from "
+        "metadata.enums[] state-like enums), 2.8 Algorithm (key "
+        "algorithms with pseudocode), 2.9 Resource (task scheduling "
+        "table from metadata.tasks[], ISR latency budget from "
+        "metadata.isrs[], memory budget), 2.10 Build System "
+        "(CMakeLists.txt for drivers + firmware + Qt GUI + tests). "
+        "MUST include Mermaid stateDiagram-v2 for each state machine."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "runtime_design_md": {
+                "type": "string",
+                "description": (
+                    "Markdown for sections 2.7-2.10. ~4000-6000 words."
+                ),
+            },
+        },
+        "required": ["runtime_design_md"],
+    },
+}
+
+# --- Section 5: traceability + appendices (section 3 + Appendix A-D) ---
+GENERATE_SDD_TRACEABILITY_TOOL = {
+    "name": "generate_sdd_traceability",
+    "description": (
+        "Step 2e: emit section 3 Traceability Matrix (every module + "
+        "function from metadata back to a REQ-SW-xxx tag) + Appendix A "
+        "(file layout from metadata.file_layout), Appendix B (full "
+        "register map from metadata.register_map[]), Appendix C "
+        "(MISRA-C 2012 compliance checklist), Appendix D (acronyms + "
+        "glossary), and a revision history table. Plus the document's "
+        "final References section."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "traceability_md": {
+                "type": "string",
+                "description": (
+                    "Markdown for section 3 + Appendices A-D. "
+                    "~3000-5000 words."
+                ),
+            },
+        },
+        "required": ["traceability_md"],
+    },
+}
+
+_SDD_TOOLS = [
+    LOCK_SDD_DESIGN_TOOL,
+    GENERATE_SDD_INTRO_OVERVIEW_TOOL,
+    GENERATE_SDD_ARCHITECTURE_TOOL,
+    GENERATE_SDD_MODULES_DETAIL_TOOL,
+    GENERATE_SDD_RUNTIME_DESIGN_TOOL,
+    GENERATE_SDD_TRACEABILITY_TOOL,
+]
 
 SYSTEM_PROMPT = """You are a senior embedded software architect generating a comprehensive, publication-quality IEEE 1016-2009-compliant Software Design Document (SDD) for an embedded hardware system.
 
@@ -811,6 +1140,11 @@ class SDDAgent(BaseAgent):
             phase_name="SDD Generation",
             model=settings.primary_model,  # Primary model for 50+ page professional document
             max_tokens=16384,
+            # P26 #16: tools registered so the parallel pipeline can
+            # call any of the 6 (1 metadata + 5 sections). The legacy
+            # text-only path (no tool_choice, no tools used) still works
+            # as a fallback if metadata-locking fails.
+            tools=_SDD_TOOLS,
         )
         self.sdd_generator = SDDGenerator()
 
@@ -837,84 +1171,221 @@ class SDDAgent(BaseAgent):
         from datetime import datetime
         today = datetime.now().strftime("%d %B %Y")
 
-        # PRIMARY PATH: LLM writes the full IEEE 1016 SDD from SRS context
-        user_message = (
-            f"Generate a COMPLETE, DETAILED, 60+ page IEEE 1016-2009 Software Design Document for:\n\n"
+        # Common context block fed to the metadata call AND to every
+        # parallel section call. Capping at 10K SRS / 5K GLR / 3K HRS
+        # keeps every per-call input under ~20K tokens — section calls
+        # ALSO get the metadata JSON, which adds ~2-4K tokens.
+        context_block = (
             f"**Project:** {project_name}\n"
             f"**Date:** {today}\n\n"
             f"## Software Requirements Specification (SRS — primary input):\n{srs[:10000]}\n\n"
             f"## GLR Specification (FPGA registers, signal names, UART protocol):\n{glr[:5000] if glr else 'Not available.'}\n\n"
             f"## HRS (hardware context, power rails, interfaces):\n{hrs[:3000] if hrs else 'Not available.'}\n\n"
-            "INSTRUCTIONS:\n"
-            "1. Generate ALL sections from the IEEE 1016 structure in your system prompt\n"
-            "2. Include complete C struct definitions and ALL function prototypes for every module\n"
-            "3. Include minimum 8 Mermaid diagrams (sequenceDiagram, stateDiagram-v2, graph TD, classDiagram)\n"
-            "4. Every design element must trace back to a REQ-SW-xxx from the SRS\n"
-            "5. Design must be MISRA-C:2012 compliant throughout\n"
-            "6. Section 2.9 (Resource Viewpoint) MUST include: task scheduling table, ISR latency budget, and memory budget derived from HRS\n"
-            "7. Section 2.10 (Build System) MUST include: CMakeLists.txt structure for drivers + firmware + Qt6 GUI + unit tests (Google Test)\n"
-            "8. Appendix B MUST include: full FPGA register map (base address, offset, name, R/W, reset value) from GLR\n"
-            "9. Derive module names, register addresses, constants from the SRS/GLR — no generic boilerplate\n"
-            "10. NEVER use TBD/TBC/TBA — use actual values or explicit engineering assumptions"
         )
 
         sdd_content = ""
+
+        # ── PARALLEL PATH (P26 #16) ─────────────────────────────────────
+        # Step 1: lock the metadata contract (modules, structs, register
+        # map, file layout, naming conventions). This is the ONLY call
+        # that decides those names — parallel sections must use them
+        # verbatim.
+        meta_user_message = (
+            f"{context_block}\n"
+            "Step 1 of SDD generation: call ONLY `lock_sdd_design` and "
+            "emit the design contract. Pull module / struct / register "
+            "names from the SRS + GLR + HRS context above. Be SPECIFIC "
+            "and FINAL — five other section generators are about to fire "
+            "in parallel using these names verbatim, and any divergence "
+            "between sections (e.g. you say `uart_drv.c` here and the "
+            "Modules section uses `uart_driver.c`) breaks the design. "
+            "Locked-in metadata wins; sections cannot rename things."
+        )
+
+        metadata: dict | None = None
         try:
-            response = await self.call_llm(
-                messages=[{"role": "user", "content": user_message}],
+            meta_response = await self.call_llm(
+                messages=[{"role": "user", "content": meta_user_message}],
                 system=SYSTEM_PROMPT,
+                tools=_SDD_TOOLS,
+                tool_choice={"type": "tool", "name": "lock_sdd_design"},
             )
-            sdd_content = response.get("content", "")
+            if meta_response.get("tool_calls"):
+                for tc in meta_response["tool_calls"]:
+                    if tc["name"] == "lock_sdd_design":
+                        metadata = tc["input"]
+                        break
+            if metadata and not meta_response.get("degraded"):
+                # Step 2: 5 parallel section calls. Each call sees the
+                # SAME locked metadata in its prompt and is asked to use
+                # it verbatim — that's the no-drift mechanism.
+                meta_blob = json.dumps(metadata, indent=2)[:6000]
+                sections_context = (
+                    f"{context_block}\n"
+                    "## LOCKED SDD METADATA (Step 1 output)\n"
+                    "Use these EXACT names — module file names, struct "
+                    "names, register addresses, task names, ISR names. "
+                    "Four other section generators are running in "
+                    "parallel right now using the same metadata; "
+                    "renaming anything will create internal "
+                    "inconsistencies that fail the IEEE 1016 review.\n\n"
+                    f"```json\n{meta_blob}\n```\n\n"
+                    "Step 2 of SDD generation: emit ONLY this one "
+                    "section tool's markdown."
+                )
+                sections_messages = [
+                    {"role": "user", "content": sections_context},
+                ]
 
-            # Up to 5 continuation passes — each feeds accumulated text back as context
-            _SDD_CONT_PROMPTS = [
-                (
-                    "Continue the SDD from exactly where you left off. "
-                    "Do NOT repeat any sections already written. "
-                    "Complete remaining viewpoints, module interface definitions, "
-                    "state machines, and interrupt/task scheduling design."
-                ),
-                (
-                    "Continue the SDD. Do NOT repeat content already written. "
-                    "Write detailed algorithm descriptions, data flow diagrams (Mermaid flowcharts), "
-                    "and the complete sequence diagrams for every major hardware interaction."
-                ),
-                (
-                    "Continue the SDD. Do NOT repeat content already written. "
-                    "Complete the IEEE 1016 Information Viewpoint: "
-                    "all data structures (C structs), enums, configuration tables, "
-                    "and persistent data layout in non-volatile memory."
-                ),
-                (
-                    "Continue the SDD. Do NOT repeat content already written. "
-                    "Write the full Design Traceability Matrix "
-                    "(SDD component/function → REQ-SW-xxx → REQ-HW-xxx). "
-                    "Every SDD design decision must trace to at least one SRS requirement."
-                ),
-                (
-                    "Finalize the SDD. Do NOT repeat content already written. "
-                    "Write Appendix A (file/directory structure), Appendix B (memory map), "
-                    "Appendix C (coding standards compliance checklist), "
-                    "Appendix D (acronyms/glossary), and the revision history table."
-                ),
-            ]
+                async def _gen_section(tool_name: str, payload_field: str) -> str:
+                    """Fire one section tool call. On failure return ""
+                    so the caller can fall back without aborting the
+                    whole phase."""
+                    try:
+                        resp = await self.call_llm(
+                            messages=sections_messages,
+                            system=SYSTEM_PROMPT,
+                            tools=_SDD_TOOLS,
+                            tool_choice={"type": "tool", "name": tool_name},
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "P8b section %s raised: %s",
+                            tool_name, str(exc)[:200],
+                        )
+                        return ""
+                    if resp.get("tool_calls"):
+                        for tc in resp["tool_calls"]:
+                            if tc["name"] == tool_name:
+                                val = tc["input"].get(payload_field, "")
+                                return val if isinstance(val, str) else ""
+                    return ""
 
-            for _pass_idx, _cont_prompt in enumerate(_SDD_CONT_PROMPTS, start=1):
-                if response.get("stop_reason") != "max_tokens":
-                    break
-                self.log(f"SDD truncated — continuation pass {_pass_idx}/5...")
-                _cont = await self.call_llm(
-                    messages=[
-                        {"role": "user", "content": user_message},
-                        {"role": "assistant", "content": sdd_content},
-                        {"role": "user", "content": _cont_prompt},
-                    ],
+                self.log("P8b: dispatching 5 parallel SDD section sub-calls "
+                         "(intro + architecture + modules + runtime + traceability)")
+                intro_md, arch_md, mods_md, runtime_md, trace_md = await asyncio.gather(
+                    _gen_section("generate_sdd_intro_overview",   "intro_overview_md"),
+                    _gen_section("generate_sdd_architecture",     "architecture_md"),
+                    _gen_section("generate_sdd_modules_detail",   "modules_detail_md"),
+                    _gen_section("generate_sdd_runtime_design",   "runtime_design_md"),
+                    _gen_section("generate_sdd_traceability",     "traceability_md"),
+                    return_exceptions=False,
+                )
+
+                # Concatenate in document order. A missing section is
+                # better than the whole phase failing — log it and
+                # insert a clear placeholder so the reader sees the gap
+                # instead of a silent omission.
+                sections = [
+                    ("Introduction & Context Viewpoint",  intro_md),
+                    ("Architecture Viewpoints",            arch_md),
+                    ("Module Detail",                      mods_md),
+                    ("Runtime / Resource / Build",         runtime_md),
+                    ("Traceability & Appendices",          trace_md),
+                ]
+                missing = [name for name, body in sections if not body.strip()]
+                if missing:
+                    logger.warning(
+                        "P8b: %d/5 sections came back empty — %s "
+                        "(non-fatal; SDD will assemble what's available)",
+                        len(missing), ", ".join(missing),
+                    )
+                # Only count this as success if at least 3 of 5 sections
+                # came back. Otherwise fall through to legacy path.
+                if sum(1 for _, body in sections if body.strip()) >= 3:
+                    sdd_content = "\n\n".join(body for _, body in sections if body.strip())
+                    if missing:
+                        sdd_content += (
+                            "\n\n---\n\n"
+                            "> **Note:** The following sections were "
+                            "not generated by the parallel pipeline "
+                            f"and are pending regeneration: {', '.join(missing)}.\n"
+                        )
+                    self.log(
+                        f"P8b parallel pipeline: {len(sdd_content)} chars "
+                        f"({5 - len(missing)}/5 sections)"
+                    )
+        except Exception as e:
+            self.log(f"P8b parallel SDD generation failed: {e} — falling "
+                     f"back to legacy single-call path", "warning")
+            sdd_content = ""
+
+        # ── LEGACY PATH (sequential continuation passes) ────────────────
+        # Used when the parallel path failed (metadata empty OR < 3 of 5
+        # sections came back). Same as the old behaviour pre-P26 #16.
+        if not sdd_content:
+            user_message = (
+                f"Generate a COMPLETE, DETAILED, 60+ page IEEE 1016-2009 Software Design Document for:\n\n"
+                f"{context_block}"
+                "INSTRUCTIONS:\n"
+                "1. Generate ALL sections from the IEEE 1016 structure in your system prompt\n"
+                "2. Include complete C struct definitions and ALL function prototypes for every module\n"
+                "3. Include minimum 8 Mermaid diagrams (sequenceDiagram, stateDiagram-v2, graph TD, classDiagram)\n"
+                "4. Every design element must trace back to a REQ-SW-xxx from the SRS\n"
+                "5. Design must be MISRA-C:2012 compliant throughout\n"
+                "6. Section 2.9 (Resource Viewpoint) MUST include: task scheduling table, ISR latency budget, and memory budget derived from HRS\n"
+                "7. Section 2.10 (Build System) MUST include: CMakeLists.txt structure for drivers + firmware + Qt6 GUI + unit tests (Google Test)\n"
+                "8. Appendix B MUST include: full FPGA register map (base address, offset, name, R/W, reset value) from GLR\n"
+                "9. Derive module names, register addresses, constants from the SRS/GLR — no generic boilerplate\n"
+                "10. NEVER use TBD/TBC/TBA — use actual values or explicit engineering assumptions"
+            )
+
+            try:
+                response = await self.call_llm(
+                    messages=[{"role": "user", "content": user_message}],
                     system=SYSTEM_PROMPT,
                 )
-                sdd_content += "\n\n" + _cont.get("content", "")
-                response = _cont  # check this response's stop_reason in next iteration
-        except Exception as e:
-            self.log(f"LLM SDD generation failed: {e} — falling back to template", "warning")
+                sdd_content = response.get("content", "")
+
+                # Up to 5 continuation passes — each feeds accumulated text back as context
+                _SDD_CONT_PROMPTS = [
+                    (
+                        "Continue the SDD from exactly where you left off. "
+                        "Do NOT repeat any sections already written. "
+                        "Complete remaining viewpoints, module interface definitions, "
+                        "state machines, and interrupt/task scheduling design."
+                    ),
+                    (
+                        "Continue the SDD. Do NOT repeat content already written. "
+                        "Write detailed algorithm descriptions, data flow diagrams (Mermaid flowcharts), "
+                        "and the complete sequence diagrams for every major hardware interaction."
+                    ),
+                    (
+                        "Continue the SDD. Do NOT repeat content already written. "
+                        "Complete the IEEE 1016 Information Viewpoint: "
+                        "all data structures (C structs), enums, configuration tables, "
+                        "and persistent data layout in non-volatile memory."
+                    ),
+                    (
+                        "Continue the SDD. Do NOT repeat content already written. "
+                        "Write the full Design Traceability Matrix "
+                        "(SDD component/function → REQ-SW-xxx → REQ-HW-xxx). "
+                        "Every SDD design decision must trace to at least one SRS requirement."
+                    ),
+                    (
+                        "Finalize the SDD. Do NOT repeat content already written. "
+                        "Write Appendix A (file/directory structure), Appendix B (memory map), "
+                        "Appendix C (coding standards compliance checklist), "
+                        "Appendix D (acronyms/glossary), and the revision history table."
+                    ),
+                ]
+
+                for _pass_idx, _cont_prompt in enumerate(_SDD_CONT_PROMPTS, start=1):
+                    if response.get("stop_reason") != "max_tokens":
+                        break
+                    self.log(f"SDD truncated — continuation pass {_pass_idx}/5...")
+                    _cont = await self.call_llm(
+                        messages=[
+                            {"role": "user", "content": user_message},
+                            {"role": "assistant", "content": sdd_content},
+                            {"role": "user", "content": _cont_prompt},
+                        ],
+                        system=SYSTEM_PROMPT,
+                    )
+                    sdd_content += "\n\n" + _cont.get("content", "")
+                    response = _cont  # check this response's stop_reason in next iteration
+            except Exception as e:
+                self.log(f"LLM SDD generation failed: {e} — falling back to template", "warning")
 
         # FALLBACK: template generator
         if not sdd_content or len(sdd_content) < 800:
