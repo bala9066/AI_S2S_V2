@@ -1,5 +1,5 @@
 """
-Hardware Pipeline - Central Configuration
+Silicon to Software (S2S) - Central Configuration
 All settings loaded from environment variables with sensible defaults.
 Compatible with Python 3.10+ (no pydantic-settings dependency).
 """
@@ -131,6 +131,13 @@ class Settings:
         self.github_repo = _env("GITHUB_REPO", "")          # e.g. "owner/hardware-pipeline-demo"
         self.github_repo_url = _env("GITHUB_REPO_URL", "")  # HTTPS clone URL (auto-derived if empty)
         self.git_enabled = _env_bool("GIT_ENABLED", bool(_env("GITHUB_TOKEN", "")))
+        # P26 #19 (2026-04-26): default ON because Windows / macOS Git
+        # Credential Manager (GCM) otherwise intercepts every push and
+        # pops the git-ecosystem OAuth dialog — even when the remote
+        # URL has the PAT embedded. Set to false ONLY if you genuinely
+        # want GCM to handle auth (rare — it conflicts with the
+        # embedded-PAT flow the agent uses).
+        self.git_bypass_credential_helper = _env_bool("GIT_BYPASS_CREDENTIAL_HELPER", True)
 
         # --- Component Search APIs ---
         self.digikey_client_id = _env("DIGIKEY_CLIENT_ID", "")
@@ -155,7 +162,7 @@ class Settings:
         self.offline_embedding_model = _env("OFFLINE_EMBEDDING_MODEL", "nomic-embed-text")
 
         # --- Application ---
-        self.app_name = _env("APP_NAME", "Hardware Pipeline")
+        self.app_name = _env("APP_NAME", "Silicon to Software (S2S)")
         self.app_env = _env("APP_ENV", "development")
         self.debug = _env_bool("DEBUG", True)
         self.log_level = _env("LOG_LEVEL", "INFO")

@@ -164,3 +164,73 @@ def test_push_branch_returns_tuple_signature():
         f"_push_branch must return a tuple (got {ret}) so commit_and_pr "
         f"can surface the actual push error in git_summary.md"
     )
+
+
+# ---------------------------------------------------------------------------
+# GCM bypass — the actual fix that addresses the user's "ecosystem" prompt
+# ---------------------------------------------------------------------------
+
+
+def test_push_branch_bypasses_credential_manager():
+    """Verifies _push_branch uses `-c credential.helper=` to disable
+    Git Credential Manager (GCM) so the embedded PAT in the remote URL
+    is the sole auth path. Without this, GCM opens an OAuth dialog
+    targeted at the `git-ecosystem` GitHub App and the headless
+    pipeline blocks waiting for a click that never comes."""
+    from unittest.mock import MagicMock, patch
+    from agents.git_agent import GitAgent
+    from pathlib import Path
+
+    # Build the agent without running __init__ (we only test
+    # _push_branch which doesn't need PyGithub or settings).
+    agent = GitAgent.__new__(GitAgent)
+
+    captured_calls: list[dict] = []
+
+    class _FakeGitCmd:
+        def execute(self, args, env=None):
+            captured_calls.append({"args": list(args), "env": dict(env or {})})
+
+    fake_repo = MagicMock()
+    fake_repo.git = _FakeGitCmd()
+
+    with patch("git.Repo", return_value=fake_repo):
+        ok, err = agent._push_branch(Path("/tmp/whatever"), "ai/test-branch")
+
+    assert ok is True, f"push expected to succeed, got error: {err}"
+    assert len(captured_calls) == 1, (
+        f"expected exactly 1 git invocation, got {len(captured_calls)}"
+    )
+    call = captured_calls[0]
+    args = call["args"]
+
+    # The bypass flags MUST be present, BEFORE the `push` subcommand.
+    helper_idx = args.index("credential.helper=") if "credential.helper=" in args else -1
+    push_idx   = args.index("push") if "push" in args else -1
+    assert helper_idx > 0, (
+        "missing `-c credential.helper=` flag — without it Git "
+        "Credential Manager will intercept the push and open the "
+        "git-ecosystem OAuth dialog"
+    )
+    assert helper_idx < push_idx, (
+        "`-c credential.helper=` must come BEFORE `push` so git "
+        "applies it to that command"
+    )
+    # The branch refspec in `branch:branch` form must follow `origin`.
+    assert "origin" in args
+    assert "ai/test-branch:ai/test-branch" in args
+
+    # Env must disable interactive credential prompting.
+    env = call["env"]
+    assert env.get("GIT_TERMINAL_PROMPT") == "0", (
+        "GIT_TERMINAL_PROMPT must be `0` so the agent can never block "
+        "on a terminal prompt"
+    )
+    assert env.get("GCM_INTERACTIVE") == "never", (
+        "GCM_INTERACTIVE must be `never` so Git Credential Manager "
+        "doesn't open a UI prompt"
+    )
+    assert env.get("GIT_ASKPASS") == "echo", (
+        "GIT_ASKPASS must be neutralised so any helper that runs "
+        "anyway can't pause for input"
+    )

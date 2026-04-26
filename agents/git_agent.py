@@ -262,16 +262,57 @@ class GitAgent:
 
     def _push_branch(self, repo_path: Path, branch: str) -> tuple[bool, str]:
         """Push the branch. Returns (ok, error_message).
-        The error message is propagated to git_summary.md so the user can
-        see the ACTUAL push failure (most often: the token lacks the
-        `workflow` scope when P8c includes a `.github/workflows/...` file).
-        Pre-fix this swallowed the error and the summary always said
-        'no GitHub remote configured' which was misleading."""
+
+        The push BYPASSES the user's git credential helper (Git
+        Credential Manager / GCM on Windows, libsecret on Linux,
+        osxkeychain on macOS) by setting `credential.helper=` empty
+        for this single command. Without this, GCM intercepts the
+        push, ignores the embedded `https://TOKEN@github.com/...`
+        URL, and pops up an OAuth dialog targeted at the
+        `git-ecosystem/git-credential-manager` GitHub App — which
+        the user reported as the "ecosystem" prompt blocking P8c.
+
+        We also disable interactive credential prompting via
+        `GIT_TERMINAL_PROMPT=0` and `GCM_INTERACTIVE=never` so that
+        even if the helper somehow runs, it can't pause the agent
+        waiting for human input.
+
+        The error message is propagated to git_summary.md so the user
+        can see the ACTUAL push failure if any (most often: the token
+        lacks the `workflow` scope when P8c includes a
+        `.github/workflows/...` file).
+        """
+        import os
         import git as gitlib
         try:
             repo = gitlib.Repo(str(repo_path))
-            origin = repo.remote("origin")
-            origin.push(refspec=f"{branch}:{branch}", force=False)
+
+            # Make absolutely sure no interactive prompt can fire from
+            # any helper that the GitPython invocation spawns.
+            push_env = {
+                "GIT_TERMINAL_PROMPT": "0",      # disable terminal prompt
+                "GCM_INTERACTIVE":     "never",  # disable Git Credential Manager UI
+                "GIT_ASKPASS":         "echo",   # neutralise askpass helper
+            }
+
+            # `-c credential.helper=` (empty value) tells git to skip
+            # ALL credential helpers for this one invocation. The token
+            # embedded in the remote URL is then the sole auth path.
+            # The repo.git.<command> form lets us pass `-c` flags and
+            # custom env safely without shelling out manually.
+            # Toggleable via `GIT_BYPASS_CREDENTIAL_HELPER=false` in
+            # `.env` for the rare case the user genuinely wants GCM.
+            cmd = ["git"]
+            if settings.git_bypass_credential_helper:
+                cmd += [
+                    "-c", "credential.helper=",
+                    "-c", "credential.useHttpPath=true",
+                ]
+            cmd += ["push", "origin", f"{branch}:{branch}"]
+            repo.git.execute(
+                cmd,
+                env={**os.environ, **push_env},
+            )
             return True, ""
         except Exception as e:
             err_text = str(e)
@@ -300,6 +341,23 @@ class GitAgent:
                     "(a) repo is part of an org with SAML SSO not yet "
                     "authorised for this token, (b) branch protection "
                     "blocks the push, or (c) token lacks required scope."
+                )
+            elif (
+                "git-ecosystem" in err_text.lower()
+                or "credential manager" in err_text.lower()
+                or "could not read username" in err_text.lower()
+            ):
+                # Fallback for the case the bypass didn't take (very
+                # old git, or an env that ignores -c overrides).
+                hint = (
+                    " — Git Credential Manager (GCM) intercepted the "
+                    "push and tried to open an OAuth dialog for the "
+                    "git-ecosystem app instead of using the embedded "
+                    "PAT. Workaround: in .env set "
+                    "GIT_BYPASS_CREDENTIAL_HELPER=true, restart the "
+                    "FastAPI server, then re-run P8c. Persistent fix: "
+                    "globally disable GCM for this account "
+                    "(`git config --global credential.helper`)."
                 )
             return False, err_text + hint
 
