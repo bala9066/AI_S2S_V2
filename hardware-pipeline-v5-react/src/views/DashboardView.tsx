@@ -367,14 +367,15 @@ export default function DashboardView({ onCreate, onLoadProject }: DashboardView
             </div>
           </div>
           <div className="menu">
-            <a className="active">Dashboard</a>
-            <a onClick={() => console.log('[dash] Projects clicked')}>Projects</a>
-            <a onClick={() => console.log('[dash] BOM clicked')}>BOM</a>
-            <a onClick={() => console.log('[dash] Compliance clicked')}>Compliance</a>
-            <a onClick={() => console.log('[dash] Docs clicked')}>Docs</a>
+            <span className="active">Dashboard</span>
+            <a onClick={() => document.getElementById('dash-phases')?.scrollIntoView({ behavior: 'smooth' })} style={{ cursor: 'pointer' }}>Phases</a>
+            <a onClick={() => document.getElementById('dash-projects')?.scrollIntoView({ behavior: 'smooth' })} style={{ cursor: 'pointer' }}>Projects</a>
+            <a onClick={() => document.getElementById('dash-events')?.scrollIntoView({ behavior: 'smooth' })} style={{ cursor: 'pointer' }}>Activity</a>
           </div>
           <div className="actions">
-            <button className="btn" onClick={refresh}>↺ Refresh</button>
+            <button className="btn" onClick={refresh} title={data.loading ? 'Refreshing…' : `Last refresh: ${new Date().toLocaleTimeString()}`}>
+              {data.loading ? '⟳ Loading…' : '↺ Refresh'}
+            </button>
             <button className="btn btn-iris" onClick={onCreate}>▶ Start new run</button>
           </div>
         </div>
@@ -530,7 +531,7 @@ export default function DashboardView({ onCreate, onLoadProject }: DashboardView
         </div>
 
         {/* ───── 4. Phase constellation ───── */}
-        <div className="section">
+        <div id="dash-phases" className="section" style={{ scrollMarginTop: 100 }}>
           <div className="section-head">
             <div>
               <div className="lbl">// pipeline</div>
@@ -575,8 +576,6 @@ export default function DashboardView({ onCreate, onLoadProject }: DashboardView
                   key={phase.id}
                   className="pcard"
                   style={{ ['--c' as never]: phaseColor }}
-                  onClick={() => featured && handleOpenProject(featured.project)}
-                  title={featured ? `Click to open ${featured.project.name}` : 'No project to view'}
                 >
                   <div className="aura"></div>
                   <div className="row">
@@ -595,11 +594,10 @@ export default function DashboardView({ onCreate, onLoadProject }: DashboardView
                 </div>
               );
             })}
-            {/* Extend slot — deferred plugin feature */}
+            {/* Extend slot — deferred plugin feature, info-only tile */}
             <div
               className="pcard"
               style={{ ['--c' as never]: '#6b6086', opacity: 0.6 }}
-              onClick={() => alert('Plugin slot — coming soon')}
             >
               <div className="row">
                 <div
@@ -610,7 +608,7 @@ export default function DashboardView({ onCreate, onLoadProject }: DashboardView
                     color: 'var(--dim)',
                   }}
                 >+</div>
-                <span className="st">Extend</span>
+                <span className="st">Coming soon</span>
               </div>
               <div className="name serif">Custom Phase</div>
               <div className="sub">Plugin slot</div>
@@ -621,7 +619,7 @@ export default function DashboardView({ onCreate, onLoadProject }: DashboardView
         </div>
 
         {/* ───── 5. Live + Events ───── */}
-        <div className="two">
+        <div id="dash-projects" className="two" style={{ scrollMarginTop: 100 }}>
 
           <div className="pane live">
             <span className="edge-light"></span>
@@ -716,7 +714,7 @@ export default function DashboardView({ onCreate, onLoadProject }: DashboardView
             )}
           </div>
 
-          <div className="pane events">
+          <div id="dash-events" className="pane events" style={{ scrollMarginTop: 100 }}>
             <span className="edge-light"></span>
             <div className="sheen"></div>
             <div className="section-head" style={{ margin: '0 0 10px' }}>

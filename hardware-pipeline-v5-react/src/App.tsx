@@ -92,6 +92,7 @@ export default function App() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const fromUrl = params.get('project');
+    const action = params.get('action');
     const fromSession = sessionStorage.getItem('hw-pipeline-project-id');
     const targetId = fromUrl ?? fromSession;
     if (targetId && /^\d+$/.test(targetId)) {
@@ -108,6 +109,16 @@ export default function App() {
           }
           sessionStorage.removeItem('hw-pipeline-project-id');
         });
+    } else if (action === 'create') {
+      // Opened from the dashboard's "Start new run" button in a new tab.
+      // Pop the create modal immediately and strip the param so F5 doesn't
+      // re-pop it. mode is already 'landing' by default.
+      setModal('create');
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('action');
+        window.history.replaceState({}, '', url.toString());
+      } catch { /* ignore */ }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -569,7 +580,20 @@ export default function App() {
     return (
       <>
         <DashboardView
-          onCreate={() => setModal('create')}
+          onCreate={() => {
+            // Zero-touch: open the create flow in a new tab so the dashboard
+            // tab stays on the dashboard. Fall back to in-tab modal if the
+            // popup is blocked.
+            try {
+              const w = window.open(
+                `${window.location.pathname}?action=create`,
+                '_blank',
+              );
+              if (!w) setModal('create');
+            } catch {
+              setModal('create');
+            }
+          }}
           onLoadProject={handleLoadProject}
         />
         {modal === 'create' && (
