@@ -598,6 +598,16 @@ Generate the FULL GLR document following EVERY section in your system prompt.
         # Scrub forbidden placeholders
         glr_content = re.sub(r'\b(TBD|TBC|TBA)\b', '[specify]', glr_content, flags=re.IGNORECASE)
 
+        # P26 #17 (2026-04-26): coerce + re-render every embedded
+        # `mermaid` block so LLM-emitted bracket mismatches (e.g.
+        # `["..."]}`), nested `[...]` inside quoted labels, or stray
+        # glyphs don't ship to disk and break the in-browser preview.
+        try:
+            from tools.mermaid_coerce import sanitize_mermaid_blocks_in_markdown
+            glr_content = sanitize_mermaid_blocks_in_markdown(glr_content)
+        except Exception as _exc:
+            self.log(f"GLR mermaid sanitise skipped: {_exc}", "warning")
+
         safe_name = project_name.replace(' ', '_')
 
         # Save under both naming conventions for compatibility

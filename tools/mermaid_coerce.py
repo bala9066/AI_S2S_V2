@@ -41,7 +41,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-__all__ = ["coerce_to_spec"]
+__all__ = ["coerce_to_spec", "sanitize_mermaid_blocks_in_markdown"]
 
 
 # Lines we want to drop entirely before extraction. These are
@@ -199,6 +199,11 @@ def _clean_label(raw: str) -> str:
     s = s.replace('"', '')          # the only thing mermaid quoted-label can't hold
     s = s.replace("\\\"", "")        # escaped quotes
     s = s.replace("\\", " ")         # backslashes (used as shape delimiters; never in labels)
+    # P26 #17 (2026-04-26): square brackets inside a quoted label
+    # (e.g. `+5V_CH[1:4]`) trip mermaid's parser even when wrapped in
+    # `["..."]` quotes — the inner `[` is read as a new shape opener.
+    # Replace with parens which render fine inside quoted labels.
+    s = s.replace("[", "(").replace("]", ")")
     # Convert HTML breaks to mermaid's <br>
     s = re.sub(r"<br\s*/?>", "<br>", s, flags=re.IGNORECASE)
     # Convert other HTML tags to spaces (preserve <br>)
@@ -374,3 +379,89 @@ def coerce_to_spec(
         # No subgraphs — they often cause cascading parse errors in the
         # raw LLM output. Cleaner without them in the deterministic path.
     }
+
+
+# ---------------------------------------------------------------------------
+# Markdown-walker helper — sanitises every ```mermaid``` block in a
+# document via the coerce-and-re-render pipeline.
+#
+# This is the agent-facing entry point used by `document_agent` (HRS),
+# `sdd_agent`, `srs_agent`, `glr_agent`, and any future agent that
+# writes markdown containing mermaid. Each fenced mermaid block gets
+# parsed → coerced to a structured spec → re-rendered as the safe
+# `flowchart <dir>` + `id["label"]` rect form. Blocks the coercer
+# can't extract a spec from (fewer than 2 nodes) are left untouched
+# so the legacy salvage layer still has a chance during DOCX render.
+#
+# Real-world bugs this catches (P26 #17, 2026-04-26, project rx_band):
+#   - L257 of HRS: `MIX2["..."]}` — extra `}` after rect close
+#   - L1540 of HRS: `LDO5C["+5V_CH[1:4]..."]` — nested `[...]` inside
+#                   a quoted label that confuses mermaid's parser
+# ---------------------------------------------------------------------------
+
+# Match a fenced mermaid block. We allow optional trailing whitespace on
+# the opening fence (`__main__\n`) and any content (incl. blank lines)
+# inside. Non-greedy + DOTALL via [\s\S].
+_MERMAID_FENCE_RE = re.compile(
+    r"```mermaid[ \t]*\n([\s\S]*?)\n```",
+    re.MULTILINE,
+)
+
+
+def sanitize_mermaid_blocks_in_markdown(
+    markdown_text: str,
+    *,
+    default_direction: str = "LR",
+) -> str:
+    """Walk a markdown document and replace every ```mermaid``` fenced
+    block with a coerce-and-re-rendered version that is guaranteed to
+    parse in mermaid.js, mmdc, and mermaid.ink.
+
+    Empty / unparseable blocks (fewer than 2 extractable nodes) are
+    left UNCHANGED so the legacy DOCX-render salvage layer still gets
+    a shot at them. This is the same trade-off the requirements_agent
+    already uses — it's better to ship the original than a half-fixed
+    placeholder when the spec is too sparse.
+
+    Used at WRITE time inside agents that emit markdown with embedded
+    mermaid (HRS, SDD, SRS, GLR). Without this pass, malformed LLM
+    mermaid (bracket mismatches, nested labels, stray glyphs) lands on
+    disk verbatim and breaks the in-browser preview.
+
+    Pure text-in / text-out — no I/O, no side effects, safe to call
+    multiple times (idempotent on already-clean input).
+    """
+    if not markdown_text or not isinstance(markdown_text, str):
+        return markdown_text or ""
+
+    # Lazy-import the renderer to avoid a circular import — render
+    # itself imports mermaid_coerce-adjacent helpers in some paths.
+    try:
+        from tools.mermaid_render import render_block_diagram
+    except Exception:
+        # Renderer not importable — return text unchanged so we don't
+        # silently corrupt mermaid blocks.
+        return markdown_text
+
+    def _replace(m: re.Match[str]) -> str:
+        raw_block = m.group(1)
+        try:
+            spec = coerce_to_spec(raw_block, default_direction=default_direction)
+        except Exception:
+            return m.group(0)  # original block unchanged
+        if not spec:
+            return m.group(0)
+        if len(spec.get("nodes") or []) < 2:
+            return m.group(0)
+        try:
+            rendered = render_block_diagram(
+                spec,
+                default_direction=default_direction,
+                raise_on_error=True,
+            )
+        except Exception:
+            return m.group(0)
+        # Re-wrap in fenced markdown.
+        return f"```mermaid\n{rendered}\n```"
+
+    return _MERMAID_FENCE_RE.sub(_replace, markdown_text)

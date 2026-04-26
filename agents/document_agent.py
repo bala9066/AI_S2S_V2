@@ -145,7 +145,7 @@ class DocumentAgent(BaseAgent):
             component_data = await self._extract_components(components)
             metadata = {
                 "version": project_context.get("version", "1.0"),
-                "author": project_context.get("author", "Hardware Pipeline AI"),
+                "author": project_context.get("author", "Silicon to Software (S2S) AI"),
                 "input_voltage": project_context.get("design_parameters", {}).get("input_voltage", "12-24"),
                 "max_power": project_context.get("design_parameters", {}).get("max_power", "per design spec"),
                 "temp_min": project_context.get("design_parameters", {}).get("temp_min", "-40"),
@@ -183,6 +183,19 @@ class DocumentAgent(BaseAgent):
             hrs_content,
             flags=_re.IGNORECASE,
         )
+
+        # P26 #17 (2026-04-26): coerce + re-render every embedded
+        # `mermaid` block so LLM-emitted bracket mismatches (e.g.
+        # `["..."]}`), nested `[...]` inside quoted labels, or stray
+        # glyphs don't ship to disk and break the in-browser preview.
+        # Real bug from project rx_band:
+        #   L257: `MIX2["..."]}` (extra `}`)
+        #   L1540: `LDO5C["+5V_CH[1:4]..."]` (nested brackets)
+        try:
+            from tools.mermaid_coerce import sanitize_mermaid_blocks_in_markdown
+            hrs_content = sanitize_mermaid_blocks_in_markdown(hrs_content)
+        except Exception as _exc:
+            self.log(f"HRS mermaid sanitise skipped: {_exc}", "warning")
 
         # Save output
         hrs_file = self.hrs_generator.save(hrs_content, output_dir, project_name)

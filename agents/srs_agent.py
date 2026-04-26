@@ -702,6 +702,16 @@ class SRSAgent(BaseAgent):
         import re as _re
         srs_content = _re.sub(r'\b(TBD|TBC|TBA)\b', '[specify]', srs_content, flags=_re.IGNORECASE)
 
+        # P26 #17 (2026-04-26): coerce + re-render every embedded
+        # `mermaid` block so LLM-emitted bracket mismatches don't
+        # break the in-browser preview. See `tools.mermaid_coerce`
+        # for the full bug-class background.
+        try:
+            from tools.mermaid_coerce import sanitize_mermaid_blocks_in_markdown
+            srs_content = sanitize_mermaid_blocks_in_markdown(srs_content)
+        except Exception as _exc:
+            self.log(f"SRS mermaid sanitise skipped: {_exc}", "warning")
+
         # Save output
         srs_file = self.srs_generator.save(srs_content, output_dir, project_name)
         self.log(f"SRS generated: {len(srs_content)} chars")
