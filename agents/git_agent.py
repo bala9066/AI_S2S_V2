@@ -4,7 +4,7 @@ Git commit + GitHub PR auto-creation agent.
 Runs after P8c completes:
   1. Initialises (or opens) a local git repo inside the project output dir
   2. Stages all generated artefacts
-  3. Creates a commit: "[AI] Hardware Pipeline: <project_name> — P8c complete"
+  3. Creates a commit: "[AI] Silicon to Software (S2S): <project_name> — P8c complete"
   4. If GITHUB_TOKEN + GITHUB_REPO are set, pushes branch and opens a PR
 
 Configuration (in .env):
@@ -77,8 +77,19 @@ class GitAgent:
             commit_sha = self._stage_and_commit(repo_path, project_name)
 
             pr_url = None
-            if self._github_client and settings.github_repo:
-                push_ok = self._push_branch(repo_path, branch)
+            push_error = ""
+            pr_error = ""
+            remote_status = "ok"
+            if not (self._github_client and settings.github_repo):
+                # Truly no remote configured — token missing OR github_repo
+                # blank OR PyGithub not installed.
+                remote_status = "no_remote"
+                if not settings.github_repo:
+                    push_error = "GITHUB_REPO not set in .env"
+                elif not self._github_client:
+                    push_error = "PyGithub not installed (run: pip install PyGithub)"
+            else:
+                push_ok, push_error = self._push_branch(repo_path, branch)
                 if push_ok:
                     pr_url = self._create_pr(
                         project_name=project_name,
@@ -86,6 +97,20 @@ class GitAgent:
                         review_report_path=review_report_path,
                         pr_body_extra=pr_body_extra,
                     )
+                    if not pr_url:
+                        # Push succeeded but PR creation didn't — could be
+                        # the org's branch protection or the source branch
+                        # doesn't differ from base. Either way, surface it.
+                        pr_error = (
+                            "PR creation failed after a successful push — "
+                            "check the backend logs for the GitHub API "
+                            "error (most often: branch protection rules "
+                            "block PR creation, or the head branch "
+                            "matches base with no diff)."
+                        )
+                        remote_status = "push_ok_pr_failed"
+                else:
+                    remote_status = "push_failed"
 
             logger.info(f"GitAgent: commit {commit_sha} on branch {branch}")
             return {
@@ -93,6 +118,9 @@ class GitAgent:
                 "commit_sha": commit_sha,
                 "branch": branch,
                 "pr_url": pr_url,
+                "push_error": push_error,
+                "pr_error": pr_error,
+                "remote_status": remote_status,
                 "repo_path": str(repo_path),
             }
 
@@ -125,7 +153,7 @@ class GitAgent:
 
         # Set minimal git config so commits don't fail
         with repo.config_writer() as cfg:
-            cfg.set_value("user", "name", "Hardware Pipeline AI")
+            cfg.set_value("user", "name", "Silicon to Software (S2S) AI")
             cfg.set_value("user", "email", "ai@hardware-pipeline.local")
 
         # Set/update remote URL with embedded auth token
@@ -162,9 +190,9 @@ class GitAgent:
             if not repo.heads:
                 # Create the initial commit if it doesn't exist yet
                 repo.index.commit(
-                    "chore: init hardware pipeline output repo",
-                    author=gitlib.Actor("Hardware Pipeline AI", "ai@hardware-pipeline.local"),
-                    committer=gitlib.Actor("Hardware Pipeline AI", "ai@hardware-pipeline.local"),
+                    "chore: init silicon to software (s2s) output repo",
+                    author=gitlib.Actor("Silicon to Software (S2S) AI", "ai@hardware-pipeline.local"),
+                    committer=gitlib.Actor("Silicon to Software (S2S) AI", "ai@hardware-pipeline.local"),
                 )
 
             # Ensure local branch is named 'main'
@@ -196,9 +224,9 @@ class GitAgent:
         if not repo.heads:
             # Create an empty initial commit
             repo.index.commit(
-                "chore: init hardware pipeline output repo",
-                author=gitlib.Actor("Hardware Pipeline AI", "ai@hardware-pipeline.local"),
-                committer=gitlib.Actor("Hardware Pipeline AI", "ai@hardware-pipeline.local"),
+                "chore: init silicon to software (s2s) output repo",
+                author=gitlib.Actor("Silicon to Software (S2S) AI", "ai@hardware-pipeline.local"),
+                committer=gitlib.Actor("Silicon to Software (S2S) AI", "ai@hardware-pipeline.local"),
             )
 
         # Create and checkout the branch
@@ -221,27 +249,59 @@ class GitAgent:
 
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         msg = (
-            f"[AI] Hardware Pipeline: {project_name} — P8c complete\n\n"
-            f"Generated by Hardware Pipeline v2 on {ts}.\n"
+            f"[AI] Silicon to Software (S2S): {project_name} — P8c complete\n\n"
+            f"Generated by Silicon to Software (S2S) v2 on {ts}.\n"
             f"Includes: device drivers, Qt GUI skeleton, SRS/SDD/HRS documents, "
             f"compliance report, netlist, GLR spec, code review report.\n\n"
-            f"🤖 Auto-committed by Hardware Pipeline AI"
+            f"🤖 Auto-committed by Silicon to Software (S2S) AI"
         )
 
-        actor = gitlib.Actor("Hardware Pipeline AI", "ai@hardware-pipeline.local")
+        actor = gitlib.Actor("Silicon to Software (S2S) AI", "ai@hardware-pipeline.local")
         commit = repo.index.commit(msg, author=actor, committer=actor)
         return commit.hexsha[:10]
 
-    def _push_branch(self, repo_path: Path, branch: str) -> bool:
+    def _push_branch(self, repo_path: Path, branch: str) -> tuple[bool, str]:
+        """Push the branch. Returns (ok, error_message).
+        The error message is propagated to git_summary.md so the user can
+        see the ACTUAL push failure (most often: the token lacks the
+        `workflow` scope when P8c includes a `.github/workflows/...` file).
+        Pre-fix this swallowed the error and the summary always said
+        'no GitHub remote configured' which was misleading."""
         import git as gitlib
         try:
             repo = gitlib.Repo(str(repo_path))
             origin = repo.remote("origin")
             origin.push(refspec=f"{branch}:{branch}", force=False)
-            return True
+            return True, ""
         except Exception as e:
-            logger.warning(f"GitAgent: push failed: {e}")
-            return False
+            err_text = str(e)
+            logger.warning(f"GitAgent: push failed: {err_text}")
+            # Detect the most common scope error and rewrite to a
+            # human-actionable message. GitHub's own message is fine
+            # but verbose — we keep it AND add the fix instruction.
+            hint = ""
+            if "workflow" in err_text and "scope" in err_text:
+                hint = (
+                    " — your GITHUB_TOKEN is missing the `workflow` "
+                    "scope. P8c writes `.github/workflows/*.yml` and "
+                    "GitHub blocks tokens without `workflow` scope from "
+                    "creating those files. Re-issue the PAT with both "
+                    "`repo` AND `workflow` scopes ticked."
+                )
+            elif "Authentication failed" in err_text or "401" in err_text:
+                hint = (
+                    " — token is invalid or expired. Re-issue your "
+                    "GITHUB_TOKEN at https://github.com/settings/tokens "
+                    "with `repo` and `workflow` scopes."
+                )
+            elif "403" in err_text:
+                hint = (
+                    " — GitHub returned 403 Forbidden. Likely causes: "
+                    "(a) repo is part of an org with SAML SSO not yet "
+                    "authorised for this token, (b) branch protection "
+                    "blocks the push, or (c) token lacks required scope."
+                )
+            return False, err_text + hint
 
     # ------------------------------------------------------------------ #
     # GitHub PR
@@ -274,7 +334,7 @@ class GitAgent:
             review_block = review_summary[:1200] if review_summary else "See code_review_report.md"
             extra_section = ("---\n" + pr_body_extra) if pr_body_extra else ""
             body = (
-                "## Hardware Pipeline AI — Auto-generated PR\n\n"
+                "## Silicon to Software (S2S) AI — Auto-generated PR\n\n"
                 f"**Project:** {project_name}\n"
                 "**Phase completed:** P8c (Code Review)\n"
                 f"**Generated:** {ts_str}\n\n"
@@ -295,11 +355,11 @@ class GitAgent:
                 f"{extra_section}\n\n"
                 "---\n"
                 "_\U0001f916 This PR was automatically created by "
-                "[Hardware Pipeline v2](http://localhost:8000/app)_\n"
+                "[Silicon to Software (S2S) v2](http://localhost:8000/app)_\n"
             )
 
             pr = gh_repo.create_pull(
-                title=f"[AI] {project_name} — Hardware Pipeline P8c complete",
+                title=f"[AI] {project_name} — Silicon to Software (S2S) P8c complete",
                 body=body,
                 head=branch,
                 base=default_branch,
